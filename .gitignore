@@ -26,3 +26,6 @@ build/windows/version-info.generated.txt
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Local worktree metadata
+.claude/worktrees/
