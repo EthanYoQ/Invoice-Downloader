@@ -1,0 +1,4 @@
+# Release-prep default dependency entrypoint.
+# Keep this file as the canonical install target for source runs and future
+# Windows PyInstaller builds.
+-r requirements.release.txt

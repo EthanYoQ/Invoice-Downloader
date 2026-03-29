@@ -1,0 +1,12 @@
+beautifulsoup4==4.14.3
+clr_loader==0.2.10
+openpyxl==3.1.5
+pillow==12.1.1
+playwright==1.58.0
+PyMuPDF==1.27.1
+python-dotenv==1.2.2
+pythonnet==3.0.5
+pywebview==6.1
+pyzbar==0.1.9
+requests==2.32.5
+tenacity==9.1.4

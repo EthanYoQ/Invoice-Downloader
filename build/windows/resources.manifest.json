@@ -1,0 +1,120 @@
+{
+  "appName": "InvoiceFlowAI",
+  "entryScript": "main.py",
+  "pythonVersion": "3.12",
+  "platform": "windows-x64",
+  "distDir": "dist/InvoiceFlowAI",
+  "workDir": "build/work/pyinstaller",
+  "packagingWorkDir": "build/work/packaging",
+  "version": {
+    "template": "build/windows/version-info.template.txt",
+    "rendered": "build/windows/version-info.generated.txt"
+  },
+  "icon": {
+    "exeIconPath": ""
+  },
+  "chromium": {
+    "envVar": "PLAYWRIGHT_BROWSERS_PATH",
+    "stagingDir": "build/runtime/ms-playwright",
+    "sanitizedWorkDir": "build/work/packaging/ms-playwright-clean",
+    "excludeEntries": [
+      ".links"
+    ],
+    "packageDir": "runtime/ms-playwright",
+    "downloadAllowed": false
+  },
+  "portable": {
+    "outputFile": "dist/InvoiceFlowAI-portable-unsigned.zip",
+    "copyRootName": "InvoiceFlowAI"
+  },
+  "handoff": {
+    "readmeSource": "build/windows/HANDOFF_README.txt",
+    "outputFileName": "HANDOFF_README.txt"
+  },
+  "installer": {
+    "script": "build/windows/installer/InvoiceFlowAI.iss",
+    "outputDir": "dist/installer",
+    "outputBaseName": "InvoiceFlowAI-Setup-unsigned",
+    "compilerPath": ""
+  },
+  "runtimeHook": "build/windows/runtime_hook_playwright.py",
+  "windowsManifest": "build/windows/app.manifest",
+  "sha256": {
+    "outputFile": "SHA256SUMS.txt"
+  },
+  "signing": {
+    "enabled": false,
+    "signtoolPath": "",
+    "certificateHint": ""
+  },
+  "requiredPaths": [
+    "main.py",
+    "app_api.py",
+    "email_fetcher.py",
+    "invoice_extractor.py",
+    "pdf_converter.py",
+    "provider_baiwang.py",
+    "provider_direct_invoice.py",
+    "frontend_run_context.py",
+    "user_settings.py",
+    "build/windows/app.manifest",
+    "build/windows/HANDOFF_README.txt",
+    "build/windows/installer/InvoiceFlowAI.iss",
+    "build/runtime/webview2-fixed/msedgewebview2.exe",
+    "templates/index.html",
+    "templates/index_app.js",
+    "templates/static/material-symbols-outlined.ttf"
+  ],
+  "datas": [
+    {
+      "source": "templates",
+      "target": "templates",
+      "optional": false
+    },
+    {
+      "source": "build/runtime/ms-playwright",
+      "target": "runtime/ms-playwright",
+      "optional": false
+    },
+    {
+      "source": "build/runtime/webview2-fixed",
+      "target": "runtime/webview2-fixed",
+      "optional": false
+    }
+  ],
+  "hiddenImports": [
+    "webview",
+    "pythonnet",
+    "clr_loader",
+    "openpyxl",
+    "fitz",
+    "PIL",
+    "playwright",
+    "playwright.sync_api",
+    "pyzbar"
+  ],
+  "excludedPaths": [
+    ".claude/",
+    ".codex/",
+    ".agent/reports/",
+    ".env",
+    ".env.*",
+    ".venv/",
+    "diagnostics/",
+    "test_dataset/",
+    "_tmp*/",
+    ".tmp-playwright/",
+    "__pycache__/",
+    "**/__pycache__/",
+    "*.pyc",
+    "**/*.pyc",
+    "dist/",
+    "release_prep/",
+    "build/InvoiceFlowAI/",
+    "build/runtime/mcp-chrome.excluded/",
+    "build/work/",
+    "build/windows/version-info.generated.txt",
+    "NUL",
+    "nul"
+  ]
+}

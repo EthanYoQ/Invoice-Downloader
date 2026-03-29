@@ -1,0 +1,28 @@
+{
+  "playwright": {
+    "python_module": "playwright",
+    "install_command": "python -m playwright install chromium",
+    "runtime_dir": "build/runtime/ms-playwright",
+    "expected_entries": [
+      "chromium-1208",
+      "chromium_headless_shell-1208",
+      "ffmpeg-1011",
+      "winldd-1007"
+    ]
+  },
+  "webview2": {
+    "runtime_dir": "build/runtime/webview2-fixed",
+    "archive_path": "build/runtime/Microsoft.WebView2.FixedVersionRuntime.146.0.3856.84.x64.cab",
+    "version": "146.0.3856.84",
+    "platform": "x64",
+    "download_url": "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/3e67708f-9219-4931-b406-b9ec9f32c070/Microsoft.WebView2.FixedVersionRuntime.146.0.3856.84.x64.cab",
+    "archive_sha256": "39CEEF46975F365C8BA3D41D41B9D4A3A85256981AA43AF86424969A961C2248",
+    "required_files": [
+      "msedgewebview2.exe",
+      "msedge.dll",
+      "resources.pak",
+      "Locales"
+    ]
+  }
+}
+
