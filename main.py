@@ -17,6 +17,8 @@ WINDOW_MIN_WIDTH = 900
 WINDOW_MIN_HEIGHT = 620
 WINDOW_TITLE = "InvoiceFlowAI"
 WEBVIEW2_RUNTIME_RELATIVE_DIR = Path("runtime") / "webview2-fixed"
+STARTUP_DIAGNOSTIC_CONTEXT = {}
+PACKAGED_UNBLOCK_SUFFIXES = {".dll", ".pyd", ".exe", ".json"}
 
 
 def _coalesce_run_context_path(argv):
@@ -113,6 +115,10 @@ def _startup_diagnostic_path():
         return Path.cwd() / "webview_startup.json"
 
 
+def _update_startup_diagnostic_context(**payload):
+    STARTUP_DIAGNOSTIC_CONTEXT.update(payload)
+
+
 def _write_startup_diagnostic(stage, **payload):
     diagnostic_path = _startup_diagnostic_path()
     diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +126,7 @@ def _write_startup_diagnostic(stage, **payload):
     content = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "stage": stage,
+        **STARTUP_DIAGNOSTIC_CONTEXT,
         **payload,
     }
 
@@ -128,6 +135,86 @@ def _write_startup_diagnostic(stage, **payload):
         encoding="utf-8",
     )
     return diagnostic_path
+
+
+def _resolve_packaged_app_root(current_dir):
+    current_dir = Path(current_dir).resolve()
+    if current_dir.name.lower() == "_internal":
+        return current_dir.parent
+    if (current_dir / "_internal").is_dir():
+        return current_dir
+    return current_dir
+
+
+def _iter_packaged_unblock_targets(app_root):
+    try:
+        for candidate in app_root.rglob("*"):
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+
+            if candidate.suffix.lower() not in PACKAGED_UNBLOCK_SUFFIXES:
+                continue
+            yield candidate
+    except OSError:
+        return
+
+
+def _has_zone_identifier(path_value):
+    zone_identifier_path = f"{path_value}:Zone.Identifier"
+    try:
+        with open(zone_identifier_path, "rb"):
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def _clear_packaged_download_markers(current_dir):
+    report = {
+        "download_marker_cleanup_enabled": False,
+        "download_marker_app_root": "",
+        "download_marker_scanned": 0,
+        "download_marker_detected": 0,
+        "download_marker_cleared": 0,
+        "download_marker_failed": 0,
+        "download_marker_failed_paths": [],
+    }
+
+    if os.name != "nt" or not (getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS")):
+        return report
+
+    app_root = _resolve_packaged_app_root(current_dir)
+    report["download_marker_cleanup_enabled"] = True
+    report["download_marker_app_root"] = str(app_root)
+
+    if not app_root.exists():
+        return report
+
+    for candidate in _iter_packaged_unblock_targets(app_root):
+        report["download_marker_scanned"] += 1
+        if not _has_zone_identifier(candidate):
+            continue
+
+        report["download_marker_detected"] += 1
+        zone_identifier_path = f"{candidate}:Zone.Identifier"
+        try:
+            os.remove(zone_identifier_path)
+            report["download_marker_cleared"] += 1
+        except OSError as exc:
+            report["download_marker_failed"] += 1
+            if len(report["download_marker_failed_paths"]) < 12:
+                report["download_marker_failed_paths"].append(
+                    {
+                        "path": str(candidate),
+                        "error": str(exc),
+                    }
+                )
+
+    return report
 
 
 def _resolve_webview2_runtime_dir(current_dir):
@@ -283,6 +370,9 @@ def main():
         set_explicit_run_context_path("")
 
     _set_windows_dpi_awareness()
+    current_dir = Path(__file__).resolve().parent
+    download_marker_report = _clear_packaged_download_markers(current_dir)
+    _update_startup_diagnostic_context(**download_marker_report)
 
     import webview
 
@@ -290,7 +380,6 @@ def main():
 
     webview.settings["DRAG_REGION_SELECTOR"] = ".window-drag-region"
 
-    current_dir = Path(__file__).resolve().parent
     runtime_dir = _configure_webview_runtime(webview, current_dir)
     _write_startup_diagnostic(
         "preflight_ok",
