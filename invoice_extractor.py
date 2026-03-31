@@ -7,6 +7,7 @@ import logging
 import shutil
 import fitz  # PyMuPDF
 import requests
+from document_types import MANUAL_REVIEW_FOLDER
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -21,6 +22,7 @@ class InvoiceExtractor:
         self.processed_records_file = os.path.join(self.output_dir, "processed_records.json")
         self.last_extraction_trace = {}
         self.last_route_trace = {}
+        self.last_timing_trace = {}
         os.makedirs(self.output_dir, exist_ok=True)
 
 
@@ -62,6 +64,62 @@ class InvoiceExtractor:
         except Exception as e:
             logging.error(f"Failed to convert PDF to base64 images: {pdf_path}, Error: {e}")
             return None
+
+    def _extract_embedded_pdf_text(self, pdf_path, max_pages=2):
+        if not pdf_path or not os.path.exists(pdf_path):
+            return ""
+        try:
+            parts = []
+            with fitz.open(pdf_path) as doc:
+                for page_index in range(min(max_pages, len(doc))):
+                    parts.append(doc.load_page(page_index).get_text("text") or "")
+            return "\n".join(part for part in parts if part).strip()
+        except Exception as exc:
+            logging.warning(f"Failed to read embedded PDF text for fast path: {exc}")
+            return ""
+
+    @staticmethod
+    def _looks_like_useful_embedded_pdf_text(text):
+        normalized = str(text or "").strip()
+        if len(normalized) < 120:
+            return False
+        lowered = normalized.lower()
+        primary_markers = (
+            "发票",
+            "电子发票",
+            "开票日期",
+            "价税合计",
+            "购买方",
+            "销售方",
+            "tax invoice",
+            "invoice number",
+            "invoice code",
+            "buyer",
+            "seller",
+            "purchaser",
+        )
+        has_primary_marker = any(token in lowered for token in primary_markers)
+        hotel_markers = (
+            "folio no.",
+            "arrival",
+            "departure",
+            "room charge",
+            "balance",
+            "结账单",
+            "入住日期",
+            "离店日期",
+            "消费合计",
+            "付款合计",
+        )
+        hotel_marker_hits = sum(1 for token in hotel_markers if token in lowered)
+        has_hotel_layout = hotel_marker_hits >= 3
+        if not has_primary_marker and not has_hotel_layout:
+            return False
+        has_amount = bool(re.search(r"(?:¥|￥)?\s*\d{1,8}(?:,\d{3})*\.\d{2}", normalized))
+        has_date = bool(re.search(r"20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}|\d{2}/\d{2}/\d{2}", normalized))
+        if "folio" in lowered and "tax invoice" not in lowered and "电子发票" not in normalized:
+            return has_hotel_layout and (has_amount or has_date)
+        return (has_primary_marker or has_hotel_layout) and (has_amount or has_date)
 
     def _try_extract_didi_invoice_from_pdf_text(self, pdf_path):
         """Local fallback for the stable Didi ride invoice PDF layout."""
@@ -122,6 +180,248 @@ class InvoiceExtractor:
             "Destination_City": "",
         }
 
+    def _try_extract_standard_china_einvoice_from_pdf_text(self, pdf_path):
+        """High-confidence fast path for standard Chinese electronic invoices with labeled buyer/seller fields."""
+        if not pdf_path or not os.path.exists(pdf_path):
+            return None
+        if not str(pdf_path).lower().endswith(".pdf"):
+            return None
+
+        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        if not text:
+            return None
+        if "电子发票" not in text or "发票号码" not in text or "开票日期" not in text:
+            return None
+
+        invoice_number_match = re.search(r"发票号码[:：]?\s*([0-9]{8,})", text)
+        date_match = re.search(r"开票日期[:：]?\s*(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
+        amount_match = (
+            re.search(r"价税合计(?:（小写）|\(小写\))?[:：]?\s*[¥￥]?\s*([0-9]+\.[0-9]{2})", text)
+            or re.search(r"（小写）\s*[¥￥]?\s*([0-9]+\.[0-9]{2})", text)
+            or re.search(r"¥\s*([0-9]+\.[0-9]{2})", text)
+        )
+        if not invoice_number_match or not date_match or not amount_match:
+            return None
+
+        compact_text = re.sub(r"\s+", "", text)
+        item_markers = {
+            "餐饮": ["*餐饮服务*", "餐费", "餐饮服务"],
+            "住宿发票": ["*住宿服务*", "住宿服务", "房费", "住宿费"],
+            "打车": ["*运输服务*", "客运服务费", "旅客运输服务", "滴滴"],
+            "过路费": ["通行费", "过路费"],
+        }
+        invoice_type = "其他"
+        for candidate_type, markers in item_markers.items():
+            if any(marker in compact_text for marker in markers):
+                invoice_type = candidate_type
+                break
+
+        tail_text = text[date_match.end():]
+        pair_pattern = re.compile(r"([A-Za-z0-9\u4e00-\u9fff（）()·\-]{2,})\s*\n\s*([0-9A-Z]{10,24})")
+        pairs = []
+        seen_names = set()
+        for match in pair_pattern.finditer(tail_text):
+            name = re.sub(r"\s+", "", match.group(1) or "").strip()
+            tax_id = re.sub(r"\s+", "", match.group(2) or "").strip()
+            if (
+                not name
+                or name in seen_names
+                or name in {"名称", "销售信息", "购买方信息", "销售方信息", "购买方", "销售方"}
+                or re.fullmatch(r"[0-9A-Z]{10,24}", name)
+            ):
+                continue
+            seen_names.add(name)
+            pairs.append((name, tax_id))
+            if len(pairs) >= 2:
+                break
+
+        if len(pairs) < 2:
+            return None
+
+        purchaser = pairs[0][0]
+        seller = pairs[1][0]
+        if purchaser == seller:
+            return None
+
+        date_value = f"{date_match.group(1)}{int(date_match.group(2)):02d}{int(date_match.group(3)):02d}"
+        amount_value = amount_match.group(1)
+        invoice_code_match = re.search(r"发票代码[:：]?\s*([0-9]{8,})", text)
+
+        return {
+            "is_invoice": True,
+            "Date": date_value,
+            "Purchaser": purchaser,
+            "Seller": seller,
+            "Amount": amount_value,
+            "InvoiceCode": invoice_code_match.group(1) if invoice_code_match else "",
+            "InvoiceNumber": invoice_number_match.group(1),
+            "Type": invoice_type,
+            "category": invoice_type,
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+        }
+
+    def _try_extract_standard_china_einvoice_from_pdf_text_v2(self, pdf_path):
+        """ASCII-safe parser for standard Chinese electronic invoice PDFs."""
+        if not pdf_path or not os.path.exists(pdf_path):
+            return None
+        if not str(pdf_path).lower().endswith(".pdf"):
+            return None
+
+        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        if not text:
+            return None
+
+        marker_invoice = "\u7535\u5b50\u53d1\u7968"
+        marker_number = "\u53d1\u7968\u53f7\u7801"
+        marker_date = "\u5f00\u7968\u65e5\u671f"
+        if marker_invoice not in text or marker_number not in text or marker_date not in text:
+            return None
+
+        compact_lines = [re.sub(r"\s+", "", line or "") for line in text.splitlines()]
+        compact_lines = [line for line in compact_lines if line]
+
+        invoice_number = next((line for line in compact_lines if re.fullmatch(r"[0-9]{8,}", line)), "")
+        if not invoice_number:
+            return None
+
+        date_match = None
+        for line in compact_lines:
+            match = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})日", line)
+            if match:
+                date_match = match
+                break
+        if not date_match:
+            return None
+
+        amount_match = (
+            re.search(r"\uff08\u5c0f\u5199\uff09\s*[\u00a5\uffe5]?\s*([0-9]+\.[0-9]{2})", text)
+            or re.search(r"[\u00a5\uffe5]\s*([0-9]+\.[0-9]{2})", text)
+        )
+        if not amount_match:
+            return None
+
+        compact_text = re.sub(r"\s+", "", text)
+        item_markers = {
+            "\u9910\u996e": ["*\u9910\u996e\u670d\u52a1*", "\u9910\u8d39", "\u9910\u996e\u670d\u52a1"],
+            "\u4f4f\u5bbf\u53d1\u7968": ["*\u4f4f\u5bbf\u670d\u52a1*", "\u4f4f\u5bbf\u670d\u52a1", "\u623f\u8d39", "\u4f4f\u5bbf\u8d39"],
+            "\u6253\u8f66": ["*\u8fd0\u8f93\u670d\u52a1*", "\u5ba2\u8fd0\u670d\u52a1\u8d39", "\u65c5\u5ba2\u8fd0\u8f93\u670d\u52a1", "\u6ef4\u6ef4"],
+            "\u8fc7\u8def\u8d39": ["\u901a\u884c\u8d39", "\u8fc7\u8def\u8d39"],
+        }
+        invoice_type = "\u5176\u4ed6"
+        for candidate_type, markers in item_markers.items():
+            if any(marker in compact_text for marker in markers):
+                invoice_type = candidate_type
+                break
+
+        date_line = date_match.group(0)
+        date_line_index = compact_lines.index(date_line) if date_line in compact_lines else -1
+        tail_lines = compact_lines[date_line_index + 1:] if date_line_index >= 0 else compact_lines
+        pairs = []
+        seen_names = set()
+        pair_pattern = re.compile(r"([A-Za-z0-9\u4e00-\u9fff\uff08\uff09()·\-]{2,})\s*\n\s*([0-9A-Z]{10,24})")
+        excluded_names = {
+            "\u540d\u79f0",
+            "\u9500\u552e\u4fe1\u606f",
+            "\u8d2d\u4e70\u65b9\u4fe1\u606f",
+            "\u9500\u552e\u65b9\u4fe1\u606f",
+            "\u8d2d\u4e70\u65b9",
+            "\u9500\u552e\u65b9",
+        }
+        for match in pair_pattern.finditer("\n".join(tail_lines)):
+            name = re.sub(r"\s+", "", match.group(1) or "").strip()
+            tax_id = re.sub(r"\s+", "", match.group(2) or "").strip()
+            if not name or name in seen_names or name in excluded_names or re.fullmatch(r"[0-9A-Z]{10,24}", name):
+                continue
+            seen_names.add(name)
+            pairs.append((name, tax_id))
+            if len(pairs) >= 2:
+                break
+        if len(pairs) < 2:
+            return None
+
+        purchaser = pairs[0][0]
+        seller = pairs[1][0]
+        if purchaser == seller:
+            return None
+
+        invoice_code_match = re.search(r"\u53d1\u7968\u4ee3\u7801[:\uff1a]?\s*([0-9]{8,})", text)
+        return {
+            "is_invoice": True,
+            "Date": f"{date_match.group(1)}{int(date_match.group(2)):02d}{int(date_match.group(3)):02d}",
+            "Purchaser": purchaser,
+            "Seller": seller,
+            "Amount": amount_match.group(1),
+            "InvoiceCode": invoice_code_match.group(1) if invoice_code_match else "",
+            "InvoiceNumber": invoice_number,
+            "Type": invoice_type,
+            "category": invoice_type,
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+        }
+
+    def _try_extract_ihg_folio_from_pdf_text(self, pdf_path):
+        """Conservative local parser for the recurring IHG folio layout."""
+        if not pdf_path or not os.path.exists(pdf_path):
+            return None
+        if not str(pdf_path).lower().endswith(".pdf"):
+            return None
+
+        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        if not text:
+            return None
+
+        lowered = text.lower()
+        required_markers = ("folio no.", "arrival", "departure", "room charge", "reference", "ihg reward club")
+        if any(marker not in lowered for marker in required_markers):
+            return None
+
+        compact_lines = [re.sub(r"\s+", " ", line or "").strip(" :") for line in text.splitlines()]
+        compact_lines = [line for line in compact_lines if line]
+
+        date_match = re.search(r"\b(\d{2})/(\d{2})/(\d{2})\b", text)
+        amount_match = re.search(r"Balance\s+([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})", text, re.IGNORECASE | re.DOTALL)
+        if not amount_match:
+            amount_match = re.search(r"Total\s+([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})", text, re.IGNORECASE | re.DOTALL)
+        if not date_match or not amount_match:
+            return None
+
+        purchaser = ""
+        seller = ""
+        for index, line in enumerate(compact_lines):
+            if line.lower() != "reference":
+                continue
+            tail_lines = compact_lines[index + 1:index + 6]
+            meaningful_lines = [
+                candidate
+                for candidate in tail_lines
+                if candidate and candidate not in {"Reference", "Guest Signature _____________________"}
+            ]
+            if len(meaningful_lines) >= 2:
+                purchaser = meaningful_lines[0]
+                seller = meaningful_lines[1]
+                break
+        if not purchaser or not seller:
+            return None
+
+        year = 2000 + int(date_match.group(3))
+        return {
+            "is_invoice": True,
+            "Date": f"{year:04d}{int(date_match.group(1)):02d}{int(date_match.group(2)):02d}",
+            "Purchaser": purchaser,
+            "Seller": seller,
+            "Amount": amount_match.group(1).replace(",", ""),
+            "InvoiceCode": "",
+            "InvoiceNumber": "",
+            "Type": "住宿",
+            "category": "住宿",
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+        }
+
     def extract_info_via_llm(self, base64_images, custom_rules="", pdf_path=None):
         """3.2 Construct the Vision/OCR API payload and extract structured JSON using dual engines"""
         from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_not_exception_type
@@ -137,6 +437,17 @@ class InvoiceExtractor:
             "result": None,
         }
         self.last_extraction_trace = copy.deepcopy(extraction_trace)
+        self.last_timing_trace = {}
+        timing_trace = {}
+        run_started_at = time.perf_counter()
+
+        def _elapsed_ms(started_at):
+            return round((time.perf_counter() - started_at) * 1000.0, 1)
+
+        def _finalize_timing():
+            timing_trace["total_ms"] = _elapsed_ms(run_started_at)
+            extraction_trace["timing_ms"] = copy.deepcopy(timing_trace)
+            self.last_timing_trace = copy.deepcopy(timing_trace)
 
         # 兼容单张图片的传入情况
         if isinstance(base64_images, str):
@@ -222,6 +533,10 @@ class InvoiceExtractor:
                 # 因此先将 PDF 第一页转为 PNG，再用 image/png base64 提交
                 ext = str(file_path).lower().split('.')[-1]
                 if ext == 'pdf':
+                    embedded_text = self._extract_embedded_pdf_text(file_path)
+                    if self._looks_like_useful_embedded_pdf_text(embedded_text):
+                        print(">>> [进度] 命中 PDF 文本快路径，直接复用内嵌文本")
+                        return embedded_text
                     import fitz
                     from PIL import Image
                     import io as _io
@@ -358,9 +673,41 @@ class InvoiceExtractor:
             # 强制日志输出物理校验信息
             print(f">>> [物理校验] 绝对路径: {abs_pdf_path} | 真实字节: {actual_size}")
             
-            full_ocr_text = _call_track_a_ocr(abs_pdf_path)
-            
-            track_a_result = _call_track_a_llm(full_ocr_text)
+            ihg_folio_result = self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path)
+            if ihg_folio_result:
+                extraction_trace["engine"] = "local_ihg_folio_pdf"
+                extraction_trace["reason_code"] = "LOCAL_IHG_FOLIO_PDF_FAST_PATH"
+                extraction_trace["result"] = copy.deepcopy(ihg_folio_result)
+                timing_trace["local_ihg_folio_pdf_ms"] = _elapsed_ms(run_started_at)
+                _finalize_timing()
+                self.last_extraction_trace = copy.deepcopy(extraction_trace)
+                _print_success_summary(ihg_folio_result)
+                return ihg_folio_result
+
+            local_standard_result = self._try_extract_standard_china_einvoice_from_pdf_text_v2(abs_pdf_path)
+            if not local_standard_result:
+                local_standard_result = self._try_extract_standard_china_einvoice_from_pdf_text(abs_pdf_path)
+            if local_standard_result:
+                extraction_trace["engine"] = "local_standard_einvoice_pdf"
+                extraction_trace["reason_code"] = "LOCAL_STANDARD_EINVOICE_PDF_FAST_PATH"
+                extraction_trace["result"] = copy.deepcopy(local_standard_result)
+                timing_trace["local_standard_pdf_ms"] = _elapsed_ms(run_started_at)
+                _finalize_timing()
+                self.last_extraction_trace = copy.deepcopy(extraction_trace)
+                _print_success_summary(local_standard_result)
+                return local_standard_result
+
+            track_a_ocr_started_at = time.perf_counter()
+            try:
+                full_ocr_text = _call_track_a_ocr(abs_pdf_path)
+            finally:
+                timing_trace["track_a_ocr_ms"] = _elapsed_ms(track_a_ocr_started_at)
+
+            track_a_llm_started_at = time.perf_counter()
+            try:
+                track_a_result = _call_track_a_llm(full_ocr_text)
+            finally:
+                timing_trace["track_a_llm_ms"] = _elapsed_ms(track_a_llm_started_at)
             track_a_success = True
             extraction_trace["track_a"] = {"status": "success", "reason_code": None, "message": None}
         except Exception as e:
@@ -375,17 +722,23 @@ class InvoiceExtractor:
         if track_a_success and track_a_result:
             extraction_trace["engine"] = "track_a"
             extraction_trace["result"] = copy.deepcopy(track_a_result)
+            _finalize_timing()
             self.last_extraction_trace = copy.deepcopy(extraction_trace)
             _print_success_summary(track_a_result)
             return track_a_result
 
         # Track B Fallback
         try:
-            track_b_result = _call_track_b_vision(base64_images)
+            track_b_started_at = time.perf_counter()
+            try:
+                track_b_result = _call_track_b_vision(base64_images)
+            finally:
+                timing_trace["track_b_vision_ms"] = _elapsed_ms(track_b_started_at)
             extraction_trace["track_b"] = {"status": "success", "reason_code": None, "message": None}
             extraction_trace["engine"] = "track_b"
             extraction_trace["reason_code"] = "TRACK_A_FAILED_TRACK_B_FALLBACK"
             extraction_trace["result"] = copy.deepcopy(track_b_result)
+            _finalize_timing()
             self.last_extraction_trace = copy.deepcopy(extraction_trace)
             if track_b_result:
                 _print_success_summary(track_b_result)
@@ -402,11 +755,13 @@ class InvoiceExtractor:
                 extraction_trace["engine"] = "local_didi_pdf_fallback"
                 extraction_trace["reason_code"] = "TRACK_A_TRACK_B_FAILED_LOCAL_DIDI_PDF_FALLBACK"
                 extraction_trace["result"] = copy.deepcopy(local_fallback_result)
+                _finalize_timing()
                 self.last_extraction_trace = copy.deepcopy(extraction_trace)
                 _print_success_summary(local_fallback_result)
                 return local_fallback_result
 
             extraction_trace["reason_code"] = "EXTRACTOR_ALL_ENGINES_FAILED"
+            _finalize_timing()
             self.last_extraction_trace = copy.deepcopy(extraction_trace)
             return None
 
@@ -445,6 +800,53 @@ class InvoiceExtractor:
         name = re.sub(r'\s+', ' ', name)
         return name
 
+    def _has_minimum_archive_fields(self, invoice_info):
+        """Only archive records that look like a real invoice after normalization."""
+        if not invoice_info or not isinstance(invoice_info, dict):
+            return False
+
+        def _normalized_text(value):
+            return str(value or "").strip()
+
+        def _has_meaningful_date(value):
+            text = _normalized_text(value)
+            if not text or text in {"未知", "未知日期", "UnknownDate"}:
+                return False
+            digits = re.sub(r"\D", "", text)
+            return len(digits) >= 8
+
+        def _has_meaningful_seller(value):
+            text = _normalized_text(value)
+            if not text:
+                return False
+            normalized = text.lower()
+            invalid_tokens = {
+                "未知开票方",
+                "unknownseller",
+                "无法读取商户",
+                "暂无抬头",
+                "未知",
+            }
+            return normalized not in invalid_tokens
+
+        def _has_positive_amount(value):
+            text = _normalized_text(value).replace(",", "")
+            match = re.search(r"-?\d+(?:\.\d+)?", text)
+            if not match:
+                return False
+            try:
+                return float(match.group(0)) > 0
+            except ValueError:
+                return False
+
+        invoice_type = _normalized_text(invoice_info.get("Type", ""))
+        date_value = invoice_info.get("Departure_Date") if invoice_type == "火车票" else invoice_info.get("Date")
+        return (
+            _has_meaningful_date(date_value)
+            and _has_meaningful_seller(invoice_info.get("Seller"))
+            and _has_positive_amount(invoice_info.get("Amount"))
+        )
+
     def route_and_rename_file(self, pdf_path, invoice_info, custom_rules=None):
         """3.4 Implement the renaming and folder routing logic with Manual_Check rescuing"""
         import uuid
@@ -463,7 +865,7 @@ class InvoiceExtractor:
         self.last_route_trace = copy.deepcopy(route_trace)
         
         def save_to_manual_check(reason_prefix):
-            target_folder = "Manual_Check"
+            target_folder = MANUAL_REVIEW_FOLDER
             new_filename = f"{reason_prefix}_{os.path.basename(pdf_path)}"
             final_dir = os.path.join(self.output_dir, target_folder)
             os.makedirs(final_dir, exist_ok=True)
@@ -479,7 +881,7 @@ class InvoiceExtractor:
                 
             try:
                 shutil.copy2(pdf_path, final_path)
-                logging.warning(f"File rescued to Manual_Check: {final_path}")
+                logging.warning(f"File rescued to {MANUAL_REVIEW_FOLDER}: {final_path}")
                 route_trace.update({
                     "status": "manual_check",
                     "reason_code": "ROUTE_TO_MANUAL_CHECK",
@@ -508,8 +910,14 @@ class InvoiceExtractor:
                 return False, str(e)
                 
         if not invoice_info or not isinstance(invoice_info, dict):
-            logging.warning(f"No valid LLM info returned for {pdf_path}. Moving to Manual_Check.")
+            logging.warning(f"No valid LLM info returned for {pdf_path}. Moving to {MANUAL_REVIEW_FOLDER}.")
             return save_to_manual_check("Unrecognized")
+
+        if not self._has_minimum_archive_fields(invoice_info):
+            logging.warning(f"Invoice info missing minimum archive fields for {pdf_path}. Moving to {MANUAL_REVIEW_FOLDER}.")
+            route_trace["reason_code"] = "LOW_CONFIDENCE_INVOICE_FIELDS"
+            self.last_route_trace = copy.deepcopy(route_trace)
+            return save_to_manual_check("NeedsReview")
             
         inv_type = self.safe_filename(invoice_info.get("Type", "未知分类"))
         _, ext = os.path.splitext(pdf_path)

@@ -81,6 +81,25 @@ class PDFConverter:
         self.staging_dir = os.path.abspath(staging_dir)
         self.timeout_ms = timeout_ms
         self.generic_timeout_ms = max(8000, min(int(timeout_ms or 0) or 30000, 12000))
+        self.provider_settle_timeout_ms = max(1500, min(int(timeout_ms or 0) or 30000, 4000))
+
+    @staticmethod
+    def _elapsed_ms(started_at):
+        import time
+        return round((time.perf_counter() - started_at) * 1000.0, 1)
+
+    @staticmethod
+    def _baiwang_url_priority(url):
+        normalized = str(url or "").lower()
+        if "previewinvoice" in normalized or "previewinvoiceallele" in normalized or "smkp-vue" in normalized:
+            return 0
+        if "ad.efapiao.com/api/affair/maillink" in normalized:
+            return 1
+        if "pis.baiwang.com" in normalized:
+            return 2
+        if "www.baiwang.com" in normalized or "official_website" in normalized:
+            return 9
+        return 5
 
     @staticmethod
     def _pdf_bytes_look_valid(pdf_bytes):
@@ -127,6 +146,7 @@ class PDFConverter:
 
     def _classify_generic_page(self, url, title_text, body_text, response_status=None):
         normalized = self._normalized_page_text(url, title_text, body_text)
+        normalized_lower = normalized.lower()
         auth_tokens = (
             "登录",
             "login",
@@ -159,18 +179,39 @@ class PDFConverter:
             "banking",
             "credit card",
         )
-        has_invoice_signal = self._has_invoice_keywords(normalized)
-        if response_status in {401, 403} or any(token in normalized for token in auth_tokens):
+        nuonuo_platform_tokens = (
+            "本软件由浙江诺诺网络科技有限公司开发运营",
+            "企业税务数智化协同管理平台",
+            "诺税通-税务共享平台",
+            "全链路票据解决方案",
+            "立即体验",
+        )
+        has_invoice_signal = self._has_invoice_keywords(normalized_lower)
+        nuonuo_platform_hits = sum(1 for token in nuonuo_platform_tokens if token.lower() in normalized_lower)
+        if response_status in {401, 403} or any(token in normalized_lower for token in auth_tokens):
             return (
                 "URL_AUTH_WALL_DETECTED",
                 "URL stopped at an authentication wall or captcha before a usable invoice document was available.",
             )
-        if not has_invoice_signal and any(token in normalized for token in non_invoice_tokens):
+        if nuonuo_platform_hits >= 2:
+            return (
+                "URL_NON_INVOICE_PAGE_SKIPPED",
+                "URL resolved to a generic Nuonuo product or platform page and was safely skipped before PDF generation.",
+            )
+        if not has_invoice_signal and any(token in normalized_lower for token in non_invoice_tokens):
             return (
                 "URL_NON_INVOICE_PAGE_SKIPPED",
                 "URL resolved to a non-invoice page and was safely skipped before PDF generation.",
             )
         return "", ""
+
+    def _goto_provider_page(self, page, url):
+        response = page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=self.provider_settle_timeout_ms)
+        except Exception:
+            pass
+        return response
 
     def _read_pdf_text(self, pdf_path, max_pages=2):
         if not pdf_path or not os.path.exists(pdf_path):
@@ -611,6 +652,7 @@ class PDFConverter:
 
     def _recover_baiwang_group(self, candidate_urls, subject, email_id, email_staging_path, candidate_info):
         expected_fields = merge_expected_fields(candidate_info.get("provider_expected_fields", {}))
+        recovery_started_at = __import__("time").perf_counter()
         recovery_meta = {
             "source_url": candidate_info.get("source_url") or (candidate_urls[0] if candidate_urls else ""),
             "candidate_urls": list(candidate_urls),
@@ -629,9 +671,11 @@ class PDFConverter:
             "selected_fields": {},
             "captured_network": [],
             "captured_artifacts": [],
+            "timing_ms": {},
         }
         artifacts = []
         network_logs = []
+        ordered_candidate_urls = sorted(list(candidate_urls), key=self._baiwang_url_priority)
 
         self._require_requests()
         self._require_playwright()
@@ -640,11 +684,14 @@ class PDFConverter:
                 browser = self._launch_chromium_browser(playwright, "baiwang recovery")
                 context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
                 try:
-                    for index, url in enumerate(candidate_urls, start=1):
+                    for index, url in enumerate(ordered_candidate_urls, start=1):
                         artifact_prefix = os.path.join(email_staging_path, f"baiwang_{index}")
                         direct_artifacts, direct_logs = self._probe_direct_artifact(session, url, artifact_prefix)
                         artifacts.extend(direct_artifacts)
                         network_logs.extend(direct_logs)
+                        selected_artifact, _ = self._select_baiwang_recovery_result(artifacts, expected_fields)
+                        if selected_artifact:
+                            break
 
                         page = context.new_page()
                         captured_responses = []
@@ -663,7 +710,7 @@ class PDFConverter:
 
                         page.on("response", _on_response)
                         try:
-                            response = page.goto(url, timeout=self.timeout_ms, wait_until="networkidle")
+                            response = self._goto_provider_page(page, url)
                             if not response:
                                 network_logs.append({"kind": "navigation_no_response", "url": url})
                                 continue
@@ -713,6 +760,9 @@ class PDFConverter:
                                             "content_type": response_item["content_type"],
                                         }
                                     )
+                            selected_artifact, _ = self._select_baiwang_recovery_result(artifacts, expected_fields)
+                            if selected_artifact:
+                                break
                         except PlaywrightTimeoutError:
                             network_logs.append({"kind": "navigation_timeout", "url": url})
                         except Exception as exc:
@@ -724,6 +774,7 @@ class PDFConverter:
                     browser.close()
 
         selected_artifact, select_reason = self._select_baiwang_recovery_result(artifacts, expected_fields)
+        recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
         recovery_meta["captured_network"] = network_logs[:200]
         recovery_meta["captured_artifacts"] = [
             {
@@ -766,6 +817,7 @@ class PDFConverter:
     def _recover_direct_invoice_group(self, candidate_urls, subject, email_id, email_staging_path, candidate_info):
         provider_family = str(candidate_info.get("provider_family") or infer_direct_invoice_family(candidate_urls[0] if candidate_urls else "")).strip()
         expected_fields = dict(candidate_info.get("provider_expected_fields", {}) or {})
+        recovery_started_at = __import__("time").perf_counter()
         recovery_meta = {
             "source_url": candidate_info.get("source_url") or (candidate_urls[0] if candidate_urls else ""),
             "candidate_urls": list(candidate_urls),
@@ -792,6 +844,7 @@ class PDFConverter:
             "captured_artifacts": [],
             "retention_bucket_suffix": "direct_invoice_url",
             "provider_recovery_message": "Direct invoice recovery exhausted all restoration paths without a confirmed invoice PDF.",
+            "timing_ms": {},
         }
         artifacts = []
         network_logs = []
@@ -812,6 +865,9 @@ class PDFConverter:
                         direct_artifacts, direct_logs = self._probe_direct_invoice_artifact(session, url, artifact_prefix)
                         artifacts.extend(direct_artifacts)
                         network_logs.extend(direct_logs)
+                        selected_artifact, _ = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
+                        if selected_artifact:
+                            break
 
                         if direct_artifacts and any(item.get("kind") == "pdf" for item in direct_artifacts):
                             continue
@@ -836,7 +892,7 @@ class PDFConverter:
 
                         page.on("response", _on_response)
                         try:
-                            response = page.goto(url, timeout=self.timeout_ms, wait_until="networkidle")
+                            response = self._goto_provider_page(page, url)
                             if not response:
                                 network_logs.append({"kind": "navigation_no_response", "url": url})
                                 continue
@@ -889,6 +945,9 @@ class PDFConverter:
                                             "content_type": response_item["content_type"],
                                         }
                                     )
+                            selected_artifact, _ = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
+                            if selected_artifact:
+                                break
                         except PlaywrightTimeoutError:
                             network_logs.append({"kind": "navigation_timeout", "url": url})
                         except Exception as exc:
@@ -900,6 +959,7 @@ class PDFConverter:
                     browser.close()
 
         selected_artifact, select_reason = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
+        recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
         recovery_meta["captured_network"] = network_logs[:200]
         recovery_meta["captured_artifacts"] = [
             {
@@ -987,6 +1047,7 @@ class PDFConverter:
             for index, url in enumerate(invoice_urls):
                 logging.info("Visiting URL: %s", url)
                 page = context.new_page()
+                link_started_at = __import__("time").perf_counter()
                 pdf_path = os.path.join(email_staging_path, f"web_invoice_{index + 1}.pdf")
                 link_meta = {
                     "source_url": url,
@@ -997,10 +1058,15 @@ class PDFConverter:
                     "wrapper_detected": False,
                     "body_excerpt": "",
                     "page_title": "",
+                    "timing_ms": {},
                     "status": "started",
                     "reason_code": "",
                     "message": "",
                 }
+
+                def _append_link_result():
+                    link_meta["timing_ms"] = {"total_ms": self._elapsed_ms(link_started_at)}
+                    downloaded_items.append(dict(link_meta))
 
                 try:
                     response = page.goto(url, timeout=self.generic_timeout_ms, wait_until="domcontentloaded")
@@ -1014,7 +1080,7 @@ class PDFConverter:
                             }
                         )
                         if return_metadata:
-                            downloaded_items.append(dict(link_meta))
+                            _append_link_result()
                         continue
 
                     body_text = self._read_body_text(page)
@@ -1041,14 +1107,14 @@ class PDFConverter:
                             }
                         )
                         if return_metadata:
-                            downloaded_items.append(dict(link_meta))
+                            _append_link_result()
                         continue
 
                     logging.info("Generating PDF from webpage...")
                     page.pdf(path=pdf_path, format="A4", print_background=True)
                     if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1024:
                         link_meta.update({"status": "downloaded", "download_mode": "page_pdf"})
-                        downloaded_items.append(dict(link_meta))
+                        _append_link_result()
                     else:
                         logging.warning("Generated PDF is empty or missing: %s", pdf_path)
                         link_meta.update(
@@ -1059,7 +1125,7 @@ class PDFConverter:
                             }
                         )
                         if return_metadata:
-                            downloaded_items.append(dict(link_meta))
+                            _append_link_result()
                 except PlaywrightTimeoutError:
                     logging.error("Timeout (%sms) while loading %s", self.generic_timeout_ms, url)
                     with open(os.path.join(self.staging_dir, "process_log.txt"), "a", encoding="utf-8") as handle:
@@ -1072,7 +1138,7 @@ class PDFConverter:
                         }
                     )
                     if return_metadata:
-                        downloaded_items.append(dict(link_meta))
+                        _append_link_result()
                 except Exception as exc:
                     logging.error("Error processing URL %s: %s", url, exc)
                     link_meta.update(
@@ -1083,8 +1149,9 @@ class PDFConverter:
                         }
                     )
                     if return_metadata:
-                        downloaded_items.append(dict(link_meta))
+                        _append_link_result()
                 finally:
+                    link_meta["timing_ms"] = {"total_ms": self._elapsed_ms(link_started_at)}
                     if not page.is_closed():
                         page.close()
 

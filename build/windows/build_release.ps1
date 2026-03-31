@@ -77,23 +77,87 @@ function Assert-LeafPathExists {
 function Remove-PathIfExists {
     param([string]$PathValue)
 
-    if (Test-Path $PathValue) {
-        if (Test-Path $PathValue -PathType Container) {
-            cmd /c "rmdir /s /q `"$PathValue`"" | Out-Null
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (-not (Test-Path $PathValue)) {
+            return
+        }
+
+        try {
+            if (Test-Path $PathValue -PathType Container) {
+                Remove-Item -LiteralPath $PathValue -Recurse -Force -ErrorAction Stop
+            }
+            else {
+                Remove-Item -LiteralPath $PathValue -Force -ErrorAction Stop
+            }
             if (Test-Path $PathValue) {
-                Remove-Item -LiteralPath $PathValue -Recurse -Force
+                throw "Path still exists after deletion attempt: $PathValue"
+            }
+            return
+        }
+        catch {
+            if (-not (Test-Path $PathValue)) {
+                return
+            }
+            if ($attempt -ge 5) {
+                throw
+            }
+            Start-Sleep -Milliseconds 1000
+        }
+    }
+}
+
+function Clear-DirectoryContents {
+    param([string]$PathValue)
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (-not (Test-Path $PathValue -PathType Container)) {
+            return
+        }
+
+        $items = @(Get-ChildItem -LiteralPath $PathValue -Force -ErrorAction SilentlyContinue)
+        if ($items.Count -eq 0) {
+            return
+        }
+
+        foreach ($item in $items) {
+            try {
+                if ($item.PSIsContainer) {
+                    Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+                }
+                else {
+                    Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+                }
+            }
+            catch {
+                if (-not (Test-Path $item.FullName)) {
+                    continue
+                }
             }
         }
-        else {
-            Remove-Item -LiteralPath $PathValue -Force
+
+        $remaining = @(Get-ChildItem -LiteralPath $PathValue -Force -ErrorAction SilentlyContinue)
+        if ($remaining.Count -eq 0) {
+            return
         }
+
+        Start-Sleep -Milliseconds 1000
+    }
+
+    $stillRemaining = @(Get-ChildItem -LiteralPath $PathValue -Force -ErrorAction SilentlyContinue)
+    if ($stillRemaining.Count -gt 0) {
+        throw "Failed to clear directory contents: $PathValue"
     }
 }
 
 function New-CleanDirectory {
     param([string]$PathValue)
 
-    Remove-PathIfExists -PathValue $PathValue
+    if (Test-Path $PathValue -PathType Container) {
+        Clear-DirectoryContents -PathValue $PathValue
+    }
+    else {
+        Remove-PathIfExists -PathValue $PathValue
+    }
     New-Item -ItemType Directory -Force -Path $PathValue | Out-Null
 }
 
@@ -153,6 +217,67 @@ function Render-VersionInfo {
     $content = $content.Replace("{{FILE_DESCRIPTION}}", "$ProductName Windows desktop application")
     $content = $content.Replace("{{COMPANY_NAME}}", "InvoiceFlowAI")
     Set-Content -Path $OutputPath -Value $content -Encoding UTF8
+}
+
+function Resolve-GitRevision {
+    param([string]$RootPath)
+
+    $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $gitCommand) {
+        return "snapshot"
+    }
+
+    try {
+        $revision = & $gitCommand.Source -C $RootPath rev-parse --short HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($revision)) {
+            return ($revision | Select-Object -First 1).Trim()
+        }
+    }
+    catch {
+    }
+
+    return "snapshot"
+}
+
+function Write-BuildIdentity {
+    param(
+        [string]$PythonExe,
+        [string]$OutputPath,
+        [string]$SourceRevision
+    )
+
+    $previousBuildTime = $env:INVOICEFLOW_BUILD_TIME
+    $previousSourceRevision = $env:INVOICEFLOW_BUILD_SOURCE_REVISION
+    $previousBuildLabel = $env:INVOICEFLOW_BUILD_LABEL
+    try {
+        $env:INVOICEFLOW_BUILD_TIME = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
+        $env:INVOICEFLOW_BUILD_SOURCE_REVISION = $SourceRevision
+        $env:INVOICEFLOW_BUILD_LABEL = "desktop-release"
+        $script = @'
+import json
+import os
+import sys
+from build_identity import build_runtime_identity
+
+output_path = sys.argv[1]
+payload = build_runtime_identity(
+    build_time=os.getenv("INVOICEFLOW_BUILD_TIME"),
+    source_revision=os.getenv("INVOICEFLOW_BUILD_SOURCE_REVISION"),
+    build_label=os.getenv("INVOICEFLOW_BUILD_LABEL"),
+)
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2)
+'@
+        $script | & $PythonExe - $OutputPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to render build identity JSON."
+        }
+    }
+    finally {
+        if ($null -ne $previousBuildTime) { $env:INVOICEFLOW_BUILD_TIME = $previousBuildTime } else { Remove-Item Env:INVOICEFLOW_BUILD_TIME -ErrorAction SilentlyContinue }
+        if ($null -ne $previousSourceRevision) { $env:INVOICEFLOW_BUILD_SOURCE_REVISION = $previousSourceRevision } else { Remove-Item Env:INVOICEFLOW_BUILD_SOURCE_REVISION -ErrorAction SilentlyContinue }
+        if ($null -ne $previousBuildLabel) { $env:INVOICEFLOW_BUILD_LABEL = $previousBuildLabel } else { Remove-Item Env:INVOICEFLOW_BUILD_LABEL -ErrorAction SilentlyContinue }
+    }
 }
 
 function Assert-PythonDependencies {
@@ -359,8 +484,22 @@ function Assert-DistributionTree {
 function Assert-DistributionTreeSanitized {
     param([string]$PathValue)
 
+    $entries = $null
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            $entries = @(Get-ChildItem -LiteralPath $PathValue -Recurse -Force -ErrorAction Stop)
+            break
+        }
+        catch {
+            if ($attempt -ge 5) {
+                throw
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
     $forbiddenHits = @()
-    foreach ($entry in Get-ChildItem -Recurse -Force $PathValue) {
+    foreach ($entry in $entries) {
         $name = $entry.Name
         if ($entry.PSIsContainer -and $name -eq "diagnostics") {
             $forbiddenHits += $entry.FullName
@@ -384,6 +523,67 @@ function Assert-DistributionTreeSanitized {
     }
 }
 
+function Remove-PackagedChromiumExcludedEntries {
+    param(
+        [string]$PathValue,
+        [string[]]$ExcludedEntryNames
+    )
+
+    $runtimeRoot = Join-Path $PathValue "_internal\\runtime\\ms-playwright"
+    if (-not (Test-Path $runtimeRoot -PathType Container)) {
+        return
+    }
+
+    foreach ($entryName in $ExcludedEntryNames) {
+        if ([string]::IsNullOrWhiteSpace($entryName)) {
+            continue
+        }
+        Remove-PathIfExists -PathValue (Join-Path $runtimeRoot $entryName)
+    }
+}
+
+function Assert-BuildIdentityPayload {
+    param([string]$PathValue)
+
+    $identityPath = Join-Path $PathValue "_internal\\build_meta\\build-identity.generated.json"
+    Assert-LeafPathExists -PathValue $identityPath -Label "Build identity payload"
+    $templatePath = Join-Path $PathValue "_internal\\templates\\index_app.js"
+    Assert-LeafPathExists -PathValue $templatePath -Label "Packaged frontend template"
+    $validationScript = @'
+import json
+import sys
+from pathlib import Path
+
+identity_path = Path(sys.argv[1])
+template_path = Path(sys.argv[2])
+identity = json.loads(identity_path.read_text(encoding="utf-8-sig"))
+
+expected_manual = "\u5f85\u4eba\u5de5\u590d\u6838"
+expected_non_target = "\u975e\u76ee\u6807\u516c\u53f8\u53d1\u7968"
+required_markers = [
+    'name: "InvoiceFlowAI"',
+    'subtitle: "AI\u53d1\u7968\u7ba1\u5bb6"',
+    "const APP_VISIBLE_COPY = {",
+]
+
+if str(identity.get("manual_review_folder", "")) != expected_manual:
+    raise SystemExit(f"Build identity manual_review_folder mismatch: {identity.get('manual_review_folder')}")
+if str(identity.get("non_target_company_folder", "")) != expected_non_target:
+    raise SystemExit(f"Build identity non_target_company_folder mismatch: {identity.get('non_target_company_folder')}")
+if not str(identity.get("url_strategy_version", "")).strip():
+    raise SystemExit("Build identity url_strategy_version is missing.")
+
+template_text = template_path.read_text(encoding="utf-8-sig")
+for marker in required_markers:
+    if marker not in template_text:
+        raise SystemExit(f"Packaged frontend template is missing required marker: {marker}")
+'@
+    $validationScript | & $resolvedBuildPythonExe - $identityPath $templatePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Build identity validation failed."
+    }
+}
+
 function New-PortableArchive {
     param(
         [string]$SourceDir,
@@ -392,19 +592,32 @@ function New-PortableArchive {
         [string]$OutputPath
     )
 
-    New-CleanDirectory -PathValue $PortableWorkDir
-    $portableRoot = Join-Path $PortableWorkDir $RootName
-    Invoke-Robocopy -Source $SourceDir -Destination $portableRoot
+    New-Item -ItemType Directory -Force -Path $PortableWorkDir | Out-Null
 
-    if (Test-Path $OutputPath -PathType Leaf) {
-        Remove-Item -LiteralPath $OutputPath -Force
-    }
+    Remove-PathIfExists -PathValue $OutputPath
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutputPath) | Out-Null
-    $tarPath = Resolve-CallableTool -PathValue "tar.exe" -Label "tar"
-    & $tarPath -a -cf $OutputPath -C $PortableWorkDir $RootName
-    if ($LASTEXITCODE -ne 0) {
-        throw "tar.exe failed to create portable archive with exit code $LASTEXITCODE"
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::Open($OutputPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $sourceRoot = (Get-Item -LiteralPath $SourceDir).FullName
+        foreach ($entry in Get-ChildItem -LiteralPath $SourceDir -Recurse -Force -File) {
+            $fullName = $entry.FullName
+            $relativePath = $fullName.Substring($sourceRoot.Length).TrimStart('\')
+            $archivePath = (Join-Path $RootName $relativePath) -replace "\\", "/"
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip,
+                $fullName,
+                $archivePath,
+                [System.IO.Compression.CompressionLevel]::Optimal
+            ) | Out-Null
+        }
     }
+    finally {
+        $zip.Dispose()
+    }
+
     Assert-LeafPathExists -PathValue $OutputPath -Label "Portable archive"
 }
 
@@ -528,6 +741,7 @@ $installerOutputDir = Resolve-RepoPath $manifest.installer.outputDir
 $installerOutputBaseName = [string]$manifest.installer.outputBaseName
 $versionTemplatePath = Resolve-RepoPath $manifest.version.template
 $versionOutputPath = Resolve-RepoPath $manifest.version.rendered
+$buildIdentityOutputPath = Resolve-RepoPath "build/windows/build-identity.generated.json"
 $specPath = Resolve-RepoPath "build/windows/InvoiceFlowAI.spec"
 $runtimeHookPath = Resolve-RepoPath $manifest.runtimeHook
 $iconPath = Resolve-ToolPath ($manifest.icon.exeIconPath)
@@ -554,6 +768,7 @@ $chromiumCheck = Assert-ChromiumStagingClean -PathValue $chromiumStageDir
 
 New-Item -ItemType Directory -Force -Path $packagingWorkDir | Out-Null
 Render-VersionInfo -TemplatePath $versionTemplatePath -OutputPath $versionOutputPath -VersionText $Version -ProductName $manifest.appName
+Write-BuildIdentity -PythonExe $resolvedBuildPythonExe -OutputPath $buildIdentityOutputPath -SourceRevision (Resolve-GitRevision -RootPath $RepoRoot)
 Set-Item -Path "Env:$($manifest.chromium.envVar)" -Value $chromiumStageDir
 $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1"
 
@@ -566,6 +781,7 @@ Write-Host "Build Python version: $buildPythonVersion"
 Write-Host "Python dependencies: OK"
 Write-Host "SignTool path: $resolvedSignToolPath"
 Write-Host "Version file: $versionOutputPath"
+Write-Host "Build identity file: $buildIdentityOutputPath"
 Write-Host "Chromium staging dir: $chromiumStageDir"
 Write-Host "Chromium payloads: $($chromiumCheck.ChromiumPayloads -join ', ')"
 Write-Host "PyInstaller spec: $specPath"
@@ -601,9 +817,8 @@ if ($RunPyInstaller) {
     Remove-PathIfExists -PathValue $portableZipPath
     Remove-PathIfExists -PathValue $installerOutputDir
     Remove-PathIfExists -PathValue $sha256OutputPath
-    Copy-SanitizedChromiumPayload -SourceDir $chromiumStageDir -DestinationDir $sanitizedChromiumDir -ExcludedEntryNames $chromiumExcludeEntries
 
-    $env:INVOICEFLOW_RUNTIME_SOURCE = $sanitizedChromiumDir
+    $env:INVOICEFLOW_RUNTIME_SOURCE = $chromiumStageDir
     try {
         $arguments = @(
             "-m",
@@ -628,13 +843,17 @@ if ($RunPyInstaller) {
 
     Assert-DistributionTree -PathValue $distDir -AppName $manifest.appName
     Copy-HandoffReadme -SourcePath $handoffReadmeSource -DestinationDir $distDir -OutputFileName $handoffReadmeOutputName | Out-Null
+    Remove-PackagedChromiumExcludedEntries -PathValue $distDir -ExcludedEntryNames $chromiumExcludeEntries
     Assert-DistributionTreeSanitized -PathValue $distDir
+    Assert-BuildIdentityPayload -PathValue $distDir
     [void]$artifactPaths.Add($packagedExePath)
 }
 else {
     Assert-DistributionTree -PathValue $distDir -AppName $manifest.appName
     Copy-HandoffReadme -SourcePath $handoffReadmeSource -DestinationDir $distDir -OutputFileName $handoffReadmeOutputName | Out-Null
+    Remove-PackagedChromiumExcludedEntries -PathValue $distDir -ExcludedEntryNames $chromiumExcludeEntries
     Assert-DistributionTreeSanitized -PathValue $distDir
+    Assert-BuildIdentityPayload -PathValue $distDir
 }
 
 if ($RunPortableZip) {

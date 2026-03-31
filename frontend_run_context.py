@@ -39,6 +39,7 @@ def _empty_run_context():
         "monitoring_dir": "",
         "qc_dir": "",
         "debug_trace_path": "",
+        "locked_email": "",
         "locked_date_from": "",
         "locked_date_to": "",
         "disable_auto_local_scan": False,
@@ -101,6 +102,7 @@ def load_run_context():
     if not run_id and run_root:
         run_id = os.path.basename(run_root)
 
+    locked_email = str(file_context.get("locked_email", "") or file_context.get("email", "")).strip()
     locked_date_from = str(file_context.get("locked_date_from", "")).strip()
     locked_date_to = str(file_context.get("locked_date_to", "")).strip()
     disable_auto_local_scan = bool(file_context.get("disable_auto_local_scan", False))
@@ -124,6 +126,7 @@ def load_run_context():
         "monitoring_dir": monitoring_dir or (os.path.join(run_root, "monitoring") if run_root else ""),
         "qc_dir": qc_dir or (os.path.join(run_root, "monitoring", "qc") if run_root else ""),
         "debug_trace_path": debug_trace_path or (os.path.join(run_root, "diagnostics", "debug_trace.jsonl") if run_root else ""),
+        "locked_email": locked_email,
         "locked_date_from": locked_date_from,
         "locked_date_to": locked_date_to,
         "disable_auto_local_scan": disable_auto_local_scan,
@@ -160,6 +163,7 @@ def serialize_run_context(context):
         "run_id": context.get("run_id", ""),
         "run_root": context.get("run_root", ""),
         "locked_output_path": context.get("output_dir", ""),
+        "locked_email": context.get("locked_email", ""),
         "locked_date_from": context.get("locked_date_from", ""),
         "locked_date_to": context.get("locked_date_to", ""),
         "debug_trace_path": context.get("debug_trace_path", ""),

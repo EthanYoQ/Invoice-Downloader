@@ -1,0 +1,36 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="164" y1="112" x2="860" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F1E3A"/>
+      <stop offset="0.52" stop-color="#133463"/>
+      <stop offset="1" stop-color="#08111F"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="232" y1="178" x2="814" y2="836" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7AD8FF" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#4C8FFF" stop-opacity="0.65"/>
+    </linearGradient>
+    <linearGradient id="text" x1="304" y1="296" x2="736" y2="736" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EAF6FF"/>
+      <stop offset="1" stop-color="#8DDBFF"/>
+    </linearGradient>
+    <filter id="shadow" x="102" y="98" width="820" height="860" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="30" stdDeviation="34" flood-color="#020712" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="#05070D"/>
+  <g filter="url(#shadow)">
+    <rect x="138" y="122" width="748" height="780" rx="196" fill="url(#bg)"/>
+    <rect x="138" y="122" width="748" height="780" rx="196" stroke="url(#stroke)" stroke-width="12"/>
+    <rect x="236" y="206" width="552" height="84" rx="42" fill="#FFFFFF" fill-opacity="0.05"/>
+    <circle cx="292" cy="248" r="16" fill="#74DCFF" fill-opacity="0.78"/>
+    <circle cx="336" cy="248" r="16" fill="#4C8FFF" fill-opacity="0.72"/>
+    <circle cx="380" cy="248" r="16" fill="#9AE8FF" fill-opacity="0.48"/>
+    <path d="M286 398H744C769.405 398 790 418.595 790 444V714C790 739.405 769.405 760 744 760H286C260.595 760 240 739.405 240 714V444C240 418.595 260.595 398 286 398Z" fill="#040A14" fill-opacity="0.16" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="4"/>
+    <path d="M344 396V728" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="4"/>
+    <path d="M440 468H678" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="26" stroke-linecap="round"/>
+    <path d="M440 548H650" stroke="#FFFFFF" stroke-opacity="0.1" stroke-width="26" stroke-linecap="round"/>
+    <path d="M440 628H606" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="26" stroke-linecap="round"/>
+    <path d="M338 436H508V506H432V728H338V436Z" fill="url(#text)"/>
+    <path d="M548 436H762V516H642V560H734V638H642V728H548V436Z" fill="url(#text)"/>
+  </g>
+</svg>

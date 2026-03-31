@@ -243,11 +243,10 @@ def _ensure_expected_frontend_assets(current_dir):
     ]
     expected_js_markers = [
         'name: "InvoiceFlowAI"',
-        'subtitle: "External Test Build',
+        'subtitle: "AI发票管家',
+        "const APP_VISIBLE_COPY = {",
     ]
-    unexpected_js_markers = [
-        'AI发票管家',
-    ]
+    unexpected_js_markers = []
 
     missing_markers = [
         marker

@@ -17,6 +17,7 @@ from provider_baiwang import (
     build_baiwang_group_key,
     collect_baiwang_candidate_urls,
     extract_baiwang_email_fields as extract_baiwang_email_fields_helper,
+    infer_baiwang_download_kind,
     is_baiwang_family_url,
     merge_expected_fields,
 )
@@ -61,6 +62,29 @@ DOCUMENT_LINK_HINTS = [
     '点击查看', '获取', '打开链接', 'invoice', 'fapiao', 'ofd', 'xml',
     'chinatax', 'baiwang', 'nuonuo',
 ]
+INVOICEISH_ATTACHMENT_KEYWORDS = (
+    "invoice",
+    "receipt",
+    "fapiao",
+    "发票",
+    "账单",
+    "行程单",
+    "水单",
+    "tax",
+    "ofd",
+    "xml",
+)
+BAIWANG_STRONG_URL_TOKENS = (
+    "downloadpdf",
+    "downloadofd",
+    "downloadxml",
+    "previewinvoice",
+    "previewinvoiceall",
+    "wjgs=pdf",
+    "wjgs=ofd",
+    "wjgs=xml",
+    "pdfurl=",
+)
 HTTP_URL_SCHEMES = {'http', 'https'}
 KNOWN_BWJF_NAVIGATION_HOST = 'www.bwjf.cn'
 KNOWN_BWJF_NAVIGATION_PATHS = {'/', '/productIntroduction', '/resourceCenter'}
@@ -74,6 +98,14 @@ KNOWN_APPLE_UTILITY_EXACT_PATHS = {
 KNOWN_MEDIA_MARKETING_PATTERNS = {
     ('film.qq.com', '/act/jump.html'),
     ('v.qq.com', '/x/cover/'),
+}
+KNOWN_NUONUO_HOME_RULES = {
+    ('www.nuonuo.com', '/nuonuo/web/aboutone/index/index.html', ''): 'A_KNOWN_NUONUO_PRODUCT_HOME_PAGE',
+    ('fp.nuonuo.com', '/', '/'): 'A_KNOWN_NUONUO_PRODUCT_HOME_PAGE',
+    ('ntf.nuonuo.com', '/', '/home'): 'A_KNOWN_NUONUO_PRODUCT_HOME_PAGE',
+    ('bmjc.nuonuo.com', '/Contents/smartCode/web/index.html', '/index'): 'A_KNOWN_NUONUO_PRODUCT_HOME_PAGE',
+    ('nst.nuonuo.com', '/', '/'): 'A_KNOWN_NUONUO_PRODUCT_HOME_PAGE',
+    ('baoxiao.nuonuo.com', '/', ''): 'A_KNOWN_NUONUO_PRODUCT_HOME_PAGE',
 }
 KNOWN_URL_NOISE_EXACT_RULES = {
     ('support.apple.com', '/HT207594'): 'A_KNOWN_APPLE_UTILITY_PAGE',
@@ -170,6 +202,8 @@ BILLING_HINT_KEYWORDS = (
     "付款",
     "支付",
 )
+
+EMAIL_FETCH_LOOP_PAUSE_SECONDS = 0.05
 
 def decode_str(s):
     """解码邮件头的字符串"""
@@ -549,6 +583,8 @@ def _match_known_noise_rule(url):
     host = parsed.netloc.lower()
     path = parsed.path or '/'
     normalized_path = path.rstrip('/') or '/'
+    fragment = (parsed.fragment or '').strip()
+    normalized_fragment = f"/{fragment.lstrip('/')}" if fragment else ''
 
     if _looks_like_invoice_url(url):
         return None
@@ -598,6 +634,10 @@ def _match_known_noise_rule(url):
 
     if host == 'shop.battlenet.com.cn' and normalized_path == '/':
         return 'A_KNOWN_GAME_HELP_LEGAL_PAGE'
+
+    nuonuo_reason = KNOWN_NUONUO_HOME_RULES.get((host, path, normalized_fragment))
+    if nuonuo_reason:
+        return nuonuo_reason
 
     explicit_reason = KNOWN_URL_NOISE_EXACT_RULES.get((host, path))
     if explicit_reason:
@@ -684,6 +724,31 @@ def _is_decorative_filename(filename):
     return any(keyword in lower_name for keyword in DECORATIVE_NAME_KEYWORDS)
 
 
+def _has_invoiceish_attachment_name(filename):
+    lower_name = os.path.basename(str(filename or "")).lower()
+    return any(keyword in lower_name for keyword in INVOICEISH_ATTACHMENT_KEYWORDS)
+
+
+def _has_strong_baiwang_provider_signal(url, anchor_text="", *, sender_addr="", subject="", body_text=""):
+    lower_url = str(url or "").lower()
+    lower_anchor = str(anchor_text or "").lower()
+    lower_sender = str(sender_addr or "").lower()
+    lower_subject = str(subject or "").lower()
+    lower_body = str(body_text or "").lower()
+
+    if infer_baiwang_download_kind(url=url):
+        return True
+
+    if any(token in lower_url for token in BAIWANG_STRONG_URL_TOKENS):
+        return True
+
+    combined = " ".join([lower_anchor, lower_subject, lower_body])
+    if any(token in combined for token in ("发票", "下载", "invoice", "download", "pdf", "ofd", "xml")):
+        return any(marker in lower_url for marker in ("previewinvoice", "downloadpdf", "downloadxml", "downloadofd", "wjgs=pdf", "wjgs=ofd", "wjgs=xml", "pdfurl="))
+
+    return "baiwang" in lower_sender and any(token in lower_url for token in ("previewinvoice", "downloadpdf", "downloadxml", "downloadofd"))
+
+
 def _build_attachment_candidate_decision(filename, payload, *, tier, content_type="", content_disposition="", zip_context=None):
     ext = os.path.splitext(filename)[1].lower()
     size_bytes = len(payload) if payload else 0
@@ -761,10 +826,20 @@ def _build_attachment_candidate_decision(filename, payload, *, tier, content_typ
         weak_with_qr = list(weak_signals)
         if has_qr is False:
             weak_with_qr.append("missing_qr")
+            if not _has_invoiceish_attachment_name(filename):
+                return _make_candidate_decision(
+                    "B",
+                    "retain_only",
+                    "B_TIER4_IMAGE_NO_QR_RETAIN",
+                    zip_context or "attachment",
+                    strong_signals=strong_signals,
+                    weak_signals=weak_with_qr,
+                    image_meta=image_meta,
+                )
             return _make_candidate_decision(
-                "C",
-                "manual_review",
-                "C_TIER4_IMAGE_NO_QR",
+                "B",
+                "retain_only",
+                "B_TIER4_IMAGE_NO_QR_RETAIN",
                 zip_context or "attachment",
                 strong_signals=strong_signals,
                 weak_signals=weak_with_qr,
@@ -772,10 +847,20 @@ def _build_attachment_candidate_decision(filename, payload, *, tier, content_typ
             )
         if has_qr is None:
             weak_with_qr.append("qr_detection_unavailable")
+            if not _has_invoiceish_attachment_name(filename):
+                return _make_candidate_decision(
+                    "B",
+                    "retain_only",
+                    "B_TIER4_IMAGE_QR_UNKNOWN_RETAIN",
+                    zip_context or "attachment",
+                    strong_signals=strong_signals,
+                    weak_signals=weak_with_qr,
+                    image_meta=image_meta,
+                )
             return _make_candidate_decision(
-                "C",
-                "manual_review",
-                "C_TIER4_IMAGE_QR_UNKNOWN",
+                "B",
+                "retain_only",
+                "B_TIER4_IMAGE_QR_UNKNOWN_RETAIN",
                 zip_context or "attachment",
                 strong_signals=strong_signals,
                 weak_signals=weak_with_qr,
@@ -783,10 +868,20 @@ def _build_attachment_candidate_decision(filename, payload, *, tier, content_typ
             )
 
     if is_image and weak_signals:
+        if not _has_invoiceish_attachment_name(filename):
+            return _make_candidate_decision(
+                "B",
+                "retain_only",
+                "B_LOW_CONFIDENCE_IMAGE_RETAIN",
+                zip_context or "attachment",
+                strong_signals=strong_signals,
+                weak_signals=weak_signals,
+                image_meta=image_meta,
+            )
         return _make_candidate_decision(
-            "C",
-            "manual_review",
-            "C_LOW_CONFIDENCE_IMAGE_REVIEW",
+            "B",
+            "retain_only",
+            "B_LOW_CONFIDENCE_IMAGE_RETAIN",
             zip_context or "attachment",
             strong_signals=strong_signals,
             weak_signals=weak_signals,
@@ -823,26 +918,6 @@ def _build_link_candidate_decision(url, anchor_text="", *, tier, sender_addr="",
         subject=subject,
         body_text=body_text,
     )
-    if provider_family in DIRECT_INVOICE_FAMILIES:
-        return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
-            "B",
-            "main_chain",
-            "B_DIRECT_INVOICE_PROVIDER_RECOVERY",
-            "url",
-            strong_signals=[f"{provider_family}_provider_family"],
-            weak_signals=weak_signals,
-            link_group_key=build_link_group_key(url),
-        ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
-    if provider_family == "baiwang":
-        return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
-            "B",
-            "main_chain",
-            "B_BAIWANG_PROVIDER_RECOVERY",
-            "url",
-            strong_signals=["baiwang_provider_family"],
-            weak_signals=weak_signals,
-            link_group_key=build_link_group_key(url),
-        ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
 
     if _is_known_bwjf_navigation_link(url):
         return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
@@ -918,11 +993,60 @@ def _build_link_candidate_decision(url, anchor_text="", *, tier, sender_addr="",
             link_group_key=build_link_group_key(url),
         ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
 
+    if provider_family in DIRECT_INVOICE_FAMILIES:
+        return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
+            "B",
+            "main_chain",
+            "B_DIRECT_INVOICE_PROVIDER_RECOVERY",
+            "url",
+            strong_signals=[f"{provider_family}_provider_family"],
+            weak_signals=weak_signals,
+            link_group_key=build_link_group_key(url),
+        ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
+
+    if provider_family == "baiwang":
+        if _has_strong_baiwang_provider_signal(
+            url,
+            anchor_text,
+            sender_addr=sender_addr,
+            subject=subject,
+            body_text=body_text,
+        ):
+            return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
+                "B",
+                "main_chain",
+                "B_BAIWANG_PROVIDER_RECOVERY",
+                "url",
+                strong_signals=["baiwang_provider_family"],
+                weak_signals=weak_signals,
+                link_group_key=build_link_group_key(url),
+            ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
+        return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
+            "B",
+            "main_chain",
+            "B_BAIWANG_PROVIDER_RECOVERY",
+            "url",
+            strong_signals=["baiwang_provider_family"],
+            weak_signals=weak_signals + ["missing_strong_baiwang_download_signal"],
+            link_group_key=build_link_group_key(url),
+        ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
+
     if has_document_hint:
         return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
             "B",
             "main_chain",
             "B_LINK_DOCUMENT_HINT",
+            "url",
+            strong_signals=strong_signals,
+            weak_signals=weak_signals,
+            link_group_key=build_link_group_key(url),
+        ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
+
+    if has_billing_hint:
+        return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
+            "B",
+            "main_chain",
+            "B_LINK_BILLING_HINT",
             "url",
             strong_signals=strong_signals,
             weak_signals=weak_signals,
@@ -940,17 +1064,6 @@ def _build_link_candidate_decision(url, anchor_text="", *, tier, sender_addr="",
             link_group_key=build_link_group_key(url),
         ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
 
-    if has_billing_hint:
-        return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
-            "C",
-            "manual_review",
-            "C_UNKNOWN_PROVIDER_BILLING_HINT_REVIEW",
-            "url",
-            strong_signals=strong_signals,
-            weak_signals=weak_signals,
-            link_group_key=build_link_group_key(url),
-        ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
-
     return _augment_link_decision(_apply_shadow_noise_metadata(_make_candidate_decision(
         "B",
         "retain_only",
@@ -962,15 +1075,23 @@ def _build_link_candidate_decision(url, anchor_text="", *, tier, sender_addr="",
     ), shadow_noise_page_type, shadow_noise_reason), url, anchor_text, sender_addr=sender_addr, subject=subject, body_text=body_text)
 
 class EmailFetcher:
-    def __init__(self, email_address, auth_code, imap_server="imap.qq.com", imap_port=993, staging_dir="staging", monitoring_dir=None):
+    def __init__(self, email_address, auth_code, imap_server="imap.qq.com", imap_port=993, staging_dir="staging", monitoring_dir=None, progress_callback=None):
         self.email_address = email_address
         self.auth_code = auth_code
         self.imap_server = imap_server
         self.imap_port = imap_port
         self.staging_dir = os.path.abspath(staging_dir)
         self.monitoring_dir = os.path.abspath(monitoring_dir) if monitoring_dir else ""
+        self.progress_callback = progress_callback
         self.mail = None
         os.makedirs(self.staging_dir, exist_ok=True)
+
+    def _emit_progress(self, message):
+        if callable(self.progress_callback):
+            try:
+                self.progress_callback(str(message or ""))
+            except Exception:
+                pass
 
     def _monitoring_path(self, filename):
         if not self.monitoring_dir:
@@ -1130,15 +1251,18 @@ class EmailFetcher:
 
         search_criteria = " ".join(search_criteria_parts)
         logging.info(f"Searching emails with criteria: {search_criteria}")
+        self._emit_progress(f"正在 IMAP 搜索：{search_criteria}")
         
         status, messages = self.mail.search(None, search_criteria)
         
         if status != "OK" or not messages[0]:
             logging.info("No emails found or search failed.")
+            self._emit_progress("IMAP 搜索完成，命中 0 封邮件。")
             return []
 
         email_ids = messages[0].split()
         logging.info(f"IMAP returned {len(email_ids)} emails. Applying local Python date filter...")
+        self._emit_progress(f"IMAP 搜索完成，命中 {len(email_ids)} 封邮件；正在进行本地日期过滤。")
         
         # 本地时间二次强制过滤 (防御 IMAP SINCE/BEFORE 失效)
         if isinstance(since_date, datetime.date) and not isinstance(since_date, datetime.datetime):
@@ -1151,14 +1275,15 @@ class EmailFetcher:
         before_dt = None
         if before_date:
             if isinstance(before_date, datetime.date) and not isinstance(before_date, datetime.datetime):
-                before_dt = datetime.datetime.combine(before_date, datetime.datetime.max.time())
+                before_dt = datetime.datetime.combine(before_date, datetime.datetime.min.time())
             elif isinstance(before_date, str):
-                before_dt = datetime.datetime.strptime(before_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+                before_dt = datetime.datetime.strptime(before_date, "%Y-%m-%d")
             else:
                 before_dt = before_date
 
         valid_email_ids = []
-        for e_id in email_ids:
+        total_ids = len(email_ids)
+        for index, e_id in enumerate(email_ids, start=1):
             try:
                 status, msg_data = self.mail.fetch(e_id, '(BODY[HEADER.FIELDS (DATE)])')
                 if status == "OK" and msg_data[0]:
@@ -1169,14 +1294,20 @@ class EmailFetcher:
                         dt_naive = dt.replace(tzinfo=None)
                         if dt_naive < since_dt:
                             continue
-                        if before_dt and dt_naive > before_dt:
+                        if before_dt and dt_naive >= before_dt:
                             continue
                 valid_email_ids.append(e_id)
             except Exception as e:
                 # 解析失败仍保留，防错杀
+                logging.warning(f"Failed to parse email date for local filter: {e}")
                 valid_email_ids.append(e_id)
+            if index == 1 or index % 20 == 0 or index == total_ids:
+                self._emit_progress(
+                    f"正在进行本地日期过滤：{index}/{total_ids}，当前保留 {len(valid_email_ids)} 封邮件。"
+                )
 
         logging.info(f"Local filter completed. {len(valid_email_ids)} emails passed.")
+        self._emit_progress(f"本地日期过滤完成，最终保留 {len(valid_email_ids)} 封邮件。")
         return valid_email_ids
 
     def _legacy_extract_attachments_pre_release_prep(self, email_ids, mailbox="INBOX"):
@@ -1220,8 +1351,9 @@ class EmailFetcher:
                             sender_domain_value = sender_addr.split("@")[-1].lower() if "@" in sender_addr else ""
                             email_id_str = e_id.decode(errors="ignore")
                             
-                            safe_subject = re.sub(r'[\\/:*?"<>|]', '_', subject)[:50]
-                            email_folder_name = f"{email_id_str}_{safe_subject}"
+                            safe_subject = re.sub(r'[\\/:*?"<>|]', '_', subject).strip(" .")
+                            safe_subject = safe_subject[:50].strip(" .")
+                            email_folder_name = f"{email_id_str}_{safe_subject or 'email'}".strip(" .")
                             email_staging_path = os.path.join(self.staging_dir, email_folder_name)
                             
                             body_text = ""
@@ -1540,7 +1672,7 @@ class EmailFetcher:
                 except Exception as e:
                     logging.error(f"Error processing email {e_id.decode()}: {e}")
             
-            time.sleep(1)
+            time.sleep(EMAIL_FETCH_LOOP_PAUSE_SECONDS)
 
         return results
 
@@ -1691,8 +1823,9 @@ class EmailFetcher:
                     _, sender_addr = email.utils.parseaddr(sender)
                     sender_domain_value = sender_addr.split("@")[-1].lower() if "@" in sender_addr else ""
 
-                    safe_subject = re.sub(r'[\\/:*?"<>|]', '_', subject)[:50]
-                    email_folder_name = f"{email_id_str}_{safe_subject}"
+                    safe_subject = re.sub(r'[\\/:*?"<>|]', '_', subject).strip(" .")
+                    safe_subject = safe_subject[:50].strip(" .")
+                    email_folder_name = f"{email_id_str}_{safe_subject or 'email'}".strip(" .")
                     email_staging_path = os.path.join(self.staging_dir, email_folder_name)
 
                     body_text = ""
@@ -2028,6 +2161,8 @@ class EmailFetcher:
 
                     kept_url_candidates = []
                     provider_groups = {}
+                    emitted_provider_groups = set()
+                    emitted_fallback_groups = set()
                     for link, anchor_text in prioritize_invoice_links(links_found):
                         if _should_drop_baiwang_wrapper_url(
                             link,
@@ -2092,6 +2227,22 @@ class EmailFetcher:
                         kept_url_candidates.append((link, anchor_text, decision))
 
                     for link, anchor_text, decision in kept_url_candidates:
+                        provider_group_key = decision.get("provider_group_key", "")
+                        if provider_group_key:
+                            if provider_group_key in emitted_provider_groups:
+                                logging.info(f"Skipped duplicate provider-group URL candidate: {link} ({provider_group_key})")
+                                continue
+                            emitted_provider_groups.add(provider_group_key)
+                        else:
+                            fallback_group_key = (
+                                decision.get("link_group_key", build_link_group_key(link)),
+                                decision.get("candidate_action", ""),
+                                decision.get("provider_family", ""),
+                            )
+                            if fallback_group_key in emitted_fallback_groups:
+                                logging.info(f"Skipped duplicate URL candidate: {link}")
+                                continue
+                            emitted_fallback_groups.add(fallback_group_key)
 
                         email_diag["entered_main_chain"] = True
                         result_payload = {
@@ -2113,7 +2264,6 @@ class EmailFetcher:
                             "provider_family": decision.get("provider_family", ""),
                             "provider_expected_fields": decision.get("provider_expected_fields", {}),
                         }
-                        provider_group_key = decision.get("provider_group_key", "")
                         provider_group_state = provider_groups.get(provider_group_key, {})
                         if provider_group_key:
                             result_payload.update({
@@ -2153,7 +2303,7 @@ class EmailFetcher:
                         email_diag["terminal_status"] = "processing_exception"
                     self._emit_extract_attachments_diagnostic(email_diag)
 
-            time.sleep(1)
+            time.sleep(EMAIL_FETCH_LOOP_PAUSE_SECONDS)
 
         return results
 

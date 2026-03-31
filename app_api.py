@@ -9,6 +9,9 @@ import time
 import uuid
 from pathlib import Path
 
+from build_identity import load_build_identity
+from company_rules import DEFAULT_COMPANY, classify_purchaser_relation
+from document_types import MANUAL_REVIEW_FOLDER, get_archive_folder, is_exempt_type
 from email_channel import resolve_channel
 from frontend_run_context import ensure_run_context_dirs, load_run_context, serialize_run_context
 from user_settings import (
@@ -185,6 +188,8 @@ class InvoiceAppAPI:
         self._effective_save_path = ""
         self._effective_date_from = ""
         self._effective_date_to = ""
+        self._raw_date_range_display = ""
+        self._imap_query_range_display = ""
         self._current_run_id = self._run_context.get("run_id", "")
         self.audit_counts = {"manual_check": 0, "retention": 0, "raw_invoices": 0}
         self.discovered_categories = set()
@@ -193,7 +198,11 @@ class InvoiceAppAPI:
         self.stats = {"emails": 0, "invoices": 0, "errors": 0}
         self._email_level_url_evidence_seen = set()
         self._last_export_path = ""
+        self._active_run_config = {}
+        self._timing_metrics = {}
         self._install_packaged_thread_excepthook()
+        self.build_identity = load_build_identity()
+        self._validate_runtime_build_identity()
         # Release-prep candidate: startup must not trigger local developer scans.
 
     def _refresh_run_context(self):
@@ -220,6 +229,50 @@ class InvoiceAppAPI:
             "raw_invoices": int(getattr(self, "audit_counts", {}).get("raw_invoices", 0) or 0),
             "errors": int(getattr(self, "stats", {}).get("errors", 0) or 0),
         }
+
+    def _reset_timing_metrics(self):
+        self._timing_metrics = {}
+
+    def _record_timing_metric(self, name, elapsed_seconds):
+        metric_name = str(name or "").strip()
+        if not metric_name:
+            return
+        try:
+            elapsed = max(0.0, float(elapsed_seconds or 0.0))
+        except (TypeError, ValueError):
+            return
+        bucket = self._timing_metrics.setdefault(
+            metric_name,
+            {"count": 0, "total_seconds": 0.0, "max_seconds": 0.0},
+        )
+        bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+        bucket["total_seconds"] = float(bucket.get("total_seconds", 0.0) or 0.0) + elapsed
+        bucket["max_seconds"] = max(float(bucket.get("max_seconds", 0.0) or 0.0), elapsed)
+
+    def _build_timing_breakdown(self):
+        breakdown = {}
+        for metric_name in sorted(self._timing_metrics):
+            bucket = self._timing_metrics.get(metric_name, {})
+            count = int(bucket.get("count", 0) or 0)
+            total_seconds = float(bucket.get("total_seconds", 0.0) or 0.0)
+            max_seconds = float(bucket.get("max_seconds", 0.0) or 0.0)
+            breakdown[metric_name] = {
+                "count": count,
+                "total_seconds": round(total_seconds, 3),
+                "avg_seconds": round(total_seconds / count, 3) if count else 0.0,
+                "max_seconds": round(max_seconds, 3),
+            }
+        return breakdown
+
+    def _resolve_active_company(self):
+        configured_company = str((self._active_run_config or {}).get("company", "") or "").strip()
+        if configured_company:
+            return configured_company
+        return (
+            self._run_context.get("company")
+            or (self._settings_store.load() or {}).get("company")
+            or DEFAULT_COMPANY
+        )
 
     def _diag_append_jsonl(self, path, payload):
         if not path:
@@ -599,6 +652,7 @@ class InvoiceAppAPI:
                 "effective_save_path": self._effective_save_path,
                 "date_from": self._effective_date_from,
                 "date_to": self._effective_date_to,
+                "active_run_config": dict(self._active_run_config or {}),
                 "controlled_run": True,
                 "stage_map": {
                     "start_processing": "active",
@@ -790,6 +844,45 @@ class InvoiceAppAPI:
 
         return ""
 
+    def _looks_like_train_ticket(self, doc_type, seller, info_json, info, file_name, pdf_path=""):
+        compact_doc_type = self._compact_text(doc_type)
+        compact_seller = self._compact_text(seller)
+        compact_train = self._compact_text("\u706b\u8f66\u7968")
+        compact_rail = self._compact_text("\u94c1\u8def")
+        compact_bullet = self._compact_text("\u9ad8\u94c1")
+        compact_ticket = self._compact_text("\u94c1\u8def\u7535\u5b50\u5ba2\u7968")
+        compact_rail_seller = self._compact_text("\u4e2d\u56fd\u94c1\u8def")
+
+        if any(token in compact_doc_type for token in (compact_train, compact_rail, compact_bullet)):
+            return True
+        if compact_rail_seller in compact_seller:
+            return True
+
+        departure_city = str((info_json or {}).get("Departure_City", "") or "").strip()
+        destination_city = str((info_json or {}).get("Destination_City", "") or "").strip()
+        context_parts = [
+            str(file_name or ""),
+            str((info or {}).get("subject", "") or ""),
+            str((info or {}).get("attachment_name", "") or ""),
+            str((info or {}).get("original_filename", "") or ""),
+        ]
+        compact_context = self._compact_text(" ".join(part for part in context_parts if part))
+        if departure_city and destination_city and any(
+            token in compact_context for token in (compact_ticket, compact_train, compact_rail, compact_bullet, "12306")
+        ):
+            return True
+
+        if not departure_city or not destination_city:
+            return False
+        if compact_doc_type not in {self._compact_text("\u673a\u7968"), self._compact_text("\u822a\u73ed\u884c\u7a0b\u5355")}:
+            return False
+
+        preview_text = self._extract_pdf_preview_text(pdf_path, max_pages=1)
+        compact_preview = self._compact_text(preview_text)
+        return any(
+            token in compact_preview for token in (compact_ticket, compact_train, compact_rail, compact_bullet, "12306")
+        )
+
     def _provider_fields_match(self, expected_fields, normalized_snapshot, info_json, recovered_fields=None):
         expected = dict(expected_fields or {})
         if not any(str(value or "").strip() for value in expected.values()):
@@ -943,7 +1036,15 @@ class InvoiceAppAPI:
         self.stats = {"emails": 0, "invoices": 0, "errors": 0}
         self.audit_counts = {"manual_check": 0, "retention": 0, "raw_invoices": 0}
         self._email_level_url_evidence_seen = set()
+        self._reset_timing_metrics()
+        self.build_identity = load_build_identity()
         self._set_run_state("running", status_text=status_text, progress=0, last_error="")
+        build_label = self.build_identity.get("build_label", "")
+        source_revision = self.build_identity.get("source_revision", "")
+        review_folder = self.build_identity.get("manual_review_folder", MANUAL_REVIEW_FOLDER)
+        build_stamp = " / ".join([part for part in [build_label, source_revision] if part])
+        if build_stamp:
+            self._append_log("构建", f"当前构建：{build_stamp}；复核目录：{review_folder}", "text-slate-400")
 
     def _append_log(self, level, message, color="text-slate-700"):
         self.logs.append({
@@ -952,6 +1053,27 @@ class InvoiceAppAPI:
             "color": color,
             "msg": message,
         })
+
+    def _on_email_fetcher_progress(self, message):
+        message = str(message or "").strip()
+        if not message:
+            return
+        self.logs.append({
+            "time": time.strftime("[%H:%M:%S]"),
+            "type": "运行",
+            "color": "text-blue-400",
+            "msg": message,
+        })
+
+    @staticmethod
+    def _user_safe_source_reference(source_path):
+        if not source_path:
+            return ""
+        text = str(source_path)
+        if text.startswith(("http://", "https://")):
+            return text
+        text = text.rstrip("\\/")
+        return os.path.basename(text) or text
 
     def _request_safe_stop(self, message="正在安全停止，当前文件处理完后结束..."):
         if self._stop_requested:
@@ -1061,6 +1183,73 @@ class InvoiceAppAPI:
     def _output_state_dir(self, save_path):
         return get_output_state_dir(save_path or self.get_default_save_path())
 
+    def _history_file_path(self, output_state_dir):
+        return os.path.join(output_state_dir, ".antigravity_history.json")
+
+    def _run_state_file_path(self, output_state_dir):
+        return os.path.join(output_state_dir, "run_state.json")
+
+    def _read_json_file(self, path, default):
+        if not path or not os.path.exists(path):
+            return copy.deepcopy(default)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return copy.deepcopy(default)
+
+    def _write_json_file(self, path, payload):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temp_path = f"{path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+        os.replace(temp_path, path)
+
+    def _mark_output_run_state(self, output_state_dir, status, **extra):
+        payload = {
+            "status": status,
+            "run_id": self._current_run_id or "",
+            "save_path": self._effective_save_path or self._requested_save_path or "",
+            "date_from": self._effective_date_from or "",
+            "date_to": self._effective_date_to or "",
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        payload.update({key: value for key, value in extra.items() if value not in (None, "")})
+        self._write_json_file(self._run_state_file_path(output_state_dir), payload)
+        return payload
+
+    def _load_output_run_state(self, output_state_dir):
+        return self._read_json_file(self._run_state_file_path(output_state_dir), {})
+
+    def _load_committed_history(self, output_state_dir):
+        # P0 stop-loss: by default do not inherit cross-run history.
+        # We only de-duplicate within the current run unless an explicit
+        # cross-run mode is introduced later.
+        return set()
+
+    def _commit_output_state(self, output_state_dir, history_keys, business_records):
+        committed_history = sorted({str(item).strip() for item in (history_keys or set()) if str(item).strip()})
+        self._write_json_file(self._history_file_path(output_state_dir), committed_history)
+        self._write_json_file(os.path.join(output_state_dir, "processed_records.json"), business_records or {})
+        self._mark_output_run_state(
+            output_state_dir,
+            "completed",
+            history_count=len(committed_history),
+            business_record_count=len(business_records or {}),
+        )
+
+    def _validate_runtime_build_identity(self):
+        identity = dict(self.build_identity or {})
+        issues = []
+        if getattr(sys, "frozen", False) and not identity.get("identity_path"):
+            issues.append("missing build identity payload")
+        if identity.get("manual_review_folder") and identity.get("manual_review_folder") != MANUAL_REVIEW_FOLDER:
+            issues.append(
+                f"manual review folder mismatch: expected {MANUAL_REVIEW_FOLDER}, got {identity.get('manual_review_folder')}"
+            )
+        if issues:
+            raise RuntimeError("Build identity validation failed: " + "; ".join(issues))
+
     def get_env_config(self):
         stored = self._settings_store.load() or {}
         return {
@@ -1100,9 +1289,11 @@ class InvoiceAppAPI:
 
     def save_user_settings(self, settings):
         incoming = dict(settings or {})
+        existing = self._settings_store.load() or {}
         merged = self._default_user_settings()
         remember_settings = incoming.get("remember_settings", True)
         if remember_settings:
+            merged.update({key: value for key, value in existing.items() if key in merged})
             merged.update({key: value for key, value in incoming.items() if key in merged})
             merged["remember_settings"] = True
         else:
@@ -1254,7 +1445,9 @@ class InvoiceAppAPI:
             
             self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": f"开始检索 {since_date} 至 {before_date} 的邮件..."})
             
+            email_fetch_started_at = time.perf_counter()
             email_ids = fetcher.fetch_emails_by_date(since_date=since_date, before_date=before_date)
+            self._record_timing_metric("email_fetch", time.perf_counter() - email_fetch_started_at)
             total_emails = len(email_ids)
             self.stats["emails"] = total_emails
             
@@ -1273,7 +1466,9 @@ class InvoiceAppAPI:
             self.status_text = "正在下载发票附件..."
             self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": "开始提取邮件附件及正文发票链接..."})
             
+            attachment_extract_started_at = time.perf_counter()
             attachments_info = fetcher.extract_attachments(email_ids)
+            self._record_timing_metric("attachment_extract", time.perf_counter() - attachment_extract_started_at)
             total_attachments = len(attachments_info)
             
             # 4. 初始化核心处理逻辑并执行
@@ -1479,6 +1674,7 @@ class InvoiceAppAPI:
                 imap_server=channel["imap_host"],
                 staging_dir=self._run_context.get("staging_dir") or "staging",
                 monitoring_dir=self._run_context.get("monitoring_dir"),
+                progress_callback=self._on_email_fetcher_progress,
             )
             self._packaged_diag_write("network_connect_before", "_processing_worker", "success")
             connect_result = fetcher.connect()
@@ -1506,11 +1702,20 @@ class InvoiceAppAPI:
             else:
                 before_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
+            self._raw_date_range_display = f"{since_date} -> {date_to or since_date}"
+            self._imap_query_range_display = f"SINCE {since_date} / BEFORE {before_date}"
+
             self.logs.append({
                 "time": time.strftime("[%H:%M:%S]"),
                 "type": "运行",
                 "color": "text-blue-400",
-                "msg": f"正在扫描时间范围 {since_date} -> {before_date} 的邮件。",
+                "msg": f"原始用户范围：{self._raw_date_range_display}",
+            })
+            self.logs.append({
+                "time": time.strftime("[%H:%M:%S]"),
+                "type": "运行",
+                "color": "text-blue-400",
+                "msg": f"实际 IMAP 查询：{self._imap_query_range_display}",
             })
 
             self._packaged_diag_write("network_scan_before", "_processing_worker", "success")
@@ -1652,6 +1857,25 @@ class InvoiceAppAPI:
         output_state_dir = self._output_state_dir(save_path)
         extractor.processed_records_file = os.path.join(output_state_dir, "processed_records.json")
         self._packaged_diag_write("run_loop_extractor_ready", "_run_processing_loop", "success")
+        history_file_path = self._history_file_path(output_state_dir)
+        previous_run_state = self._load_output_run_state(output_state_dir)
+        previous_run_status = str(previous_run_state.get("status") or "").strip().lower()
+        if previous_run_status:
+            if previous_run_status != "completed":
+                self.logs.append({
+                    "time": time.strftime("[%H:%M:%S]"),
+                    "type": "提示",
+                    "color": "text-amber-400",
+                    "msg": f"检测到上轮未完成运行状态（{previous_run_status}），本轮已忽略未提交的历史去重缓存。",
+                })
+            else:
+                self.logs.append({
+                    "time": time.strftime("[%H:%M:%S]"),
+                    "type": "信息",
+                    "color": "text-blue-400",
+                    "msg": "历史去重已关闭；本轮仅对当前任务内的重复附件和重复链接做去重。",
+                })
+        self._mark_output_run_state(output_state_dir, "running", previous_status=previous_run_status or "none")
         
         # --- PHASE 1: RECONCILIATION GROUND TRUTH ---
         ground_truth_files = {info['filepath']: info for info in attachments_info}
@@ -1659,6 +1883,8 @@ class InvoiceAppAPI:
         
         # Load business logic deduplication records
         business_records = extractor.load_processed_records()
+        committed_history = self._load_committed_history(output_state_dir)
+        working_history = set(committed_history)
         trace_store = self._create_document_trace_store(
             output_path=self._run_context.get("debug_trace_path") or None
         )
@@ -1917,7 +2143,7 @@ class InvoiceAppAPI:
                             "time": time.strftime("[%H:%M:%S]"),
                             "type": "复核:",
                             "color": "text-yellow-400",
-                            "msg": f"前置过滤 C 层候选已进入 Manual_Check: {os.path.basename(review_path)}",
+                            "msg": f"前置过滤 C 层候选已进入待人工复核: {os.path.basename(review_path)}",
                         })
                         self.error_invoices.append({
                             "id": f"inv_prefilter_{time.time()}_{i}",
@@ -1955,49 +2181,25 @@ class InvoiceAppAPI:
                     # --- State Persistence Check ---
                     # 生成唯一 ID 以防重复提交大模型
                     history_key = _build_history_key(info, file_name, pdf_path)
-                    
-                    history_file_path = os.path.join(output_state_dir, ".antigravity_history.json")
-                    processed_history = set()
-                    if os.path.exists(history_file_path):
-                        try:
-                            import json
-                            with open(history_file_path, "r", encoding="utf-8") as hf:
-                                processed_history = set(json.load(hf))
-                        except Exception:
-                            pass
-                            
-                    if history_key in processed_history:
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "记忆:", "color": "text-blue-400", "msg": f"跳过已成功归档文件: {file_name}"})
+
+                    if history_key in working_history:
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-blue-400", "msg": f"本轮内重复已跳过: {file_name}"})
                         self.progress = 50 + int(((i + 1) / total_attachments) * 45)
-                        retained_path = None
-                        if not info.get('is_url', False):
-                            retained_path = self._retain_artifact(
-                                save_path,
-                                pdf_path,
-                                "history_skipped",
-                                "命中历史去重记录，未重复提交模型",
-                                {
-                                    "subject": info.get("subject", ""),
-                                    "tier": info.get("tier", 0),
-                                    "history_key": history_key
-                                }
-                            )
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "保全:", "color": "text-blue-400", "msg": f"已保留历史跳过副本: {os.path.basename(retained_path)}"})
                         trace_store.set_fields(
                             document_id,
-                            naming_result={"status": "skipped", "reason_code": "HISTORY_DUPLICATE_SKIP"},
-                            archive_target=retained_path,
+                            naming_result={"status": "skipped", "reason_code": "CURRENT_RUN_DUPLICATE_SKIP"},
+                            archive_target=None,
                         )
                         _mark_combine_not_applicable(
                             document_id,
                             "COMBINE_NOT_APPLICABLE",
-                            "Document was skipped by history de-duplication before archive/combine.",
+                            "Document was skipped because it duplicated another item in the current run.",
                         )
                         trace_store.record_failure_event(
                             document_id,
-                            "HISTORY_DUPLICATE_SKIP",
-                            "history",
-                            "命中历史去重记录，跳过本次处理。",
+                            "CURRENT_RUN_DUPLICATE_SKIP",
+                            "dedupe",
+                            "命中当前任务内重复项，已跳过。",
                             severity="skipped",
                         )
                         processed_filepaths.add(pdf_path)
@@ -2125,6 +2327,7 @@ class InvoiceAppAPI:
                         )
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "抓取:", "color": "text-blue-400", "msg": f"正在启动无头浏览器抓取网页: {file_name[:30]}"})
                         try:
+                            url_recovery_started_at = time.perf_counter()
                             link_results = converter.process_invoice_links(
                                 pdf_path,
                                 info.get('subject', 'Link_Invoice'),
@@ -2132,6 +2335,7 @@ class InvoiceAppAPI:
                                 return_metadata=True,
                                 candidate_info=info,
                             )
+                            self._record_timing_metric("url_recovery", time.perf_counter() - url_recovery_started_at)
                             if not browser_first_recorded:
                                 self._packaged_diag_write(
                                     "browser_first_after",
@@ -2144,6 +2348,7 @@ class InvoiceAppAPI:
                                 )
                                 browser_first_recorded = True
                         except Exception as exc:
+                            self._record_timing_metric("url_recovery", time.perf_counter() - url_recovery_started_at)
                             if not browser_first_recorded:
                                 self._packaged_diag_write(
                                     "browser_first_exception",
@@ -2180,7 +2385,7 @@ class InvoiceAppAPI:
                             processed_provider_groups.add(provider_group_key)
 
                         link_status = str(link_result.get("status") or "").strip().lower()
-                        if link_status in {"failed", "skipped"} and not link_result.get("pdf_path"):
+                        if link_status in {"failed", "skipped"}:
                             link_reason_code = str(link_result.get("reason_code") or "URL_DOWNLOAD_FAILED").strip() or "URL_DOWNLOAD_FAILED"
                             link_message = (
                                 str(link_result.get("message") or "").strip()
@@ -2337,6 +2542,8 @@ class InvoiceAppAPI:
                             "provider_family": link_result.get("provider_family", info.get("provider_family", "")),
                             "provider_recovered_fields": link_result.get("selected_fields", {}),
                             "provider_recovery_status": link_result.get("status", ""),
+                            "body_excerpt": link_result.get("body_excerpt", ""),
+                            "page_title": link_result.get("page_title", ""),
                         })
                         trace_store.set_fields(document_id, source_download_result=link_result)
                         pdf_path = link_result["pdf_path"]
@@ -2348,6 +2555,72 @@ class InvoiceAppAPI:
                         pdf_health = self._inspect_pdf_health(pdf_path)
                         if pdf_health:
                             trace_store.set_fields(document_id, pdf_health=pdf_health)
+                    if (
+                        info.get("is_url")
+                        and str(info.get("download_mode") or "").strip().lower() == "page_pdf"
+                        and pdf_health
+                        and (
+                            int(pdf_health.get("size_bytes", 0) or 0) < 2048
+                            or not bool(pdf_health.get("starts_with_pdf_magic"))
+                            or int(pdf_health.get("page_count", 0) or 0) <= 0
+                        )
+                    ):
+                        retained_path = self._retain_artifact(
+                            save_path,
+                            info.get("resolved_url") or info.get("source_url") or pdf_path,
+                            "url_runtime_failed",
+                            "URL generated a tiny or invalid PDF shell before a usable invoice document was available.",
+                            self._attachment_diag_metadata(
+                                info,
+                                file_name=file_name,
+                                document_id=document_id,
+                                extra={
+                                    "tier": tier_info,
+                                    "pdf_health": pdf_health,
+                                    "source_download_result": info.get("source_download_result", {}),
+                                },
+                            ),
+                        )
+                        self.stats["errors"] += 1
+                        self.logs.append({
+                            "time": time.strftime("[%H:%M:%S]"),
+                            "type": "错误:",
+                            "color": "text-red-400",
+                            "msg": f"链接生成的 PDF 壳无效，已保留证据: {os.path.basename(retained_path)}",
+                        })
+                        self.error_invoices.append({
+                            "id": f"inv_url_shell_{time.time()}_{i}",
+                            "date": "---",
+                            "amount": "---",
+                            "category": "解析失败",
+                            "merchant": "链接抓取",
+                            "path": retained_path,
+                            "name": os.path.basename(retained_path),
+                            "sColor": "bg-yellow-500",
+                            "status": "处理异常",
+                            "reason": "URL_INVALID_PDF_SHELL",
+                            "rColor": "text-red-600 border-red-200 bg-red-50",
+                        })
+                        trace_store.set_fields(
+                            document_id,
+                            pdf_health=pdf_health,
+                            naming_result={"status": "skipped", "reason_code": "URL_INVALID_PDF_SHELL"},
+                            archive_target=retained_path,
+                        )
+                        _mark_combine_not_applicable(
+                            document_id,
+                            "COMBINE_NOT_APPLICABLE",
+                            "URL generated a tiny or invalid PDF shell before archive/combine.",
+                        )
+                        trace_store.record_failure_event(
+                            document_id,
+                            "URL_INVALID_PDF_SHELL",
+                            "source_download",
+                            "URL generated a tiny or invalid PDF shell before a usable invoice document was available.",
+                            severity="failure",
+                        )
+                        processed_filepaths.add(pdf_path)
+                        continue
                     
                     # Step A: 转图片
                     base64_img = extractor.pdf_to_base64_image(pdf_path)
@@ -2381,8 +2654,9 @@ class InvoiceAppAPI:
                             "merchant": "无法读取附件",
                             "path": retained_path,
                             "name": os.path.basename(retained_path),
+                            "artifact_kind": "retention",
                             "sColor": "bg-yellow-500",
-                            "status": "待人工复核",
+                            "status": "已保全待确认",
                             "reason": "无法读取附件图像，已保全原件",
                             "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
                         })
@@ -2430,6 +2704,7 @@ class InvoiceAppAPI:
                         pass
                         
                     # Step C: LLM 信息提取
+                    extraction_started_at = time.perf_counter()
                     try:
                         info_json = extractor.extract_info_via_llm(base64_img, custom_rules=rules_text, pdf_path=pdf_path)
                     except Exception as extraction_error:
@@ -2437,8 +2712,25 @@ class InvoiceAppAPI:
                         if quota_message:
                             raise QuotaExceededError(quota_message) from extraction_error
                         raise
+                    finally:
+                        self._record_timing_metric("extract_total", time.perf_counter() - extraction_started_at)
                     extraction_trace = copy.deepcopy(getattr(extractor, "last_extraction_trace", {}) or {})
-                    trace_store.set_fields(document_id, extractor_raw_result=extraction_trace or None)
+                    extraction_timing = copy.deepcopy(getattr(extractor, "last_timing_trace", {}) or {})
+                    trace_store.set_fields(
+                        document_id,
+                        extractor_raw_result=extraction_trace or None,
+                        extractor_timing=extraction_timing or None,
+                    )
+                    timing_name_map = {
+                        "track_a_ocr_ms": "track_a_ocr",
+                        "track_a_llm_ms": "track_a_llm",
+                        "track_b_vision_ms": "track_b_vision",
+                    }
+                    for timing_key, metric_name in timing_name_map.items():
+                        timing_ms = extraction_timing.get(timing_key)
+                        if timing_ms is None:
+                            continue
+                        self._record_timing_metric(metric_name, float(timing_ms) / 1000.0)
                     if extraction_trace.get("reason_code") == "TRACK_A_FAILED_TRACK_B_FALLBACK":
                         trace_store.record_failure_event(
                             document_id,
@@ -2475,7 +2767,7 @@ class InvoiceAppAPI:
                                 document_id=document_id,
                                 source_kind=info.get("source_kind"),
                                 reason_code=naming_trace.get("reason_code") or "ROUTE_TO_MANUAL_CHECK",
-                                category="Manual_Check",
+                                category=MANUAL_REVIEW_FOLDER,
                                 extra=self._attachment_diag_metadata(
                                     info,
                                     file_name=file_name,
@@ -2505,14 +2797,19 @@ class InvoiceAppAPI:
                                 document_id,
                                 naming_trace["reason_code"],
                                 "naming",
-                                naming_trace.get("error_message") or "解析失败后进入 Manual_Check 兜底。",
+                                naming_trace.get("error_message") or "解析失败后进入待人工复核兜底。",
                                 severity="fallback" if naming_trace.get("used_manual_check") else "failure",
                             )
                         processed_filepaths.add(pdf_path)
+                        artifact_kind = "manual_check" if manual_success and result_path else "retention"
+                        category = "待人工复核" if artifact_kind == "manual_check" else "保留记录"
+                        status = "待人工复核" if artifact_kind == "manual_check" else "已保全待确认"
+                        reason = "解析失败移入待人工复核" if artifact_kind == "manual_check" else "解析失败，原件已保全待确认"
                         self.error_invoices.append({
-                            "id": f"inv_{time.time()}_{i}", "date": "---", "amount": "---", "category": "人工复核",
+                            "id": f"inv_{time.time()}_{i}", "date": "---", "amount": "---", "category": category,
                             "merchant": "模型提取彻底失败", "path": result_path, "name": os.path.basename(result_path),
-                            "sColor": "bg-yellow-500", "status": "待人工复核", "reason": "解析失败移入 Manual_Check",
+                            "artifact_kind": artifact_kind,
+                            "sColor": "bg-yellow-500", "status": status, "reason": reason,
                             "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
                         })
                         continue
@@ -2579,8 +2876,8 @@ class InvoiceAppAPI:
                         processed_filepaths.add(pdf_path)
                         continue
                     is_itinerary_or_folio = (
-                        any(kw in file_name for kw in ["行程单", "行程报销单", "报销单", "folio", "Folio"])
-                        or any(kw in doc_type_peek for kw in ["行程单", "报销单", "水单", "folio", "Folio"])
+                        any(kw in file_name for kw in ["行程单", "行程报销单", "报销单", "folio", "Folio", "水单", "结账单", "账单", "住宿明细"])
+                        or any(kw in doc_type_peek for kw in ["行程单", "报销单", "水单", "结账单", "账单", "住宿明细", "folio", "Folio"])
                     )
 
                     is_invoice = info_json.get("is_invoice", True)
@@ -2604,13 +2901,14 @@ class InvoiceAppAPI:
                             "id": f"inv_{time.time()}_{i}",
                             "date": info_json.get("Date", "---"),
                             "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                            "category": "模型拒绝",
+                            "category": "保留记录",
                             "merchant": info_json.get("Seller", "未知开票方"),
                             "path": retained_path,
                             "name": os.path.basename(retained_path),
+                            "artifact_kind": "retention",
                             "sColor": "bg-yellow-500",
-                            "status": "待人工复核",
-                            "reason": info_json.get("rejection_reason", "模型判定为非票据"),
+                            "status": "已保全待确认",
+                            "reason": info_json.get("rejection_reason", "模型判定为非票据，原件已保全"),
                             "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
                         })
                         trace_store.set_fields(
@@ -2747,9 +3045,9 @@ class InvoiceAppAPI:
                     elif any(kw in doc_type for kw in ["火车", "高铁", "铁路"]):
                         doc_type = "火车票"
                         classification_reason_codes.append("CLASSIFIED_AS_TRAIN_BY_TYPE")
-                    # 1e. 水单
-                    elif any(kw in doc_type for kw in ["水单", "Folio", "账单", "folio"]):
-                        doc_type = "住宿发票"
+                    # 1e. 水单 / 结账单 / 住宿明细
+                    elif any(kw in doc_type for kw in ["水单", "Folio", "账单", "folio", "结账单", "住宿明细"]):
+                        doc_type = "住宿水单"
                         info_json["_is_folio"] = True
                         classification_reason_codes.append("CLASSIFIED_AS_HOTEL_FOLIO")
                     elif "住宿" in doc_type:
@@ -2757,23 +3055,86 @@ class InvoiceAppAPI:
                         classification_reason_codes.append("CLASSIFIED_AS_HOTEL_INVOICE")
                     else:
                         classification_reason_codes.append("CLASSIFICATION_FROM_MODEL_TYPE")
+                    if self._compact_text(doc_type) in {
+                        self._compact_text("\u673a\u7968"),
+                        self._compact_text("\u822a\u73ed\u884c\u7a0b\u5355"),
+                    } and self._looks_like_train_ticket(
+                        original_doc_type,
+                        seller,
+                        info_json,
+                        info,
+                        file_name,
+                        pdf_path=pdf_path,
+                    ):
+                        doc_type = "\u706b\u8f66\u7968"
+                        classification_reason_codes.append("CLASSIFIED_AS_TRAIN_BY_STRONG_EVIDENCE")
                     info_json["Type"] = doc_type
 
-                    # 2. 豁免白名单 (使用 document_types 注册表)
-                    from document_types import is_exempt_type
                     is_exempt = is_exempt_type(doc_type)
 
-                    # 3. 公司抬头严格拦截网 (仅针对非豁免票据，如餐饮、住宿发票等)
+                    # 3. 公司抬头分流 (仅针对非豁免票据，如餐饮、住宿发票等)
                     if not is_exempt:
-                        from company_rules import is_company_purchaser
-                        active_company = self._run_context.get("company") or (self._settings_store.load() or {}).get("company") or ""
-                        if not is_company_purchaser(purchaser, active_company):
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "拦截:", "color": "text-yellow-400", "msg": f"非公司抬头 ({purchaser}), 已移入隔离区"})
-                            info_json["Type"] = "个人非报销发票"
-                            classification_reason_codes.append("CLASSIFIED_AS_PERSONAL_NON_REIMBURSEMENT")
+                        active_company = self._resolve_active_company()
+                        purchaser_relation = classify_purchaser_relation(purchaser, active_company)
+                        if purchaser_relation == "non_target":
+                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "拦截:", "color": "text-yellow-400", "msg": f"购买方与目标公司不匹配 ({purchaser})，已分流到非目标公司发票"})
+                            info_json["Type"] = "非目标公司发票"
+                            classification_reason_codes.append("CLASSIFIED_AS_NON_TARGET_COMPANY")
+                        elif purchaser_relation == "unknown":
+                            review_path = self._send_to_manual_check(
+                                save_path,
+                                pdf_path,
+                                "COMPANY_PURCHASER_UNKNOWN",
+                                metadata=self._attachment_diag_metadata(
+                                    info,
+                                    file_name=file_name,
+                                    document_id=document_id,
+                                    extra={
+                                        "tier": tier_info,
+                                        "seller": seller,
+                                        "purchaser": purchaser,
+                                        "doc_type": doc_type,
+                                        "target_company": active_company,
+                                    },
+                                ),
+                                is_url=info.get("is_url", False),
+                            )
+                            self.stats["errors"] += 1
+                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "复核:", "color": "text-yellow-400", "msg": f"购买方字段缺失或低置信度，已移入待人工复核: {os.path.basename(review_path)}"})
+                            trace_store.set_fields(
+                                document_id,
+                                normalized_fields=normalized_snapshot,
+                                classification_result={
+                                    "status": "manual_review",
+                                    "original_type": original_doc_type,
+                                    "final_type": info_json.get("Type", ""),
+                                    "category": MANUAL_REVIEW_FOLDER,
+                                    "is_invoice": is_invoice,
+                                    "is_exempt": is_exempt,
+                                    "purchaser_relation": purchaser_relation,
+                                },
+                                naming_result={"status": "manual_check", "reason_code": "COMPANY_PURCHASER_UNKNOWN"},
+                                archive_target=review_path,
+                            )
+                            self.error_invoices.append({
+                                "id": f"inv_{time.time()}_{i}",
+                                "date": info_json.get("Date", "---"),
+                                "amount": f"¥ {info_json.get('Amount', '0.00')}",
+                                "category": "待人工复核",
+                                "merchant": info_json.get("Seller", "未知开票方"),
+                                "path": review_path,
+                                "name": os.path.basename(review_path),
+                                "artifact_kind": "manual_check",
+                                "sColor": "bg-yellow-500",
+                                "status": "待人工复核",
+                                "reason": "购买方字段缺失或低置信度，需人工确认是否属于目标公司",
+                                "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50",
+                            })
+                            processed_filepaths.add(pdf_path)
+                            continue
 
                     # Step C: 回传记录前端
-                    category_name = info_json.get("category", info_json.get("Type", "未知分类"))
+                    category_name = get_archive_folder(info_json.get("Type", "未知分类"))
                     self.discovered_categories.add(category_name)
                     trace_store.set_fields(
                         document_id,
@@ -2927,7 +3288,6 @@ class InvoiceAppAPI:
 
                     # 构建归档路由规则: CWT 类型映射到正确的目标文件夹
                     # 航班行程单→机票, 住宿确认单→住宿发票(与发票/水单排序挨着)
-                    from document_types import get_archive_folder
                     _archive_rules = {}
                     _cur_type = info_json.get("Type", "")
                     _mapped_folder = get_archive_folder(_cur_type)
@@ -2935,8 +3295,68 @@ class InvoiceAppAPI:
                         _archive_rules[_cur_type] = _mapped_folder
                     success, result_path = extractor.route_and_rename_file(pdf_path, info_json, custom_rules=_archive_rules or None)
                     naming_trace = copy.deepcopy(getattr(extractor, "last_route_trace", {}) or {})
+                    routed_to_manual_check = bool(
+                        result_path
+                        and (
+                            MANUAL_REVIEW_FOLDER in result_path
+                            or naming_trace.get("used_manual_check")
+                        )
+                    )
                     
+                    if success and routed_to_manual_check:
+                        self.audit_counts["manual_check"] += 1
+                        self.logs.append({
+                            "time": time.strftime("[%H:%M:%S]"),
+                            "type": "复核:",
+                            "color": "text-yellow-400",
+                            "msg": f"低置信度结果已移入人工复核: {os.path.basename(result_path)}",
+                        })
+                        trace_store.set_fields(
+                            document_id,
+                            naming_result=naming_trace or {"status": "manual_check", "reason_code": "ROUTE_TO_MANUAL_CHECK"},
+                            archive_target=result_path,
+                        )
+                        self._safe_emit_artifact_event(
+                            "manual_check",
+                            result_path,
+                            document_id=document_id,
+                            source_kind=info.get("source_kind"),
+                            reason_code=naming_trace.get("reason_code") or "ROUTE_TO_MANUAL_CHECK",
+                            category=MANUAL_REVIEW_FOLDER,
+                            extra=self._attachment_diag_metadata(
+                                info,
+                                file_name=file_name,
+                                document_id=document_id,
+                                extra={
+                                    "final_type": info_json.get("Type", ""),
+                                    "seller": info_json.get("Seller", ""),
+                                },
+                            ),
+                        )
+                        self.error_invoices.append({
+                            "id": f"inv_{time.time()}_{i}",
+                            "date": info_json.get("Date", "---"),
+                            "amount": f"¥ {info_json.get('Amount', '0.00')}",
+                            "category": "待人工复核",
+                            "merchant": info_json.get("Seller", "未知开票方"),
+                            "path": result_path,
+                            "name": os.path.basename(result_path),
+                            "artifact_kind": "manual_check",
+                            "sColor": "bg-yellow-500",
+                            "status": "待人工复核",
+                            "reason": "识别结果缺少关键字段，已移入待人工复核",
+                            "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50",
+                        })
+                        processed_filepaths.add(pdf_path)
+                        continue
+
                     if success:
+                        final_category = (
+                            naming_trace.get("target_folder")
+                            or os.path.basename(os.path.dirname(result_path))
+                            or category_name
+                        )
+                        category_name = final_category
                         success_count += 1
                         self.stats["invoices"] = success_count
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "成功:", "color": "text-emerald-400", "msg": f"[{category_name}] 归档至: {os.path.basename(result_path)}"})
@@ -2951,7 +3371,7 @@ class InvoiceAppAPI:
                             document_id=document_id,
                             source_kind=info.get("source_kind"),
                             reason_code=naming_trace.get("reason_code"),
-                            category=category_name,
+                            category=final_category,
                             extra=self._attachment_diag_metadata(
                                 info,
                                 file_name=file_name,
@@ -2968,32 +3388,25 @@ class InvoiceAppAPI:
                             "id": f"inv_{time.time()}_{i}",
                             "date": info_json.get("Date", "---"),
                             "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                            "category": category_name,
+                            "category": final_category,
                             "merchant": info_json.get("Seller", "未知开票方"),
                             "path": result_path
                         })
                         processed_filepaths.add(pdf_path)
                         
                         # 记录成功提取的指纹，避免重复扣费
-                        processed_history.add(history_key)
-                        try:
-                            import json
-                            with open(history_file_path, "w", encoding="utf-8") as hf:
-                                json.dump(list(processed_history), hf)
-                        except Exception:
-                            pass
+                        working_history.add(history_key)
                             
-                        # 更新 Business 去重字典并持久化
+                        # 更新 Business 去重字典，整轮成功后再统一持久化
                         if invoice_code or invoice_number:
                             dup_key = f"{invoice_code}_{invoice_number}"
                             business_records[dup_key] = {"file": os.path.basename(result_path), "date": info_json.get("Date", ""), "amount": info_json.get("Amount", "")}
-                            extractor.save_processed_records(business_records)
                     else:
                         self.stats["errors"] += 1
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "跳过:", "color": "text-yellow-400", "msg": f"未归档或放入人工分类: {file_name} ({result_path})"})
                         self._record_error_log(save_path, info.get('subject', file_name), result_path)
                         original_error = result_path
-                        if "Manual_Check" not in result_path:
+                        if MANUAL_REVIEW_FOLDER not in result_path:
                             result_path = self._retain_artifact(
                                 save_path,
                                 pdf_path,
@@ -3014,7 +3427,7 @@ class InvoiceAppAPI:
                                 document_id=document_id,
                                 source_kind=info.get("source_kind"),
                                 reason_code=naming_trace.get("reason_code") or "ROUTE_TO_MANUAL_CHECK",
-                                category="Manual_Check",
+                                category=MANUAL_REVIEW_FOLDER,
                                 extra=self._attachment_diag_metadata(
                                     info,
                                     file_name=file_name,
@@ -3041,13 +3454,13 @@ class InvoiceAppAPI:
                         processed_filepaths.add(pdf_path) # [Fix] Always mark as processed
                         
                         # 纳入人工分类的即使失败也要视为已处理，由 Manual_Check 承接
-                        if "Manual_Check" in result_path:
+                        if MANUAL_REVIEW_FOLDER in result_path:
                             processed_filepaths.add(pdf_path)
                             self.error_invoices.append({
                                 "id": f"inv_{time.time()}_{i}",
                                 "date": "---",
                                 "amount": "---",
-                                "category": "人工复核",
+                            "category": "待人工复核",
                                 "merchant": "无法自动分类",
                                 "path": result_path,
                                 "name": os.path.basename(result_path),
@@ -3623,6 +4036,25 @@ class InvoiceAppAPI:
                 trace_store.flush()
             except Exception as trace_err:
                 self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"诊断 trace 写入失败: {trace_err}"})
+            if loop_result == "failed" or self.quota_exhausted:
+                failure_reason = "quota_exhausted" if self.quota_exhausted else "processing_failed"
+                self._mark_output_run_state(
+                    output_state_dir,
+                    "failed",
+                    failure_reason=failure_reason,
+                    history_count=len(committed_history),
+                    business_record_count=len(business_records or {}),
+                )
+            elif self._stop_requested:
+                self._mark_output_run_state(
+                    output_state_dir,
+                    "aborted",
+                    failure_reason="safe_stop_requested",
+                    history_count=len(committed_history),
+                    business_record_count=len(business_records or {}),
+                )
+            else:
+                self._commit_output_state(output_state_dir, working_history, business_records)
             if loop_result != "failed":
                 self._safe_emit_stage_event(
                     "_run_processing_loop",
@@ -3682,7 +4114,7 @@ class InvoiceAppAPI:
         sidecar = f"{target_path}.json"
         payload = {
             "reason": reason,
-            "original_path": str(source_path),
+            "original_path": self._user_safe_source_reference(source_path),
             "retained_path": target_path,
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -3713,13 +4145,13 @@ class InvoiceAppAPI:
         return target_path
 
     def _send_to_manual_check(self, save_path, source_path, reason, metadata=None, is_url=False):
-        """把待人工复核候选写入用户输出目录下的 Manual_Check。"""
+        """把待人工复核候选写入用户输出目录下的中文复核目录。"""
         import json
         import re
         import shutil
         import uuid
 
-        manual_dir = os.path.join(save_path, "Manual_Check")
+        manual_dir = os.path.join(save_path, MANUAL_REVIEW_FOLDER)
         os.makedirs(manual_dir, exist_ok=True)
 
         def _unique_path(filename):
@@ -3742,7 +4174,7 @@ class InvoiceAppAPI:
             target_path = _unique_path(f"P0_LinkReview_{safe_subject}_{candidate_index}.url.txt")
             with open(target_path, "w", encoding="utf-8") as fh:
                 fh.write(str(source_path))
-            original_path = str(source_path)
+            original_path = self._user_safe_source_reference(source_path)
         else:
             if not source_path or not os.path.exists(source_path):
                 return source_path
@@ -3752,7 +4184,7 @@ class InvoiceAppAPI:
                 original_name = os.path.basename(str(metadata["file_name"]))
             target_path = _unique_path(f"{prefix}_{original_name}")
             shutil.copy2(source_path, target_path)
-            original_path = source_path
+            original_path = self._user_safe_source_reference(source_path)
 
         sidecar = f"{target_path}.json"
         payload = {
@@ -3778,7 +4210,7 @@ class InvoiceAppAPI:
             document_id=(metadata or {}).get("document_id"),
             source_kind=(metadata or {}).get("source_kind"),
             reason_code=reason,
-            category="Manual_Check",
+            category=MANUAL_REVIEW_FOLDER,
             extra={
                 "is_url": bool(is_url),
                 "metadata": metadata or {},
@@ -3789,7 +4221,7 @@ class InvoiceAppAPI:
 
     def _cwt_cancellation_matching(self, save_path):
         """CWT 取消撮合: 根据取消知会中的人名，在已归档的住宿确认单中寻找匹配的预订，
-        将匹配的预订也移入 Manual_Check，并在 sidecar 中注明撮合关系。"""
+        将匹配的预订也移入待人工复核，并在 sidecar 中注明撮合关系。"""
         import re
         import shutil
         import json
@@ -3802,7 +4234,7 @@ class InvoiceAppAPI:
         # 格式: 酒店预定取消知会-{name}-{date}入住-{city} (CONNECT 订单号：{order}).pdf
         cancel_pattern = re.compile(r'取消知会[_\-]?(\S+?)[_\-]\d')
 
-        manual_dir = os.path.join(save_path, "Manual_Check")
+        manual_dir = os.path.join(save_path, MANUAL_REVIEW_FOLDER)
         hotel_dir = os.path.join(save_path, "住宿发票")
 
         for cancel in cancellations:
@@ -3830,7 +4262,7 @@ class InvoiceAppAPI:
                         "reason": "CWT_CANCELLATION_MATCH",
                         "matched_cancellation": cancel_fn,
                         "matched_person": person_name,
-                        "original_path": src,
+                        "original_path": self._user_safe_source_reference(src),
                         "review_path": dst,
                         "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     }
@@ -4054,7 +4486,7 @@ class InvoiceAppAPI:
 
     def _manual_check_path(self):
         base_path = self._effective_save_path or self._requested_save_path or self.get_default_save_path()
-        return os.path.join(base_path, "Manual_Check")
+        return os.path.join(base_path, MANUAL_REVIEW_FOLDER)
 
     def _build_error_breakdown(self):
         breakdown = {
@@ -4078,20 +4510,29 @@ class InvoiceAppAPI:
 
     def _summarize_stats(self):
         breakdown = self._build_error_breakdown()
+        manual_review_count = max(
+            int(breakdown.get("manual_review", 0) or 0),
+            int(self.audit_counts.get("manual_check", 0) or 0),
+        )
+        retention_count = max(
+            int(breakdown.get("retained_record", 0) or 0),
+            int(self.audit_counts.get("retention", 0) or 0),
+        )
         return {
             "emails": int(self.stats.get("emails", 0) or 0),
             "success_count": len(self.processed_invoices),
             "error_count": len(self.error_invoices),
-            "manual_check_count": int(breakdown.get("manual_review", 0) or self.audit_counts.get("manual_check", 0) or 0),
-            "retention_count": int(breakdown.get("retained_record", 0) or 0),
+            "manual_check_count": manual_review_count,
+            "retention_count": retention_count,
             "raw_invoice_count": int(self.audit_counts.get("raw_invoices", 0) or 0),
             "processing_error_count": int(breakdown.get("processing_error", 0) or 0),
             "result_breakdown": {
-                "manual_review": int(breakdown.get("manual_review", 0) or 0),
-                "retained_record": int(breakdown.get("retained_record", 0) or 0),
+                "manual_review": manual_review_count,
+                "retained_record": retention_count,
                 "processing_error": int(breakdown.get("processing_error", 0) or 0),
             },
             "reason_code_breakdown": breakdown.get("reason_codes", {}),
+            "timing_breakdown": self._build_timing_breakdown(),
             "quota_exhausted": bool(self.quota_exhausted),
             "quota_message": self.quota_message,
             "run_state": self.run_state,
@@ -4100,12 +4541,18 @@ class InvoiceAppAPI:
 
     def _classify_error_invoice(self, item):
         path = str((item or {}).get("path", "") or "")
+        artifact_kind = str((item or {}).get("artifact_kind", "") or "").strip().lower()
         status = str((item or {}).get("status", "") or "")
         reason = str((item or {}).get("reason", "") or "")
         category = str((item or {}).get("category", "") or "")
         merchant = str((item or {}).get("merchant", "") or "")
         normalized = " ".join([path, status, reason, category, merchant]).lower()
+        normalized_path = path.replace("\\", "/").lower()
 
+        if artifact_kind == "manual_check" or "/manual_check/" in normalized_path or f"/{MANUAL_REVIEW_FOLDER.lower()}/" in normalized_path:
+            return "manual_review", "待人工复核"
+        if artifact_kind == "retention" or "/_audit_retention/" in normalized_path:
+            return "retained_record", "保留记录"
         if "manual_check" in normalized or "人工复核" in normalized or "待人工复核" in normalized:
             return "manual_review", "待人工复核"
         if any(token in normalized for token in [
@@ -4296,7 +4743,16 @@ class InvoiceAppAPI:
         except Exception as exc:
             return {"success": False, "message": f"无法创建输出目录: {exc}"}
 
-        remember_settings = bool((self._settings_store.load() or {}).get("remember_settings", True))
+        current_settings = self._settings_store.load() or {}
+        remember_settings = bool(current_settings.get("remember_settings", True))
+        active_company = str(current_settings.get("company") or "").strip()
+        self._active_run_config = {
+            "company": active_company,
+            "save_path": effective_save_path,
+            "date_from": self._effective_date_from,
+            "date_to": self._effective_date_to,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
         if remember_settings:
             self.save_user_settings({
                 "email": email_address,
@@ -4305,6 +4761,7 @@ class InvoiceAppAPI:
                 "save_path": effective_save_path,
                 "date_from": effective_date_from or "",
                 "date_to": effective_date_to or "",
+                "company": active_company,
                 "remember_settings": True,
             })
         else:
@@ -4394,6 +4851,9 @@ class InvoiceAppAPI:
                 "can_stop": False,
                 "quota_exhausted": self.quota_exhausted,
                 "quota_message": self.quota_message,
+                "build_identity": self.build_identity,
+                "raw_date_range": self._raw_date_range_display,
+                "imap_query_range": self._imap_query_range_display,
             }
         else:
             payload = {
@@ -4409,6 +4869,9 @@ class InvoiceAppAPI:
                 "can_stop": bool(self._is_running and not self._stop_requested),
                 "quota_exhausted": self.quota_exhausted,
                 "quota_message": self.quota_message,
+                "build_identity": self.build_identity,
+                "raw_date_range": self._raw_date_range_display,
+                "imap_query_range": self._imap_query_range_display,
             }
         self._packaged_diag_log_progress_poll(payload)
         return payload
@@ -4425,6 +4888,9 @@ class InvoiceAppAPI:
             "manual_check_path": self._manual_check_path(),
             "output_path": self._effective_save_path or self._requested_save_path or self.get_default_save_path(),
             "summary": summary,
+            "build_identity": self.build_identity,
+            "raw_date_range": self._raw_date_range_display,
+            "imap_query_range": self._imap_query_range_display,
             "resultBreakdown": summary.get("result_breakdown", {}),
             "reasonCodeBreakdown": summary.get("reason_code_breakdown", {}),
             "quota_exhausted": self.quota_exhausted,

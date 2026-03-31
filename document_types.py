@@ -5,6 +5,10 @@
 新增类型只需在 DOCUMENT_TYPES 字典中加一个条目。
 """
 
+MANUAL_REVIEW_FOLDER = "待人工复核"
+NON_TARGET_COMPANY_FOLDER = "非目标公司发票"
+PERSONAL_NON_REIMBURSEMENT_FOLDER = "个人非报销发票"
+
 DOCUMENT_TYPES = {
     # 现有发票类型
     "打车":     {"exempt_from_purchaser_check": True,  "archive_folder": "打车"},
@@ -23,7 +27,8 @@ DOCUMENT_TYPES = {
     # 差旅服务费 (GBT Travel Services SCCT 发票)
     "差旅服务费": {"exempt_from_purchaser_check": True, "archive_folder": "差旅服务费"},
     # 隔离类型
-    "个人非报销发票": {"exempt_from_purchaser_check": True, "archive_folder": "个人非报销发票"},
+    "非目标公司发票": {"exempt_from_purchaser_check": True, "archive_folder": NON_TARGET_COMPANY_FOLDER},
+    "个人非报销发票": {"exempt_from_purchaser_check": True, "archive_folder": PERSONAL_NON_REIMBURSEMENT_FOLDER},
 }
 
 

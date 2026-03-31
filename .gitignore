@@ -21,7 +21,11 @@ dist/
 build/work/
 build/runtime/
 build/windows/version-info.generated.txt
+build/windows/build-identity.generated.json
 *.log
+HANDOFF_*.md
+frontend-current-*.png
+design/
 
 # OS/editor noise
 .DS_Store

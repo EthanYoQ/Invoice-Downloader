@@ -11,7 +11,7 @@
     "rendered": "build/windows/version-info.generated.txt"
   },
   "icon": {
-    "exeIconPath": ""
+    "exeIconPath": "build/windows/assets/invoiceflowai.ico"
   },
   "chromium": {
     "envVar": "PLAYWRIGHT_BROWSERS_PATH",
@@ -80,6 +80,11 @@
       "source": "build/runtime/webview2-fixed",
       "target": "runtime/webview2-fixed",
       "optional": false
+    },
+    {
+      "source": "build/windows/build-identity.generated.json",
+      "target": "build_meta",
+      "optional": false
     }
   ],
   "hiddenImports": [
@@ -114,6 +119,7 @@
     "build/runtime/mcp-chrome.excluded/",
     "build/work/",
     "build/windows/version-info.generated.txt",
+    "build/windows/build-identity.generated.json",
     "NUL",
     "nul"
   ]

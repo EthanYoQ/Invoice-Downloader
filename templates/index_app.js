@@ -48,28 +48,20 @@ const DEFAULT_PROGRESS = {
     can_stop: false,
     quota_exhausted: false,
     quota_message: "",
+    build_identity: null,
 };
-
-const QUICK_RANGE_OPTIONS = [
-    { key: "last_7_days", label: "近 7 天", resolve: () => lastDaysRange(7) },
-    { key: "last_30_days", label: "近 30 天", resolve: () => lastDaysRange(30) },
-    { key: "last_90_days", label: "近 90 天", resolve: () => lastDaysRange(90) },
-    {
-        key: "this_month",
-        label: "本月",
-        resolve: () => {
-            const now = new Date();
-            return {
-                date_from: isoDate(new Date(now.getFullYear(), now.getMonth(), 1)),
-                date_to: isoDate(now),
-            };
-        },
-    },
-];
 
 const APP_BRAND = {
     name: "InvoiceFlowAI",
-    subtitle: "External Test Build",
+    subtitle: "AI发票管家",
+};
+
+const APP_VISIBLE_COPY = {
+    topSubtitle: "AI发票管家",
+    footerVersion: "InvoiceFlowAI v2026.03.31",
+    footerStamp: "P-H-Dx",
+    githubLabel: "产品官网",
+    githubUrl: "https://github.com/Ethan-YoungQ/Invoice-Downloader",
 };
 
 const ZHIPU_PLATFORM_URL = "https://bigmodel.cn/pricing";
@@ -79,23 +71,17 @@ const EMAIL_DOMAIN_OPTIONS = [
 ];
 
 const DISCLAIMER_SOFTWARE_ITEMS = [
-    "本软件用于外部测试环境下的票据整理验证。",
+    "本软件用于票据整理、归档与复核辅助处理。",
     "本软件不附带任何真实邮箱凭据或 API Key。",
-    "请仅填写并使用你自己的测试邮箱和授权码。",
+    "请仅填写并使用你自己的邮箱授权信息与 API Key。",
     "涉及报销、入账或合规判断的重要票据，请务必进行人工复核。",
 ];
 
 const DISCLAIMER_ITEMS = [
-    "本工具为测试版免费软件，当前界面与识别结果仅用于辅助处理。",
+    "本工具用于票据整理与归档辅助，识别结果应结合业务流程进行复核。",
     "对于识别、归档、遗漏、误判及由此产生的后果，工具方不承担责任。",
     "使用者应自行遵守所在公司关于大模型、API 使用和数据安全管理的规定。",
     "涉及报销、入账或合规判断的重要票据，请务必进行人工复核。",
-];
-
-const TASK_CONFIRMATION_TIPS = [
-    "确认邮箱、输出目录与本轮任务一致。",
-    "日期锁定时不可修改，可直接开始提取。",
-    "若结果页提示人工复核，请前往人工复核文件夹查看。",
 ];
 
 const UI_COPY = {
@@ -109,34 +95,23 @@ const UI_COPY = {
         windowSubtitle: "桌面工作区",
     },
     navigation: [
-        { key: "settings", label: "连接设置", description: "邮箱与 API", icon: "tune", path: "/" },
-        { key: "config", label: "任务确认", description: "日期与摘要", icon: "calendar_month", path: "/config" },
+        { key: "settings", label: "启动配置", description: "邮箱、API 与日期", icon: "tune", path: "/" },
         { key: "processing", label: "处理中心", description: "进度与日志", icon: "data_thresholding", path: "/processing" },
         { key: "analysis", label: "结果分析", description: "总览与导出", icon: "assessment", path: "/analysis" },
     ],
     pages: {
         settings: {
             eyebrow: "Step 1",
-            title: "连接设置",
-            footerText: "当前页: 连接设置",
-            bootstrapTitle: "连接设置",
+            title: "启动配置",
+            footerText: "当前页: 启动配置",
+            bootstrapTitle: "启动配置",
             bootstrapDescription: "正在初始化本地设置。",
             bootstrapMessage: "正在连接桌面接口并加载本地设置，请稍候。",
             errorDescription: "本地设置初始化失败。",
             controlledNotice: "受控复跑已锁定输出目录与日期窗口。",
         },
-        config: {
-            eyebrow: "Step 2",
-            title: "任务确认",
-            footerText: "当前页: 任务确认",
-            bootstrapTitle: "任务确认",
-            bootstrapDescription: "正在加载运行设置。",
-            bootstrapMessage: "正在连接桌面接口并加载运行设置，请稍候。",
-            errorDescription: "运行设置初始化失败。",
-            lockedNotice: "当前为受控前端复跑，本轮日期窗口已锁定。",
-        },
         processing: {
-            eyebrow: "Step 3",
+            eyebrow: "Step 2",
             title: "处理中心",
             footerText: "当前页: 处理中心",
             closeHint: "关闭程序会直接结束当前窗口与任务进程，请仅在确认后执行。",
@@ -150,14 +125,14 @@ const UI_COPY = {
             stopNotice: "已收到安全停止指令，当前邮件或当前文件处理完成后将结束任务。",
         },
         analysis: {
-            eyebrow: "Step 4",
+            eyebrow: "Step 3",
             title: "结果分析",
             footerText: "当前页: 结果分析",
             statusSummary: "运行结果",
             resultTitle: "本次处理完成",
             reviewTitle: "待人工复核",
             reviewEmpty: "当前没有待人工复核记录。",
-            reviewReady: "请优先前往人工复核文件夹处理这些记录。",
+            reviewReady: "请优先前往待人工复核文件夹处理这些记录。",
             reviewIdle: "结果明细仍可导出查看，输出目录会保留本轮成功归档结果。",
         },
     },
@@ -276,11 +251,6 @@ function parentFolder(path) {
     return value.replace(/[/\\][^/\\]+$/, "");
 }
 
-function getQuickRange(optionKey) {
-    const matched = QUICK_RANGE_OPTIONS.find((item) => item.key === optionKey) || QUICK_RANGE_OPTIONS[1];
-    return matched.resolve();
-}
-
 const SESSION_SETTINGS_KEY = "invoiceflow.session.settings";
 const SESSION_RUN_SETTINGS_KEY = "invoiceflow.session.runSettings";
 const CONTROLLED_AUTOSTART_PREFIX = "invoiceflow.controlledAutostart";
@@ -381,6 +351,9 @@ async function loadShellState() {
     };
 
     if (hasExplicitQaRunContext(runContext)) {
+        if (runContext.locked_email) {
+            settings.email = runContext.locked_email;
+        }
         if (runContext.locked_output_path) {
             settings.save_path = runContext.locked_output_path;
         }
@@ -758,6 +731,7 @@ function DisclaimerDialog({ open, onClose }) {
 
 function Sidebar({ active, onOpenDisclaimer }) {
     const navigate = useNavigate();
+    const githubUrl = APP_VISIBLE_COPY.githubUrl;
 
     return (
         <aside className="app-sidebar">
@@ -765,7 +739,7 @@ function Sidebar({ active, onOpenDisclaimer }) {
                 <div className="sidebar-logo">IF</div>
                 <div>
                     <p className="sidebar-title">{APP_BRAND.name}</p>
-                    <p className="sidebar-subtitle">{APP_BRAND.subtitle}</p>
+                    <p className="sidebar-subtitle">{APP_VISIBLE_COPY.topSubtitle}</p>
                 </div>
             </div>
 
@@ -789,17 +763,23 @@ function Sidebar({ active, onOpenDisclaimer }) {
             <div className="sidebar-footer">
                 <button type="button" className="sidebar-foot-button" onClick={() => navigate("/")}>
                     <span className="material-symbols-outlined">restart_alt</span>
-                    <span className="sidebar-foot-button__label">重新配置</span>
+                    <span className="sidebar-foot-button__label">回到首页</span>
                 </button>
                 <button type="button" className="sidebar-foot-button" onClick={onOpenDisclaimer}>
                     <span className="material-symbols-outlined">balance</span>
                     <span className="sidebar-foot-button__label">免责声明</span>
                 </button>
+                <div className="sidebar-link-row">
+                    <button type="button" className="sidebar-foot-chip sidebar-foot-chip--single" onClick={() => openExternalUrl(githubUrl)}>
+                        <span className="material-symbols-outlined">code</span>
+                        <span>{APP_VISIBLE_COPY.githubLabel}</span>
+                    </button>
+                </div>
                 <div className="sidebar-brand">
                     <span className="sidebar-brand__dot"></span>
                     <div>
-                        <p className="sidebar-brand__name">{APP_BRAND.name}</p>
-                        <p className="sidebar-brand__sub">{APP_BRAND.subtitle}</p>
+                        <p className="sidebar-brand__name">{APP_VISIBLE_COPY.footerVersion}</p>
+                        <p className="sidebar-brand__sub">{APP_VISIBLE_COPY.footerStamp}</p>
                     </div>
                 </div>
             </div>
@@ -819,8 +799,10 @@ function SettingsPage({ onOpenDisclaimer }) {
     const [apiStatus, setApiStatus] = useState({ status: "idle", message: "" });
     const [bootstrapState, setBootstrapState] = useState("bootstrapping");
     const [bootstrapError, setBootstrapError] = useState("");
+    const [starting, setStarting] = useState(false);
     const saveTimerRef = useRef(null);
-    const controlledNavRef = useRef(false);
+    const autostartTimerRef = useRef(null);
+    const autostartTriggeredRef = useRef(false);
 
     useEffect(() => {
         let active = true;
@@ -843,6 +825,7 @@ function SettingsPage({ onOpenDisclaimer }) {
         return () => {
             active = false;
             if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+            if (autostartTimerRef.current) clearTimeout(autostartTimerRef.current);
         };
     }, []);
 
@@ -861,25 +844,41 @@ function SettingsPage({ onOpenDisclaimer }) {
 
     const controlledRun = hasExplicitQaRunContext(runContext);
     const emailParts = splitEmailAddress(settings.email);
-    const canContinue = !validateEmail(settings.email)
+    const dateError = validateDateRange(runSettings.date_from, runSettings.date_to);
+    const canStart = !validateEmail(settings.email)
         && !!settings.auth_code
         && !!settings.api_key
         && !!String(settings.company || "").trim()
-        && !!String(settings.save_path || "").trim();
+        && !!String(settings.save_path || "").trim()
+        && !dateError;
 
     useEffect(() => {
-        if (bootstrapState !== "bootstrapped" || controlledNavRef.current || !shouldAutostartControlledRun(runContext) || isControlledAutostartConsumed(runContext)) {
-            return;
+        if (bootstrapState !== "bootstrapped" || starting || autostartTriggeredRef.current || !shouldAutostartControlledRun(runContext)) return undefined;
+        if (isControlledAutostartConsumed(runContext)) {
+            autostartTriggeredRef.current = true;
+            return undefined;
         }
-        controlledNavRef.current = true;
-        navigate("/config", { replace: true });
-    }, [bootstrapState, navigate, runContext]);
+        const delayMs = Math.max(0, Number(runContext.autostart_delay_ms || 0));
+        autostartTimerRef.current = setTimeout(() => {
+            autostartTriggeredRef.current = true;
+            markControlledAutostartConsumed(runContext);
+            handleStart();
+        }, delayMs);
+        return () => {
+            if (autostartTimerRef.current) clearTimeout(autostartTimerRef.current);
+        };
+    }, [bootstrapState, runContext, starting, settings, runSettings]);
 
     function updateSetting(key, value) {
         setSettings((current) => ({ ...current, [key]: value }));
         setPageError("");
         if (key === "email" || key === "auth_code") setEmailStatus({ status: "idle", message: "" });
         if (key === "email" || key === "api_key") setApiStatus({ status: "idle", message: "" });
+    }
+
+    function setDateValue(field, value) {
+        setRunSettings((current) => ({ ...current, [field]: value, quick_range: "custom" }));
+        setPageError("");
     }
 
     async function handleChooseDirectory() {
@@ -930,18 +929,27 @@ function SettingsPage({ onOpenDisclaimer }) {
         }
     }
 
-    async function handleContinue() {
+    async function handleStart() {
         const emailError = validateEmail(settings.email);
         if (emailError) return setPageError(emailError);
         if (!settings.auth_code) return setPageError("请输入邮箱授权码。");
         if (!settings.api_key) return setPageError("请输入 GLM API Key。");
         if (!settings.company || !settings.company.trim()) return setPageError("请填写公司名称。");
         if (!settings.save_path) return setPageError("请选择输出目录。");
+        if (dateError) return setPageError(dateError);
+        setStarting(true);
         try {
             await persistUserSettings(settings, runSettings, runContext);
-            navigate("/config");
+            const result = await callApi("start_processing", "", settings.save_path, runSettings.date_from, runSettings.date_to, String(settings.email).trim(), settings.auth_code, settings.api_key);
+            if (!result || !result.success) {
+                setPageError(result && result.message ? result.message : "任务启动失败。");
+                return;
+            }
+            navigate("/processing");
         } catch (error) {
-            setPageError(error.message || "保存设置失败。");
+            setPageError(error.message || "任务启动失败。");
+        } finally {
+            setStarting(false);
         }
     }
     if (bootstrapState === "bootstrapping") {
@@ -955,7 +963,6 @@ function SettingsPage({ onOpenDisclaimer }) {
         <AppShell
             active="settings"
             onOpenDisclaimer={onOpenDisclaimer}
-            contentScrollable={false}
             footerLeft={
                 <label className="toggle-row">
                     <input type="checkbox" checked={settings.remember_settings !== false} onChange={(event) => updateSetting("remember_settings", event.target.checked)} />
@@ -963,9 +970,9 @@ function SettingsPage({ onOpenDisclaimer }) {
                 </label>
             }
             footerRight={
-                <button type="button" className="btn btn--primary" onClick={handleContinue} disabled={!canContinue}>
-                    <span>保存并继续</span>
-                    <span className="material-symbols-outlined">arrow_forward</span>
+                <button type="button" className="btn btn--primary" onClick={handleStart} disabled={!canStart || starting}>
+                    <span className="material-symbols-outlined">{starting ? "sync" : "play_arrow"}</span>
+                    <span>{starting ? "启动中..." : "开始提取"}</span>
                 </button>
             }
         >
@@ -976,7 +983,7 @@ function SettingsPage({ onOpenDisclaimer }) {
 
                 <div className="settings-grid settings-grid--fit">
                     <div className="settings-column">
-                        <section className="surface-card" style={{ flex: 1 }}>
+                        <section className="surface-card">
                             <SectionHeader icon="mail" title="邮箱源配置" indicator={<StatusPill tone="warning" icon="mail">待确认</StatusPill>} />
                             <div className="card-stack card-stack--compact">
                                 <div className="field-block">
@@ -1035,13 +1042,13 @@ function SettingsPage({ onOpenDisclaimer }) {
                                         <span>{controlledRun ? "路径已锁定" : "浏览目录"}</span>
                                     </button>
                                 </div>
-                                <p className="field-help">{controlledRun ? "当前为受控前端复跑，本轮输出目录由诊断上下文锁定。" : "系统会在此目录下继续按发票类型落盘，并生成人工复核目录。"}</p>
+                                <p className="field-help">{controlledRun ? "当前为受控前端复跑，本轮输出目录由诊断上下文锁定。" : "系统会在此目录下继续按发票类型落盘，并生成待人工复核目录。"}</p>
                             </div>
                         </section>
                     </div>
 
                     <div className="settings-column">
-                        <section className="surface-card" style={{ flex: 1 }}>
+                        <section className="surface-card">
                             <SectionHeader icon="psychology" title="智能处理引擎" indicator={<StatusPill tone="success" icon="auto_awesome">GLM</StatusPill>} />
                             <div className="card-stack card-stack--compact">
                                 <div className="field-block">
@@ -1066,6 +1073,18 @@ function SettingsPage({ onOpenDisclaimer }) {
                             </div>
                         </section>
 
+                        <section className="surface-card surface-card--compact settings-date-card">
+                            <SectionHeader icon="calendar_month" title="提取时间范围" indicator={controlledRun ? <StatusPill tone="info" icon="lock">已锁定</StatusPill> : null} />
+                            <div className="card-stack card-stack--compact">
+                                <div className="field-row field-row--dates settings-date-row">
+                                    <DateField label="开始日期" value={runSettings.date_from} onChange={(value) => setDateValue("date_from", value)} disabled={controlledRun} />
+                                    <span className="field-separator">—</span>
+                                    <DateField label="结束日期" value={runSettings.date_to} onChange={(value) => setDateValue("date_to", value)} disabled={controlledRun} />
+                                </div>
+                                {controlledRun ? <p className="field-help field-help--subtle">当前为受控复跑，日期范围已按上下文锁定。</p> : <p className="field-help field-help--subtle">确认起止日期后可直接开始提取，本页不再进入独立确认流程。</p>}
+                            </div>
+                        </section>
+
                         <section className="surface-card">
                             <SectionHeader icon="business" title="公司配置" indicator={<StatusPill tone={settings.company && settings.company.trim() ? "success" : "warning"} icon="apartment">购买方校验</StatusPill>} />
                             <div className="card-stack card-stack--compact">
@@ -1077,7 +1096,7 @@ function SettingsPage({ onOpenDisclaimer }) {
                                     </div>
                                     {!settings.company || !settings.company.trim()
                                         ? <p className="field-help field-help--subtle">填写公司名称后按购买方字段匹配。</p>
-                                        : <p className="field-help field-help--subtle">按购买方包含“{settings.company.trim()}”进行匹配。</p>}
+                                        : <p className="field-help field-help--subtle">按购买方包含“{settings.company.trim()}”进行匹配；明确不匹配的票据会单独进入“非目标公司发票”。</p>}
                                 </div>
                             </div>
                         </section>
@@ -1088,177 +1107,11 @@ function SettingsPage({ onOpenDisclaimer }) {
     );
 }
 
-function ConfigPage({ onOpenDisclaimer }) {
-    const navigate = useNavigate();
-    const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-    const [runSettings, setRunSettings] = useState(DEFAULT_RUN_SETTINGS);
-    const [runContext, setRunContext] = useState({ controlled_run: false, explicit_run_context: false });
-    const [pageError, setPageError] = useState("");
-    const [starting, setStarting] = useState(false);
-    const [bootstrapState, setBootstrapState] = useState("bootstrapping");
-    const [bootstrapError, setBootstrapError] = useState("");
-    const saveTimerRef = useRef(null);
-    const autostartTimerRef = useRef(null);
-    const autostartTriggeredRef = useRef(false);
-
-    useEffect(() => {
-        let active = true;
-        (async () => {
-            try {
-                const state = await loadShellState();
-                if (!active) return;
-                setSettings(state.settings);
-                setRunSettings(state.runSettings);
-                setRunContext(state.runContext);
-                setBootstrapError("");
-                setBootstrapState("bootstrapped");
-            } catch (error) {
-                if (active) {
-                    setBootstrapError(error.message || "加载运行设置失败。");
-                    setBootstrapState("bootstrap_failed");
-                }
-            }
-        })();
-        return () => {
-            active = false;
-            if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-            if (autostartTimerRef.current) clearTimeout(autostartTimerRef.current);
-        };
-    }, []);
-
-    useEffect(() => {
-        if (bootstrapState !== "bootstrapped") return undefined;
-        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = setTimeout(() => {
-            persistUserSettings(settings, runSettings, runContext).catch((error) => {
-                console.error("Failed to save run settings", error);
-            });
-        }, 400);
-        return () => {
-            if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-        };
-    }, [bootstrapState, settings, runSettings, runContext]);
-
-    const controlledRun = hasExplicitQaRunContext(runContext);
-
-    function setDateValue(field, value) {
-        setRunSettings((current) => ({ ...current, [field]: value, quick_range: "custom" }));
-        setPageError("");
-    }
-
-    function applyQuickRange(rangeKey) {
-        const range = getQuickRange(rangeKey);
-        setRunSettings({ ...range, quick_range: rangeKey });
-        setPageError("");
-    }
-
-    async function handleStart() {
-        const emailError = validateEmail(settings.email);
-        if (emailError) return setPageError(emailError);
-        if (!settings.auth_code) return setPageError("请先回到连接设置页填写邮箱授权码。");
-        if (!settings.api_key) return setPageError("请先回到连接设置页填写 GLM API Key。");
-        if (!settings.company || !settings.company.trim()) return setPageError("请先回到连接设置页填写公司名称。");
-        const dateError = validateDateRange(runSettings.date_from, runSettings.date_to);
-        if (dateError) return setPageError(dateError);
-
-        setStarting(true);
-        setPageError("");
-        try {
-            await persistUserSettings(settings, runSettings, runContext);
-            const result = await callApi("start_processing", "", settings.save_path, runSettings.date_from, runSettings.date_to, String(settings.email).trim(), settings.auth_code, settings.api_key);
-            if (!result || !result.success) {
-                setPageError(result && result.message ? result.message : "任务启动失败。");
-                return;
-            }
-            navigate("/processing");
-        } catch (error) {
-            setPageError(error.message || "任务启动失败。");
-        } finally {
-            setStarting(false);
-        }
-    }
-
-    useEffect(() => {
-        if (bootstrapState !== "bootstrapped" || starting || autostartTriggeredRef.current || !shouldAutostartControlledRun(runContext)) return undefined;
-        if (isControlledAutostartConsumed(runContext)) {
-            autostartTriggeredRef.current = true;
-            return undefined;
-        }
-        const delayMs = Math.max(0, Number(runContext.autostart_delay_ms || 0));
-        autostartTimerRef.current = setTimeout(() => {
-            autostartTriggeredRef.current = true;
-            markControlledAutostartConsumed(runContext);
-            handleStart();
-        }, delayMs);
-        return () => {
-            if (autostartTimerRef.current) clearTimeout(autostartTimerRef.current);
-        };
-    }, [bootstrapState, runContext, starting]);
-
-    if (bootstrapState === "bootstrapping") {
-        return <BootstrapStatePage active="config" onOpenDisclaimer={onOpenDisclaimer} eyebrow={UI_COPY.pages.config.eyebrow} title={UI_COPY.pages.config.bootstrapTitle} description={UI_COPY.pages.config.bootstrapDescription} tone="info" message={UI_COPY.pages.config.bootstrapMessage} footerText={UI_COPY.pages.config.footerText} />;
-    }
-    if (bootstrapState === "bootstrap_failed") {
-        return <BootstrapStatePage active="config" onOpenDisclaimer={onOpenDisclaimer} eyebrow={UI_COPY.pages.config.eyebrow} title={UI_COPY.pages.config.bootstrapTitle} description={UI_COPY.pages.config.errorDescription} tone="error" message={bootstrapError || "加载运行设置失败。"} footerText={UI_COPY.pages.config.footerText} />;
-    }
-
-    return (
-        <AppShell
-            active="config"
-            onOpenDisclaimer={onOpenDisclaimer}
-            contentScrollable={false}
-            footerLeft={<button type="button" className="btn btn--secondary" onClick={() => navigate("/")}><span className="material-symbols-outlined">arrow_back</span><span>返回设置</span></button>}
-            footerRight={<button type="button" className="btn btn--primary" onClick={handleStart} disabled={starting}><span className="material-symbols-outlined">{starting ? "sync" : "play_arrow"}</span><span>{starting ? "启动中..." : "开始提取"}</span></button>}
-        >
-            <div className="page-wrap page-wrap--narrow page-wrap--config">
-                <PageHeader eyebrow={UI_COPY.pages.config.eyebrow} title={UI_COPY.pages.config.title} />
-                {pageError ? <NoticeBox tone="error">{pageError}</NoticeBox> : null}
-
-                <section className="surface-card">
-                    <SectionHeader icon="fact_check" title="本次任务摘要" />
-                    <div className="summary-grid summary-grid--compact" style={{ padding: 16 }}>
-                        <SummaryField span={4} label="当前邮箱地址" value={settings.email ? maskEmail(settings.email) : "--"} helper="使用已配置邮箱" icon="mail" tone="summary-item--accent" />
-                        <SummaryField span={4} label="公司" value={settings.company || "未设置"} helper="按购买方名称匹配" icon="business" tone="summary-item--accent" />
-                        <SummaryField span={4} label="API Key" value={settings.api_key ? "已填写" : "未填写"} helper={settings.api_key ? "当前仅展示填写状态" : "如未填写请返回补充"} icon="vpn_key" tone={settings.api_key ? "summary-item--success" : "summary-item--warning"} />
-                        <SummaryField span={12} label="输出目录" value={safeText(settings.save_path)} helper={controlledRun ? "当前路径保持锁定" : "结果将继续写入当前目录"} icon="folder_open" mono truncate />
-                    </div>
-                </section>
-
-                <div className="settings-grid settings-grid--compact" style={{ flex: 1, minHeight: 0 }}>
-                    <section className="surface-card surface-card--compact" style={{ display: "flex", flexDirection: "column" }}>
-                        <SectionHeader icon="calendar_month" title="提取时间范围" />
-                        <div className="card-stack card-stack--compact">
-                            <div className="field-row field-row--dates" style={{ alignItems: "flex-end" }}>
-                                <DateField label="开始日期" value={runSettings.date_from} onChange={(value) => setDateValue("date_from", value)} disabled={controlledRun} />
-                                <span className="field-separator">—</span>
-                                <DateField label="结束日期" value={runSettings.date_to} onChange={(value) => setDateValue("date_to", value)} disabled={controlledRun} />
-                            </div>
-                            <div className="quick-range quick-range--compact">
-                                {QUICK_RANGE_OPTIONS.map((item) => <button key={item.key} type="button" className={joinClasses("quick-chip", runSettings.quick_range === item.key && "is-active")} disabled={controlledRun} onClick={() => applyQuickRange(item.key)}>{item.label}</button>)}
-                            </div>
-                            {controlledRun ? <NoticeBox tone="info">{UI_COPY.pages.config.lockedNotice}</NoticeBox> : null}
-                        </div>
-                    </section>
-
-                    <section className="surface-card surface-card--compact" style={{ display: "flex", flexDirection: "column" }}>
-                        <SectionHeader icon="lightbulb" title="开始前提示" />
-                        <div className="card-stack card-stack--compact">
-                            <div className="tips-list">
-                                {TASK_CONFIRMATION_TIPS.map((item) => <div key={item} className="tips-item"><span className="material-symbols-outlined" style={{ fontSize: 18, color: "var(--blue)" }}>done</span><span>{item}</span></div>)}
-                            </div>
-                            {shouldAutostartControlledRun(runContext) ? <NoticeBox tone="warning">当前任务会在受控复跑流程中自动启动。</NoticeBox> : null}
-                        </div>
-                    </section>
-                </div>
-            </div>
-        </AppShell>
-    );
-}
-
 function ProcessingPage({ onOpenDisclaimer }) {
     const navigate = useNavigate();
     const [progressState, setProgressState] = useState(DEFAULT_PROGRESS);
     const redirectRef = useRef(false);
+    const terminalBodyRef = useRef(null);
 
     useEffect(() => {
         let active = true;
@@ -1299,6 +1152,11 @@ function ProcessingPage({ onOpenDisclaimer }) {
     const statusTone = progressState.run_state === "failed" ? "error" : progressState.run_state === "completed" ? "success" : progressState.is_running ? "info" : "neutral";
     const statusLabel = progressState.run_state === "failed" ? "处理失败" : progressState.run_state === "completed" ? "处理完成" : progressState.is_running ? "实时连接已建立" : UI_COPY.pages.processing.statusWaiting;
 
+    useEffect(() => {
+        if (!terminalBodyRef.current) return;
+        terminalBodyRef.current.scrollTop = terminalBodyRef.current.scrollHeight;
+    }, [logs, progressState.is_running, progressState.stop_requested]);
+
     return (
         <AppShell
             active="processing"
@@ -1337,9 +1195,9 @@ function ProcessingPage({ onOpenDisclaimer }) {
                     <div className="metric-card metric-card--amber"><div className="metric-card__icon"><span className="material-symbols-outlined">warning</span></div><div className="metric-card__copy"><p className="metric-card__label">异常处理</p><p className="metric-card__value u-tabular">{stats.errors || 0}</p></div></div>
                 </div>
 
-                <section className="surface-card surface-card--terminal" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+                <section className="surface-card surface-card--terminal processing-terminal" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
                     <div className="terminal-head"><div className="terminal-title"><span className="material-symbols-outlined">terminal</span><span>实时执行日志</span></div><div className="terminal-dots"><span className="terminal-dot"></span><span className="terminal-dot"></span><span className="terminal-dot"></span></div></div>
-                    <div className="terminal-body">
+                    <div ref={terminalBodyRef} className="terminal-body">
                         <p className="terminal-intro">-- 发票助手引擎已连接 --<br />-- 进度与日志实时刷新中 --</p>
                         {logs.map((log, index) => <div key={`${log.time || "log"}-${index}`} className="terminal-line"><span className="terminal-time">{safeText(log.time, "[实时]")}</span><span className={resolveLogToneClass(log)}>{safeText(log.type, "LOG")}</span><span className="terminal-text">{safeText(log.msg, "-")}</span></div>)}
                         {progressState.is_running ? <div className="terminal-line" style={{ marginTop: 4 }}><span className="terminal-time">[实时]</span><span className="terminal-kind terminal-kind--info">状态</span><span className="terminal-text">{progressState.stop_requested ? "正在安全停止..." : "任务持续执行中..."}<span className="terminal-cursor"></span></span></div> : null}
@@ -1388,7 +1246,13 @@ function normalizeSuccessInvoices(items) {
 function normalizeGroupedErrors(groups) {
     return (groups || []).map((group, groupIndex) => ({
         key: group.key || `group-${groupIndex}`,
-        label: group.label || "待处理记录",
+        label: group.key === "retained_record"
+            ? "暂存记录"
+            : group.key === "manual_review"
+                ? "待人工复核"
+                : group.key === "processing_error"
+                    ? "真实异常"
+                    : group.label || "待处理记录",
         count: Number(group.count || 0),
         items: (group.items || []).map((item, itemIndex) => {
             const path = item.path || "";
@@ -1402,33 +1266,33 @@ function buildResultStatusText(successCount, manualCheckCount, retentionCount, p
     if (successCount > 0 && pendingCount === 0) return "主要结果已经整理完成，本轮没有需要额外关注的记录。";
     if (successCount > 0 && pendingCount > 0) {
         if (manualCheckCount > 0 && retentionCount > 0 && processingErrorCount > 0) {
-            return `已整理 ${successCount} 条成功记录；请先处理 ${manualCheckCount} 条人工复核，另有 ${retentionCount} 条保留记录与 ${processingErrorCount} 条真实异常需要查看。`;
+            return `已整理 ${successCount} 条成功记录；请先处理 ${manualCheckCount} 条待人工复核记录，另有 ${retentionCount} 条暂存记录与 ${processingErrorCount} 条真实异常需要查看。`;
         }
         if (manualCheckCount > 0 && retentionCount > 0) {
-            return `已整理 ${successCount} 条成功记录；请优先查看 ${manualCheckCount} 条人工复核记录，另有 ${retentionCount} 条保留记录可按需导出查看。`;
+            return `已整理 ${successCount} 条成功记录；请优先查看 ${manualCheckCount} 条待人工复核记录，另有 ${retentionCount} 条暂存记录可按需导出查看。`;
         }
         if (manualCheckCount > 0 && processingErrorCount > 0) {
-            return `已整理 ${successCount} 条成功记录；当前需要关注 ${manualCheckCount} 条人工复核记录和 ${processingErrorCount} 条真实异常。`;
+            return `已整理 ${successCount} 条成功记录；当前需要关注 ${manualCheckCount} 条待人工复核记录和 ${processingErrorCount} 条真实异常。`;
         }
         if (manualCheckCount > 0) {
-            return `已整理 ${successCount} 条成功记录；当前需要你关注的是 ${manualCheckCount} 条人工复核记录。`;
+            return `已整理 ${successCount} 条成功记录；当前需要你关注的是 ${manualCheckCount} 条待人工复核记录。`;
         }
         if (retentionCount > 0 && processingErrorCount > 0) {
-            return `已整理 ${successCount} 条成功记录，另有 ${retentionCount} 条保留记录和 ${processingErrorCount} 条真实异常需要查看。`;
+            return `已整理 ${successCount} 条成功记录，另有 ${retentionCount} 条暂存记录和 ${processingErrorCount} 条真实异常需要查看。`;
         }
-        if (retentionCount > 0) return `已整理 ${successCount} 条成功记录，另有 ${retentionCount} 条保留记录可按需导出查看。`;
+        if (retentionCount > 0) return `已整理 ${successCount} 条成功记录，另有 ${retentionCount} 条暂存记录可按需导出查看。`;
         if (processingErrorCount > 0) return `已整理 ${successCount} 条成功记录，但仍有 ${processingErrorCount} 条真实异常需要排查。`;
     }
     if (successCount === 0 && pendingCount > 0) {
-        if (manualCheckCount > 0) return `本轮暂无可直接归档的记录；请先查看 ${manualCheckCount} 条人工复核记录，其余结果可按需导出查看。`;
-        if (retentionCount > 0 && processingErrorCount > 0) return `本轮暂无可直接归档的记录，当前有 ${retentionCount} 条保留记录和 ${processingErrorCount} 条真实异常。`;
+        if (manualCheckCount > 0) return `本轮暂无可直接归档的记录；请先查看 ${manualCheckCount} 条待人工复核记录，其余结果可按需导出查看。`;
+        if (retentionCount > 0 && processingErrorCount > 0) return `本轮暂无可直接归档的记录，当前有 ${retentionCount} 条暂存记录和 ${processingErrorCount} 条真实异常。`;
         if (retentionCount > 0) return "本轮暂无可直接归档的记录，当前结果可通过导出明细进一步查看。";
         if (processingErrorCount > 0) return `本轮暂无可直接归档的记录，当前有 ${processingErrorCount} 条真实异常需要排查。`;
     }
     return "本轮尚未生成可展示的结果记录。";
 }
 
-function ResultSummaryCard({ icon, label, value, helper, actionLabel, onAction, actionDisabled = false, tone = "info" }) {
+function ResultSummaryCard({ icon, label, value, helper, tone = "info" }) {
     return (
         <section className={joinClasses("stat-card", `stat-card--${tone}`)}>
             <div className="stat-card__top">
@@ -1436,13 +1300,33 @@ function ResultSummaryCard({ icon, label, value, helper, actionLabel, onAction, 
                 <div className="stat-card__copy"><p className="stat-card__label">{label}</p><p className="stat-card__value u-tabular">{value}</p></div>
             </div>
             <p className="stat-card__helper">{helper}</p>
-            <button type="button" className="stat-card__action" onClick={onAction} disabled={actionDisabled}><span className="material-symbols-outlined">arrow_forward</span><span>{actionLabel}</span></button>
         </section>
     );
 }
 
 function ResultToolbarButton({ icon, label, onClick, disabled = false, primary = false }) {
     return <button type="button" className={joinClasses("btn", primary ? "btn--primary" : "btn--secondary", "btn--sm")} onClick={onClick} disabled={disabled}><span className="material-symbols-outlined">{icon}</span><span>{label}</span></button>;
+}
+
+function ResultActionBanner({ tone = "warning", icon, eyebrow, title, text, buttonLabel, onClick, disabled = false, pathText = "", chips = null }) {
+    return (
+        <section className={joinClasses("manual-banner", tone === "neutral" && "manual-banner--calm", tone === "neutral" && "manual-banner--output")}>
+            <div className="manual-banner__lead">
+                <div className="manual-banner__icon"><span className="material-symbols-outlined">{icon}</span></div>
+                <div>
+                    <p className="manual-banner__eyebrow">{eyebrow}</p>
+                    <p className="manual-banner__title">{title}</p>
+                    <p className="manual-banner__text">{text}</p>
+                    {pathText ? <p className="manual-banner__path u-mono" title={pathText}>{pathText}</p> : null}
+                    {chips}
+                </div>
+            </div>
+            <button type="button" className="btn btn--secondary" onClick={onClick} disabled={disabled}>
+                <span className="material-symbols-outlined">{icon}</span>
+                <span>{buttonLabel}</span>
+            </button>
+        </section>
+    );
 }
 
 function AnalysisPage({ onOpenDisclaimer }) {
@@ -1535,13 +1419,10 @@ function AnalysisPage({ onOpenDisclaimer }) {
     }
 
     const summaryCards = [
-        { key: "success", icon: "task_alt", label: "处理成功", value: successCount, helper: successCount > 0 ? "归档文件已写入输出目录。" : "当前还没有成功记录。", actionLabel: "打开输出目录", onAction: handleOpenOutput, actionDisabled: !outputPath, tone: "success" },
-        { key: "retention", icon: "inventory_2", label: "保留记录", value: retentionCount, helper: retentionCount > 0 ? "审计保留已写入导出目录，可按需统一查看。" : "当前没有额外保留记录。", actionLabel: exporting ? "导出中..." : "导出结果明细", onAction: handleExport, actionDisabled: exporting, tone: "info" },
-        { key: "manual", icon: "folder_open", label: "人工复核", value: manualCheckCount, helper: manualCheckCount > 0 ? "这是当前需要优先处理的内容。" : "当前没有人工复核项。", actionLabel: "打开人工复核", onAction: handleOpenManualCheck, actionDisabled: !manualCheckCount, tone: manualCheckCount > 0 ? "warning" : "info" },
-        { key: "processing_error", icon: "error", label: "真实异常", value: processingErrorCount, helper: processingErrorCount > 0 ? "这些是需要排查的真实处理异常。" : "当前没有真实处理异常。", actionLabel: exporting ? "导出中..." : "导出结果明细", onAction: handleExport, actionDisabled: exporting, tone: processingErrorCount > 0 ? "error" : "info" },
+        { key: "success", icon: "task_alt", label: "处理成功", value: successCount, helper: successCount > 0 ? "归档文件已写入输出目录。" : "当前还没有成功记录。", tone: "success" },
+        { key: "retention", icon: "inventory_2", label: "暂存记录", value: retentionCount, helper: retentionCount > 0 ? "系统已保全但未纳入成功归档，可按需导出查看。" : "当前没有暂存记录。", tone: "info" },
+        { key: "manual", icon: "folder_open", label: "待人工复核", value: manualCheckCount, helper: manualCheckCount > 0 ? "这是当前需要优先处理的内容。" : "当前没有待人工复核项。", tone: manualCheckCount > 0 ? "warning" : "info" },
     ];
-
-    const overviewTone = manualCheckCount > 0 ? "warning" : successCount > 0 && pendingCount === 0 ? "success" : "info";
 
     return (
         <AppShell
@@ -1563,31 +1444,39 @@ function AnalysisPage({ onOpenDisclaimer }) {
                                 <p className="progress-meta">共整理 <strong className="u-tabular">{totalResultCount}</strong> 条结果记录。{statusText}</p>
                             </div>
                             <div className="footer-cluster">
-                                <ResultToolbarButton icon="folder" label="打开输出目录" onClick={handleOpenOutput} disabled={!outputPath} />
                                 <ResultToolbarButton icon={exporting ? "sync" : "download"} label={exporting ? "导出中..." : "导出结果明细"} onClick={handleExport} disabled={exporting} primary />
                             </div>
                         </div>
                         <div className="cards-grid">{summaryCards.map((card) => <ResultSummaryCard key={card.key} {...card} />)}</div>
                         {quotaExhausted && quotaMessage ? <NoticeBox tone="warning">{quotaMessage}</NoticeBox> : null}
+                        {processingErrorCount > 0 ? <NoticeBox tone="warning">检测到 {processingErrorCount} 条真实异常，请通过“导出结果明细”继续排查。</NoticeBox> : null}
                     </div>
                 </section>
 
                 {loadingError ? <NoticeBox tone="error">{loadingError}</NoticeBox> : null}
-                <section className={joinClasses("manual-banner", manualCheckCount > 0 ? "manual-banner--warning" : "manual-banner--calm")}>
-                    <div className="manual-banner__lead">
-                        <div className="manual-banner__icon"><span className="material-symbols-outlined">folder_open</span></div>
-                        <div>
-                            <p className="manual-banner__eyebrow">{UI_COPY.pages.analysis.reviewTitle}</p>
-                            <p className="manual-banner__title">{manualCheckCount > 0 ? `检测到 ${manualCheckCount} 条待人工复核记录` : UI_COPY.pages.analysis.reviewEmpty}</p>
-                            <p className="manual-banner__text">{manualCheckCount > 0 ? UI_COPY.pages.analysis.reviewReady : UI_COPY.pages.analysis.reviewIdle}</p>
-                            {groupedVisible.length > 0 ? <div className="group-strip group-strip--inline">{groupedVisible.map((group) => <span key={group.key} className={joinClasses("group-chip", resolveGroupTone(group.key))}><span>{group.label}</span><span className="u-tabular">{Number(group.count || group.items.length || 0)}</span></span>)}</div> : null}
-                        </div>
-                    </div>
-                    <button type="button" className="btn btn--secondary" onClick={handleOpenManualCheck} disabled={!manualCheckCount}>
-                        <span className="material-symbols-outlined">folder_open</span>
-                        <span>打开人工复核</span>
-                    </button>
-                </section>
+                {manualCheckCount > 0 ? (
+                    <ResultActionBanner
+                        icon="folder_open"
+                        eyebrow={UI_COPY.pages.analysis.reviewTitle}
+                        title={`检测到 ${manualCheckCount} 条待人工复核记录`}
+                        text={UI_COPY.pages.analysis.reviewReady}
+                        chips={groupedVisible.length > 0 ? <div className="group-strip group-strip--inline">{groupedVisible.map((group) => <span key={group.key} className={joinClasses("group-chip", resolveGroupTone(group.key))}><span>{group.label}</span><span className="u-tabular">{Number(group.count || group.items.length || 0)}</span></span>)}</div> : null}
+                        buttonLabel="打开待人工复核"
+                        onClick={handleOpenManualCheck}
+                        disabled={!manualCheckCount}
+                    />
+                ) : null}
+                <ResultActionBanner
+                    tone="neutral"
+                    icon="folder"
+                    eyebrow="输出目录"
+                    title={outputPath ? "归档结果与暂存记录已写入输出目录" : "当前还没有可打开的输出目录"}
+                    text={outputPath ? "成功归档文件、暂存记录和导出结果都可以从这里继续查看。" : "待本轮生成结果后，可从这里直接打开输出目录。"}
+                    pathText={outputPath || ""}
+                    buttonLabel="打开输出目录"
+                    onClick={handleOpenOutput}
+                    disabled={!outputPath}
+                />
             </div>
         </AppShell>
     );
@@ -1600,7 +1489,6 @@ function App() {
             <MemoryRouter>
                 <Routes>
                     <Route path="/" element={<SettingsPage onOpenDisclaimer={() => setShowDisclaimer(true)} />} />
-                    <Route path="/config" element={<ConfigPage onOpenDisclaimer={() => setShowDisclaimer(true)} />} />
                     <Route path="/processing" element={<ProcessingPage onOpenDisclaimer={() => setShowDisclaimer(true)} />} />
                     <Route path="/analysis" element={<AnalysisPage onOpenDisclaimer={() => setShowDisclaimer(true)} />} />
                 </Routes>

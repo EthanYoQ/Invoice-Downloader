@@ -6,7 +6,10 @@ import os
 from ctypes import wintypes
 
 
-APP_DIR_NAME = "InvoiceFlowAI External Test"
+APP_DIR_NAME = "InvoiceFlowAI"
+LEGACY_APP_DIR_NAMES = (
+    " ".join(("InvoiceFlowAI", "External", "Test")),
+)
 SETTINGS_FILE_NAME = "user_settings.json"
 SENSITIVE_KEYS = {"auth_code", "api_key"}
 DEFAULT_OUTPUT_DIR_NAME = "发票整理"
@@ -27,14 +30,27 @@ def _localappdata_root():
     return os.getenv("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
 
 
-def get_settings_dir():
-    settings_dir = os.path.join(_appdata_root(), APP_DIR_NAME)
+def _settings_dir_for(app_dir_name):
+    settings_dir = os.path.join(_appdata_root(), app_dir_name)
     os.makedirs(settings_dir, exist_ok=True)
     return settings_dir
 
 
+def get_settings_dir():
+    return _settings_dir_for(APP_DIR_NAME)
+
+
 def get_settings_path():
     return os.path.join(get_settings_dir(), SETTINGS_FILE_NAME)
+
+
+def get_legacy_settings_paths():
+    paths = []
+    for app_dir_name in LEGACY_APP_DIR_NAMES:
+        settings_path = os.path.join(_appdata_root(), app_dir_name, SETTINGS_FILE_NAME)
+        if os.path.exists(settings_path):
+            paths.append(settings_path)
+    return paths
 
 
 def get_runtime_data_dir():
@@ -149,25 +165,28 @@ def _unprotect_text(value):
 class UserSettingsStore:
     def __init__(self, settings_path=None):
         self.settings_path = settings_path or get_settings_path()
+        self._fallback_paths = [path for path in get_legacy_settings_paths() if os.path.abspath(path) != os.path.abspath(self.settings_path)]
 
     def load(self):
-        if not os.path.exists(self.settings_path):
-            return {}
+        for candidate_path in [self.settings_path, *self._fallback_paths]:
+            if not os.path.exists(candidate_path):
+                continue
 
-        try:
-            with open(self.settings_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except Exception:
-            return {}
-
-        values = dict(payload.get("values") or {})
-        protected = dict(payload.get("protected") or {})
-        for key, encoded in protected.items():
             try:
-                values[key] = _unprotect_text(encoded)
+                with open(candidate_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
             except Exception:
-                values[key] = ""
-        return values
+                continue
+
+            values = dict(payload.get("values") or {})
+            protected = dict(payload.get("protected") or {})
+            for key, encoded in protected.items():
+                try:
+                    values[key] = _unprotect_text(encoded)
+                except Exception:
+                    values[key] = ""
+            return values
+        return {}
 
     def save(self, settings):
         os.makedirs(os.path.dirname(self.settings_path), exist_ok=True)
