@@ -27,10 +27,6 @@
     "outputFile": "dist/InvoiceFlowAI-portable-unsigned.zip",
     "copyRootName": "InvoiceFlowAI"
   },
-  "handoff": {
-    "readmeSource": "build/windows/HANDOFF_README.txt",
-    "outputFileName": "HANDOFF_README.txt"
-  },
   "installer": {
     "script": "build/windows/installer/InvoiceFlowAI.iss",
     "outputDir": "dist/installer",
@@ -58,7 +54,6 @@
     "frontend_run_context.py",
     "user_settings.py",
     "build/windows/app.manifest",
-    "build/windows/HANDOFF_README.txt",
     "build/windows/installer/InvoiceFlowAI.iss",
     "build/runtime/webview2-fixed/msedgewebview2.exe",
     "templates/index.html",

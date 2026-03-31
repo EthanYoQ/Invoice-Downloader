@@ -687,23 +687,6 @@ function Write-Sha256Manifest {
     Set-Content -Path $OutputPath -Value $rows -Encoding UTF8
 }
 
-function Copy-HandoffReadme {
-    param(
-        [string]$SourcePath,
-        [string]$DestinationDir,
-        [string]$OutputFileName
-    )
-
-    if ([string]::IsNullOrWhiteSpace($SourcePath) -or [string]::IsNullOrWhiteSpace($OutputFileName)) {
-        return ""
-    }
-
-    Assert-LeafPathExists -PathValue $SourcePath -Label "Handoff readme"
-    $destinationPath = Join-Path $DestinationDir $OutputFileName
-    Copy-Item -LiteralPath $SourcePath -Destination $destinationPath -Force
-    return $destinationPath
-}
-
 $manifest = Get-Content -Raw -Encoding UTF8 $ManifestPath | ConvertFrom-Json
 
 foreach ($requiredPath in $manifest.requiredPaths) {
@@ -734,8 +717,6 @@ $sanitizedChromiumDir = Resolve-RepoPath $manifest.chromium.sanitizedWorkDir
 $chromiumExcludeEntries = @($manifest.chromium.excludeEntries)
 $portableZipPath = Resolve-RepoPath $manifest.portable.outputFile
 $portableRootName = [string]$manifest.portable.copyRootName
-$handoffReadmeSource = Resolve-RepoPath $manifest.handoff.readmeSource
-$handoffReadmeOutputName = [string]$manifest.handoff.outputFileName
 $installerScriptPath = Resolve-RepoPath $manifest.installer.script
 $installerOutputDir = Resolve-RepoPath $manifest.installer.outputDir
 $installerOutputBaseName = [string]$manifest.installer.outputBaseName
@@ -842,7 +823,6 @@ if ($RunPyInstaller) {
     }
 
     Assert-DistributionTree -PathValue $distDir -AppName $manifest.appName
-    Copy-HandoffReadme -SourcePath $handoffReadmeSource -DestinationDir $distDir -OutputFileName $handoffReadmeOutputName | Out-Null
     Remove-PackagedChromiumExcludedEntries -PathValue $distDir -ExcludedEntryNames $chromiumExcludeEntries
     Assert-DistributionTreeSanitized -PathValue $distDir
     Assert-BuildIdentityPayload -PathValue $distDir
@@ -850,7 +830,6 @@ if ($RunPyInstaller) {
 }
 else {
     Assert-DistributionTree -PathValue $distDir -AppName $manifest.appName
-    Copy-HandoffReadme -SourcePath $handoffReadmeSource -DestinationDir $distDir -OutputFileName $handoffReadmeOutputName | Out-Null
     Remove-PackagedChromiumExcludedEntries -PathValue $distDir -ExcludedEntryNames $chromiumExcludeEntries
     Assert-DistributionTreeSanitized -PathValue $distDir
     Assert-BuildIdentityPayload -PathValue $distDir
