@@ -7,9 +7,10 @@
 - Visible UI copy must come from product intent and user workflow needs, not from implementation commentary.
 
 ## README Style Guardrails
-- Default README style must follow the Chinese product-facing structure and tone established by the `cbc51d7` version of `README.md`.
+- The current `README.md` on `main` is the canonical baseline and replaces any earlier README preference memory, including the prior `cbc51d7`-based baseline.
+- Future README work must preserve the current structure, tone, and user-facing writing style unless the user explicitly requests a broader rewrite.
+- README changes must be limited to local corrections of inaccurate facts, broken links, outdated release references, or similarly narrow issues; do not proactively restructure or rewrite the document.
 - README content should read like software usage documentation, not a handoff memo, baseline note, or internal engineering summary.
-- Prefer the following structure unless the user explicitly asks otherwise: `适用场景`、`当前发布`、`功能概览`、`使用方法`、`输出目录说明`、`系统要求`、`从源码运行`、`构建发行版`、`隐私与安全`.
-- README should prioritize user value, product explanation, and practical usage guidance over implementation detail.
+- Keep the current Chinese product-facing structure unless the user explicitly asks otherwise.
 - When a release asset changes, update README download links and release wording to match the actual public release state before publishing.
 - Do not include personal data, internal test labels, developer commentary, or outdated release instructions in README content.
