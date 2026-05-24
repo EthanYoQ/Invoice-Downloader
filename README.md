@@ -1,9 +1,11 @@
+<div align="center">
+
+**English** | [中文](README_zh.md)
+
+</div>
 
 
 
-
-
-# InvoiceFlowAI — AI 驱动的发票自动归档助手
 
 <div align="center">
 
@@ -13,298 +15,298 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
-**连接你的 QQ / 163 邮箱 → AI 全自动扫描发票 → 按类型归档到本地 → 生成 Excel 汇总表**
+**Connect your QQ / 163 mailbox → AI fully automatic invoice scanning → Archive by category locally → Generate Excel summary**
 
-*整个过程无需人工干预，所有数据仅保存在本地，零隐私风险*
+*The entire process requires no manual intervention; all data is stored locally with zero privacy risk*
 
 </div>
 
 ---
 
-## ✨ 核心亮点
+## ✨ Key Highlights
 
-| &nbsp; | 特性 | 说明 |
-|--------|------|------|
-| 🔒 | **一键运行，开箱即用** | 解压即可运行，无需安装 Python 或任何依赖 |
-| 🤖 | **双引擎 AI 识别** | Track A（OCR精确流）+ Track B（视觉降级流），自动切换，无需手动操作 |
-| 🔍 | **四层智能漏斗** | 白名单域名 → 主题关键字 → 正文检测 → 二维码扫描，精准过滤非发票邮件 |
-| 📄 | **链接发票自动恢复** | Playwright 自动打开百望云、税务平台链接，下载正式 PDF 存档 |
-| 🗂️ | **自然语言分类规则** | 支持"滴滴大于100元放进大额"这样的自定义规则 |
-| 📊 | **一键 Excel 报表** | 自动生成 `summary_report.xlsx`，发票清单、金额汇总全覆盖 |
+| &nbsp; | Feature | Description |
+|--------|---------|-------------|
+| 🔒 | **One-click launch, ready to use** | Extract and run — no need to install Python or any dependencies |
+| 🤖 | **Dual-engine AI recognition** | Track A (OCR precision flow) + Track B (vision fallback flow), automatic switching with no manual operation needed |
+| 🔍 | **Four-layer smart funnel** | Whitelist domains → Subject keywords → Body detection → QR code scanning, precisely filtering non-invoice emails |
+| 📄 | **Link-based invoice auto-recovery** | Playwright automatically opens Baiwang Cloud and tax platform links, downloading official PDF archives |
+| 🗂️ | **Natural language classification rules** | Supports custom rules like "Didi rides over 100 yuan go into the high-amount category" |
+| 📊 | **One-click Excel report** | Automatically generates `summary_report.xlsx`, covering invoice lists and amount summaries |
 
 ---
 
-## 🏗️ 整体工作流程
+## 🏗️ Overall Workflow
 
 ```mermaid
 flowchart LR
-    A["📧 QQ / 163\n邮箱 IMAP"] --> B["📥 邮件抓取\nEmailFetcher"]
-    B --> C{"🔍 四层\n智能漏斗"}
-    C -->|"通过"| D["📎 附件提取\nZIP 递归解包"]
-    C -->|"丢弃"| X["🗑️ 非发票邮件"]
-    D --> E{"附件类型?"}
-    E -->|"PDF/OFD/XML"| F["🤖 AI 提取引擎"]
-    E -->|"URL 链接"| G["🌐 PDF 恢复\nPlaywright"]
+    A["📧 QQ / 163\nMailbox IMAP"] --> B["📥 Email Fetching\nEmailFetcher"]
+    B --> C{"🔍 Four-layer\nSmart Funnel"}
+    C -->|"Pass"| D["📎 Attachment Extraction\nZIP Recursive Unpack"]
+    C -->|"Discard"| X["🗑️ Non-invoice Emails"]
+    D --> E{"Attachment Type?"}
+    E -->|"PDF/OFD/XML"| F["🤖 AI Extraction Engine"]
+    E -->|"URL Link"| G["🌐 PDF Recovery\nPlaywright"]
     G --> F
-    F --> H{"提取\n成功?"}
-    H -->|"✅"| I["📂 智能分类\n规则重命名"]
+    F --> H{"Extraction\nSuccessful?"}
+    H -->|"✅"| I["📂 Smart Classification\nRule-based Renaming"]
     H -->|"❌"| J["📁 Manual_Check"]
-    I --> K["🗂️ 本地归档"]
-    K --> L["📊 Excel 报表"]
+    I --> K["🗂️ Local Archiving"]
+    K --> L["📊 Excel Report"]
 ```
 
 ---
 
-## 🤖 双引擎 AI 提取架构
+## 🤖 Dual-Engine AI Extraction Architecture
 
-系统采用 **Track A + Track B + Local Fallback** 三层防线，任何一层成功即采用结果，确保极高的识别成功率。
+The system employs **Track A + Track B + Local Fallback** as a three-layer defense. If any layer succeeds, its result is adopted, ensuring an extremely high recognition success rate.
 
-![双引擎AI识别架构](docs/track-ab.svg)
+![Dual-Engine AI Recognition Architecture](docs/track-ab.svg)
 
-> **为什么这样设计？**
-> - **Track A**（OCR + LLM）：精度最高，先提取文字结构再理解
-> - **Track B**（glm-4.5V 视觉）：直接"看图"，适合复杂排版或图片类发票
-> - **Local Fallback**：本地正则规则，断网可用，零 API 消耗
-
----
-
-## 🔍 四层智能筛选漏斗
-
-系统不会对每封邮件都调用 AI，而是先经过四层漏斗精准判断，大幅降低误识别率和 API 费用。
-
-![四层智能筛选漏斗](docs/funnel.svg)
-
-筛选通过后，附件还会经过 **三级决策**：
-
-| 层级 | 触发条件 | 处理方式 |
-|------|----------|----------|
-| 🗑️ **A 层**（丢弃） | Tracking pixel、Logo、装饰图（≤32px） | 直接跳过 |
-| 📦 **B 层**（暂存） | 附件 >5MB、ZIP 解包失败 | 保留但不处理 |
-| ✅ **C 层**（归档） | 正常 PDF/OFD/XML | 进入 AI 提取流程 |
+> **Why this design?**
+> - **Track A** (OCR + LLM): Highest precision — extracts text structure first, then understands it
+> - **Track B** (glm-4.5V Vision): Directly "looks at the image" — ideal for complex layouts or image-based invoices
+> - **Local Fallback**: Local regex rules — works offline with zero API consumption
 
 ---
 
-## 🌐 三级 PDF 恢复方案
+## 🔍 Four-Layer Smart Filtering Funnel
 
-许多发票邮件只有"点击下载"的链接，系统自动识别平台并选择最优方案：
+The system does not call AI for every email. Instead, it first passes through a four-layer funnel for precise filtering, significantly reducing false recognition rates and API costs.
+
+![Four-Layer Smart Filtering Funnel](docs/funnel.svg)
+
+After passing the filter, attachments also go through a **three-tier decision process**:
+
+| Tier | Trigger Condition | Handling |
+|------|-------------------|----------|
+| 🗑️ **Tier A** (Discard) | Tracking pixels, logos, decorative images (≤32px) | Skipped directly |
+| 📦 **Tier B** (Hold) | Attachments >5MB, ZIP unpack failure | Retained but not processed |
+| ✅ **Tier C** (Archive) | Normal PDF/OFD/XML | Enters AI extraction pipeline |
+
+---
+
+## 🌐 Three-Tier PDF Recovery Strategy
+
+Many invoice emails only contain "click to download" links. The system automatically identifies the platform and selects the optimal approach:
 
 ```mermaid
 flowchart TD
-    Link(["🔗 邮件中的发票链接"]) --> Detect{"识别链接平台"}
-    Detect -->|"百望云"| BW["🏢 Playwright 自动化\n登录 → 点击下载 → 捕获文件\n字段匹配验证"]
-    Detect -->|"国税·诺诺·航信"| DI["📥 HTTP 直接下载\n识别发票族群\n本地字段校验"]
-    Detect -->|"未知网页"| Generic["🌐 网页转 PDF\n检测登录/验证码\nA4 格式渲染"]
-    BW & DI & Generic --> Final(["📄 本地 PDF"])
-    Final --> AI(["🤖 AI 提取流程"])
+    Link(["🔗 Invoice Links in Email"]) --> Detect{"Identify Link Platform"}
+    Detect -->|"Baiwang Cloud"| BW["🏢 Playwright Automation\nLogin → Click Download → Capture File\nField Matching Verification"]
+    Detect -->|"Tax Bureau · Nuonuo · Aisino"| DI["📥 Direct HTTP Download\nIdentify Invoice Family\nLocal Field Validation"]
+    Detect -->|"Unknown Webpage"| Generic["🌐 Web to PDF\nDetect Login/Captcha\nA4 Format Rendering"]
+    BW & DI & Generic --> Final(["📄 Local PDF"])
+    Final --> AI(["🤖 AI Extraction Pipeline"])
 ```
 
 ---
 
-## ⚙️ 配置指南
+## ⚙️ Configuration Guide
 
-> 首次使用只需配置一次，之后每次扫描直接点击运行。
+> Only needs to be configured once on first use; after that, just click run for each scan.
 
-### 第一步 · 开启 163 邮箱 IMAP
+### Step 1 · Enable 163 Mailbox IMAP
 
 <details>
-<summary>📖 点击展开 163 邮箱详细步骤</summary>
+<summary>📖 Click to expand detailed steps for 163 mailbox</summary>
 
-**服务器参数**
+**Server Parameters**
 
-| 参数 | 值 |
-|------|----|
-| IMAP 服务器 | `imap.163.com` |
-| 端口 | `993`（SSL/TLS） |
+| Parameter | Value |
+|-----------|-------|
+| IMAP Server | `imap.163.com` |
+| Port | `993` (SSL/TLS) |
 
-**开启步骤**
+**Setup Steps**
 
-1. 登录 [mail.163.com](https://mail.163.com)，点击右上角「**设置**」
-2. 在下拉菜单中选择「**POP3/SMTP/IMAP**」
-3. 找到「**IMAP/SMTP 服务**」，点击右侧「**开启**」按钮
-4. 弹出「账号安全验证」窗口：
-   - **扫码方式**（推荐）：手机扫描二维码，自动发送验证短信
-   - **手动方式**：按提示手动发送短信到指定号码
-5. 短信发送后点击「**我已发送**」
-6. 系统生成 **16 位授权码**（字母组合，**仅显示一次，务必立即复制保存**）
+1. Log in to [mail.163.com](https://mail.163.com), click **Settings** in the upper right corner
+2. Select **POP3/SMTP/IMAP** from the dropdown menu
+3. Find **IMAP/SMTP Service**, click the **Enable** button on the right
+4. An "Account Security Verification" window will appear:
+   - **QR Code Method** (Recommended): Scan the QR code with your phone to automatically send a verification SMS
+   - **Manual Method**: Manually send an SMS to the designated number as prompted
+5. After sending the SMS, click **I Have Sent It**
+6. The system generates a **16-character authorization code** (letter combination, **only displayed once — copy and save it immediately**)
 
-> ⚠️ 授权码不是邮箱登录密码，是专用于第三方客户端的独立密码，大小写敏感。
+> ⚠️ The authorization code is not your mailbox login password. It is a separate password specifically for third-party clients, and it is case-sensitive.
 
-📚 [163 邮箱官方帮助](https://help.mail.163.com/)
+📚 [163 Mailbox Official Help](https://help.mail.163.com/)
 
 </details>
 
 ---
 
-### 第二步 · 开启 QQ 邮箱 IMAP
+### Step 2 · Enable QQ Mailbox IMAP
 
 <details>
-<summary>📖 点击展开 QQ 邮箱详细步骤</summary>
+<summary>📖 Click to expand detailed steps for QQ mailbox</summary>
 
-**服务器参数**
+**Server Parameters**
 
-| 参数 | 值 |
-|------|----|
-| IMAP 服务器 | `imap.qq.com` |
-| 端口 | `993`（SSL/TLS） |
+| Parameter | Value |
+|-----------|-------|
+| IMAP Server | `imap.qq.com` |
+| Port | `993` (SSL/TLS) |
 
-**开启步骤**
+**Setup Steps**
 
-1. 登录 [mail.qq.com](https://mail.qq.com)，点击右上角「**设置**」图标
-2. 选择「**账户**」选项卡
-3. 找到「**POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV 服务**」
-4. 点击「**管理服务**」→「**开启服务**」
-5. 点击「**生成授权码**」，进行身份验证：
-   - **扫码方式**（推荐）：手机扫码后自动发送验证短信
-   - **手动方式**：用 QQ 绑定手机发送「**配置邮件客户端**」到 **1069070069**
-6. 点击「**我已发送**」，验证后授权码即时生成（**请立即保存**）
+1. Log in to [mail.qq.com](https://mail.qq.com), click the **Settings** icon in the upper right corner
+2. Select the **Account** tab
+3. Find **POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV Service**
+4. Click **Manage Service** → **Enable Service**
+5. Click **Generate Authorization Code** and complete identity verification:
+   - **QR Code Method** (Recommended): Scan the QR code with your phone to automatically send a verification SMS
+   - **Manual Method**: Send "Configure Email Client" to **1069070069** using your QQ-linked phone
+6. Click **I Have Sent It** — the authorization code is generated instantly after verification (**save it immediately**)
 
-> ⚠️ 修改 QQ 密码后授权码自动失效，需重新生成。
+> ⚠️ The authorization code automatically becomes invalid after changing your QQ password and must be regenerated.
 
-📚 [QQ 邮箱官方帮助](https://service.mail.qq.com/detail/0/339)
+📚 [QQ Mailbox Official Help](https://service.mail.qq.com/detail/0/339)
 
 </details>
 
 ---
 
-### 第三步 · 获取智谱 GLM API Key
+### Step 3 · Obtain Zhipu GLM API Key
 
 <details>
-<summary>📖 点击展开 GLM API 配置步骤</summary>
+<summary>📖 Click to expand GLM API configuration steps</summary>
 
-系统使用 **GLM-4.5V**（多模态视觉）和 **GLM-OCR** 识别发票内容。
+The system uses **GLM-4.5V** (multimodal vision) and **GLM-OCR** to recognize invoice content.
 
-**步骤**
+**Steps**
 
-1. 访问 [open.bigmodel.cn](https://open.bigmodel.cn/)，注册账号
-2. 进入控制台 → **API Keys** → **创建 API Key**
-3. 复制并保存 Key（格式：`xxxxxxxx.xxxxxxxxxxxxxxxx`）
+1. Visit [open.bigmodel.cn](https://open.bigmodel.cn/) and register an account
+2. Go to Console → **API Keys** → **Create API Key**
+3. Copy and save the Key (format: `xxxxxxxx.xxxxxxxxxxxxxxxx`)
 
-**费用参考**
+**Cost Reference**
 
-| 情况 | 说明 |
-|------|------|
-| 🎁 新用户福利 | 赠送 500 万 GLM-4 tokens（30 天有效） |
-| 💰 推荐充值 | **5 元以内**，按量计费 |
-| 📊 使用估算 | 每张发票约消耗 1,000–3,000 tokens；每月 200 张，5 元可用约 12 个月 |
+| Scenario | Description |
+|----------|-------------|
+| 🎁 New User Bonus | 5 million GLM-4 tokens gifted (valid for 30 days) |
+| 💰 Recommended Top-up | **Under 5 yuan**, pay-as-you-go |
+| 📊 Usage Estimate | Each invoice consumes approximately 1,000–3,000 tokens; for 200 invoices/month, 5 yuan lasts about 12 months |
 
-📚 [智谱 AI 开放平台](https://open.bigmodel.cn/)
+📚 [Zhipu AI Open Platform](https://open.bigmodel.cn/)
 
 </details>
 
 ---
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
 ```
-Step 1  解压软件包到普通文件夹（避免云盘同步目录）
-        保持 _internal 文件夹与 InvoiceFlowAI.exe 同级
+Step 1  Extract the software package to a regular folder (avoid cloud sync directories)
+        Keep the _internal folder in the same directory as InvoiceFlowAI.exe
         ↓
-Step 2  双击运行 InvoiceFlowAI.exe
-        首次启动自动弹出设置界面
+Step 2  Double-click to run InvoiceFlowAI.exe
+        The settings interface automatically appears on first launch
         ↓
-Step 3  填入配置并保存：
-        · 邮箱地址 + 授权码（QQ 或 163）
+Step 3  Fill in the configuration and save:
+        · Email address + authorization code (QQ or 163)
         · GLM API Key
         ↓
-        点击「开始扫描」→ 等待完成
-        发票自动归档到桌面「发票整理」文件夹 ✅
+        Click "Start Scanning" → Wait for completion
+        Invoices are automatically archived to the "Invoice Organizer" folder on your desktop ✅
 ```
 
 ---
 
-## 📁 输出目录结构
+## 📁 Output Directory Structure
 
 ```
-发票整理/
-├── 火车票/
-│   └── 20260315-北京-上海-火车票.pdf
-├── 机票/
-│   └── 20260301_机票_1280.00_中国国际航空.pdf
-├── 住宿/
-│   └── 20260310_住宿_888.00_北京希尔顿.pdf
-├── 打车/
-│   └── 20260312_打车_45.50_滴滴出行.pdf
-├── 餐饮/
-├── Manual_Check/      ← AI 无法识别，需人工处理
+Invoice Organizer/
+├── Train Tickets/
+│   └── 20260315-Beijing-Shanghai-Train-Ticket.pdf
+├── Flight Tickets/
+│   └── 20260301_Flight_1280.00_Air-China.pdf
+├── Accommodation/
+│   └── 20260310_Accommodation_888.00_Beijing-Hilton.pdf
+├── Taxi/
+│   └── 20260312_Taxi_45.50_DiDi.pdf
+├── Dining/
+├── Manual_Check/      ← Cannot be recognized by AI, requires manual processing
 └── summary_report.xlsx
 ```
 
 ---
 
-## ❓ 常见问题
+## ❓ FAQ
 
 <details>
-<summary>Q：软件启动后白屏或无响应？</summary>
+<summary>Q: White screen or no response after launching the software?</summary>
 
-- 确认已将**整个压缩包解压**，`_internal` 文件夹须与 `InvoiceFlowAI.exe` 在同一目录
-- 避免将软件放在含有**中文路径或空格**的目录下
+- Make sure the **entire archive is extracted**; the `_internal` folder must be in the same directory as `InvoiceFlowAI.exe`
+- Avoid placing the software in a directory containing **Chinese characters or spaces**
 
 </details>
 
 <details>
-<summary>Q：扫描完发票数量很少？</summary>
+<summary>Q: Very few invoices found after scanning?</summary>
 
-- 在软件的时间范围设置中，将起始日期**往前调整至 180 天以上**
-- 部分邮箱默认只拉取近30天邮件，需要在邮箱 IMAP 设置里选择「收取全部邮件」
-
-</details>
-
-<details>
-<summary>Q：授权码填写后提示认证失败？</summary>
-
-- **QQ 邮箱**：须从「管理服务 → 生成授权码」流程中获取，**不是 QQ 密码**
-- **163 邮箱**：须从「开启 IMAP 服务」弹窗中生成，**不是邮箱登录密码**，注意大小写
-- QQ 修改密码后需重新生成授权码
+- In the software's time range settings, **adjust the start date to more than 180 days ago**
+- Some mailboxes default to fetching only the last 30 days of emails — select "Fetch all emails" in the mailbox IMAP settings
 
 </details>
 
 <details>
-<summary>Q：GLM API 报错余额不足？</summary>
+<summary>Q: Authentication failure after entering the authorization code?</summary>
 
-登录 [open.bigmodel.cn](https://open.bigmodel.cn/) → 费用中心 → 充值。推荐充值 **5 元**，按量计费。
+- **QQ Mailbox**: Must be obtained through "Manage Service → Generate Authorization Code" — it is **not your QQ password**
+- **163 Mailbox**: Must be generated from the "Enable IMAP Service" popup — it is **not your mailbox login password**, and it is case-sensitive
+- The QQ authorization code must be regenerated after changing your QQ password
 
 </details>
 
 <details>
-<summary>Q：部分发票进入 Manual_Check 文件夹？</summary>
+<summary>Q: GLM API reports insufficient balance?</summary>
 
-正常现象。当 AI 识别置信度不足时，系统自动放入 `Manual_Check` 队列，需人工确认。通常由图片模糊、非标准票据或加密 PDF 导致。
+Log in to [open.bigmodel.cn](https://open.bigmodel.cn/) → Billing Center → Top Up. Recommended top-up of **5 yuan**, pay-as-you-go.
+
+</details>
+
+<details>
+<summary>Q: Some invoices end up in the Manual_Check folder?</summary>
+
+This is normal. When AI recognition confidence is insufficient, the system automatically places invoices in the `Manual_Check` queue for manual confirmation. This is usually caused by blurry images, non-standard documents, or encrypted PDFs.
 
 </details>
 
 ---
 
-## 🛡️ 隐私与安全
+## 🛡️ Privacy & Security
 
-- 所有邮件、发票文件均在**本地处理**，不上传任何服务器
-- 邮箱凭据通过 **Windows DPAPI** 加密存储，只有当前 Windows 账户可解密
-- GLM API 仅接收**发票图片**（Base64）用于文字识别，不发送邮件原文内容
-
----
-
-## ⚠️ 免责声明
-
-使用本软件即表示您已理解并接受以下内容。
-
-**合规使用** · 本软件通过 IMAP **只读**访问邮箱，不发送、删除或修改任何邮件。用户须确保对所处理邮箱拥有合法授权。
-
-**准确性** · AI 识别存在一定错误率，**请勿将输出结果直接用于正式财务申报或税务申报**，需经人工复核。开发者对识别错误导致的任何损失不承担责任。
-
-**数据** · 调用 GLM API 时，发票图片会发送至智谱 AI 服务器进行识别，受 [智谱 AI 隐私政策](https://www.zhipuai.cn/zh/privacy) 约束；邮件原文不会发送。
-
-**第三方服务**
-
-| 服务 | 用途 | 服务方 |
-|------|------|--------|
-| 智谱 GLM API | 发票 OCR 与视觉识别 | 北京智谱华章科技有限公司 |
-| QQ 邮箱 IMAP | 邮件读取 | 腾讯科技（深圳）有限公司 |
-| 163 邮箱 IMAP | 邮件读取 | 网易（杭州）网络有限公司 |
+- All emails and invoice files are processed **locally** and are never uploaded to any server
+- Mailbox credentials are encrypted and stored via **Windows DPAPI**, decryptable only by the current Windows account
+- The GLM API only receives **invoice images** (Base64) for text recognition and does not send the original email content
 
 ---
 
-## 📜 许可证
+## ⚠️ Disclaimer
 
-[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.zh) · ✅ 个人使用、学习研究 · ❌ 禁止商业用途
+By using this software, you acknowledge and accept the following terms.
+
+**Compliant Use** · This software accesses mailboxes through IMAP in **read-only** mode. It does not send, delete, or modify any emails. Users must ensure they have legitimate authorization for the mailboxes being processed.
+
+**Accuracy** · AI recognition has a certain error rate. **Do not use the output results directly for formal financial or tax filings** — manual review is required. The developer assumes no liability for any losses caused by recognition errors.
+
+**Data** · When calling the GLM API, invoice images are sent to Zhipu AI servers for recognition, subject to the [Zhipu AI Privacy Policy](https://www.zhipuai.cn/zh/privacy). Original email content is never sent.
+
+**Third-Party Services**
+
+| Service | Purpose | Provider |
+|---------|---------|----------|
+| Zhipu GLM API | Invoice OCR and visual recognition | Beijing Zhipu Huazhang Technology Co., Ltd. |
+| QQ Mailbox IMAP | Email reading | Tencent Technology (Shenzhen) Co., Ltd. |
+| 163 Mailbox IMAP | Email reading | NetEase (Hangzhou) Network Co., Ltd. |
+
+---
+
+## 📜 License
+
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.en) · ✅ Personal use, learning and research · ❌ Commercial use prohibited
 
 ---
 
@@ -312,6 +314,6 @@ Step 3  填入配置并保存：
 
 Made with ❤️ by **Ethan-YQ**
 
-[报告问题](https://github.com/Ethan-YoungQ/Invoice-Downloader/issues) · [智谱AI开放平台](https://open.bigmodel.cn/) · [163邮箱帮助](https://help.mail.163.com/) · [QQ邮箱帮助](https://service.mail.qq.com/detail/0/339)
+[Report Issues](https://github.com/Ethan-YoungQ/Invoice-Downloader/issues) · [Zhipu AI Open Platform](https://open.bigmodel.cn/) · [163 Mailbox Help](https://help.mail.163.com/) · [QQ Mailbox Help](https://service.mail.qq.com/detail/0/339)
 
 </div>
