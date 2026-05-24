@@ -1,3 +1,5 @@
+# InvoiceFlowAI — AI 驱动的发票自动归档助手
+
 <div align="center">
 
 [English](README.md) | **中文**
