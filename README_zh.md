@@ -25,6 +25,12 @@
 
 ---
 
+## 🎬 视频介绍
+
+https://github.com/EthanYoQ/Invoice-Downloader/raw/codex/add-readme-video/docs/intro-video.mp4
+
+---
+
 ## ✨ 核心亮点
 
 | &nbsp; | 特性 | 说明 |

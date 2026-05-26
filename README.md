@@ -25,6 +25,12 @@
 
 ---
 
+## 🎬 Video Introduction
+
+https://github.com/EthanYoQ/Invoice-Downloader/raw/codex/add-readme-video/docs/intro-video.mp4
+
+---
+
 ## ✨ Key Highlights
 
 | &nbsp; | Feature | Description |
