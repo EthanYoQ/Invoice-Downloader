@@ -25,6 +25,12 @@
 
 ---
 
+## 🎬 Video Introduction
+
+https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
+
+---
+
 ## ✨ Key Highlights
 
 | &nbsp; | Feature | Description |

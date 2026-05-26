@@ -25,6 +25,12 @@
 
 ---
 
+## 🎬 视频介绍
+
+https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
+
+---
+
 ## ✨ 核心亮点
 
 | &nbsp; | 特性 | 说明 |
