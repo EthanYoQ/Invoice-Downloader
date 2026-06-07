@@ -12,7 +12,7 @@
 <div align="center">
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
-![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-green)
+![License](https://img.shields.io/badge/License-Apache--2.0-blue)
 ![AI](https://img.shields.io/badge/AI-GLM--4.5V%20%7C%20GLM--OCR-purple)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
@@ -298,9 +298,13 @@ Step 3  填入配置并保存：
 
 **合规使用** · 本软件通过 IMAP **只读**访问邮箱，不发送、删除或修改任何邮件。用户须确保对所处理邮箱拥有合法授权。
 
-**准确性** · AI 识别存在一定错误率，**请勿将输出结果直接用于正式财务申报或税务申报**，需经人工复核。开发者对识别错误导致的任何损失不承担责任。
+**用途** · 本软件仅用于发票邮件下载、识别、分类、归档等自动化辅助。
+
+**准确性与合规性** · 作者不保证发票数据或生成结果的准确性、完整性、合法性、税务合规性、财务合规性或会计合规性。用户必须自行核验所有发票、报销、税务、会计和合规结果后再使用。
 
 **数据** · 调用 GLM API 时，发票图片会发送至智谱 AI 服务器进行识别，受 [智谱 AI 隐私政策](https://www.zhipuai.cn/zh/privacy) 约束；邮件原文不会发送。
+
+**责任限制** · 作者不对使用本软件造成的损失、遗漏、错误、报销失败、税务风险、合规问题或数据丢失承担责任。
 
 **第三方服务**
 
@@ -314,14 +318,14 @@ Step 3  填入配置并保存：
 
 ## 📜 许可证
 
-[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.zh) · ✅ 个人使用、学习研究 · ❌ 禁止商业用途
+本项目基于 [Apache License 2.0](LICENSE) 授权。允许商业使用、修改、分发和闭源集成，但再分发时必须保留 copyright notice、license notice，以及 [NOTICE](NOTICE) 中的作者署名。
 
 ---
 
 <div align="center">
 
-Made with ❤️ by **Ethan-YQ**
+Made with ❤️ by **EthanYoQ / Yong Qi**
 
-[报告问题](https://github.com/Ethan-YoungQ/Invoice-Downloader/issues) · [智谱AI开放平台](https://open.bigmodel.cn/) · [163邮箱帮助](https://help.mail.163.com/) · [QQ邮箱帮助](https://service.mail.qq.com/detail/0/339)
+[报告问题](https://github.com/EthanYoQ/Invoice-Downloader/issues) · [智谱AI开放平台](https://open.bigmodel.cn/) · [163邮箱帮助](https://help.mail.163.com/) · [QQ邮箱帮助](https://service.mail.qq.com/detail/0/339)
 
 </div>

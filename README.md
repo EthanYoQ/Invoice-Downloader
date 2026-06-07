@@ -12,7 +12,7 @@
 <div align="center">
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
-![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-green)
+![License](https://img.shields.io/badge/License-Apache--2.0-blue)
 ![AI](https://img.shields.io/badge/AI-GLM--4.5V%20%7C%20GLM--OCR-purple)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
@@ -298,9 +298,13 @@ By using this software, you acknowledge and accept the following terms.
 
 **Compliant Use** · This software accesses mailboxes through IMAP in **read-only** mode. It does not send, delete, or modify any emails. Users must ensure they have legitimate authorization for the mailboxes being processed.
 
-**Accuracy** · AI recognition has a certain error rate. **Do not use the output results directly for formal financial or tax filings** — manual review is required. The developer assumes no liability for any losses caused by recognition errors.
+**Purpose** · This software is intended only as an automation assistant for downloading, recognizing, classifying, and archiving invoice-related emails and files.
+
+**Accuracy & Compliance** · The author does not warrant the accuracy, completeness, legality, tax compliance, financial compliance, or accounting compliance of any invoice data or generated results. Users must independently verify all invoices, reimbursements, tax filings, accounting records, and compliance outcomes before relying on them.
 
 **Data** · When calling the GLM API, invoice images are sent to Zhipu AI servers for recognition, subject to the [Zhipu AI Privacy Policy](https://www.zhipuai.cn/zh/privacy). Original email content is never sent.
+
+**Liability** · The author is not liable for any losses, omissions, errors, failed reimbursements, tax risks, compliance issues, or data loss arising from use of this software.
 
 **Third-Party Services**
 
@@ -314,14 +318,14 @@ By using this software, you acknowledge and accept the following terms.
 
 ## 📜 License
 
-[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.en) · ✅ Personal use, learning and research · ❌ Commercial use prohibited
+Licensed under the [Apache License 2.0](LICENSE). Commercial use, modification, distribution, and closed-source integration are permitted, provided that redistributions retain the copyright notice, license notice, and author attribution in [NOTICE](NOTICE).
 
 ---
 
 <div align="center">
 
-Made with ❤️ by **Ethan-YQ**
+Made with ❤️ by **EthanYoQ / Yong Qi**
 
-[Report Issues](https://github.com/Ethan-YoungQ/Invoice-Downloader/issues) · [Zhipu AI Open Platform](https://open.bigmodel.cn/) · [163 Mailbox Help](https://help.mail.163.com/) · [QQ Mailbox Help](https://service.mail.qq.com/detail/0/339)
+[Report Issues](https://github.com/EthanYoQ/Invoice-Downloader/issues) · [Zhipu AI Open Platform](https://open.bigmodel.cn/) · [163 Mailbox Help](https://help.mail.163.com/) · [QQ Mailbox Help](https://service.mail.qq.com/detail/0/339)
 
 </div>
