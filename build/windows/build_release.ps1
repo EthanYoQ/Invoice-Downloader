@@ -301,6 +301,7 @@ modules = [
     ("requests", "requests"),
     ("beautifulsoup4", "bs4"),
     ("python-dotenv", "dotenv"),
+    ("tenacity", "tenacity"),
 ]
 
 rows = []

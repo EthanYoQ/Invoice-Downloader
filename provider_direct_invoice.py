@@ -6,6 +6,11 @@ from urllib.parse import parse_qsl, urlparse
 DIRECT_INVOICE_FAMILIES = (
     "chinatax_direct_invoice",
     "bwjf_signed_invoice",
+    "fpyun_direct_invoice",
+    "nuonuo_scan_invoice",
+    "pdd_direct_invoice",
+    "jdcloud_direct_invoice",
+    "kpbyd_direct_invoice",
 )
 
 
@@ -49,6 +54,24 @@ def infer_direct_invoice_family(url):
         return "chinatax_direct_invoice"
     if host == "fp.bwjf.cn" and (path.startswith("/u/") or path.startswith("/downsigninvoice")):
         return "bwjf_signed_invoice"
+    if host == "sdapi.fpyun.com.cn" and path == "/invoice/qd/download/getinvoicefile":
+        return "fpyun_direct_invoice"
+    if host == "nnfp.jss.com.cn":
+        if path == "/scan-invoice/printqrcode" or path.startswith("/invoice/scan/"):
+            return "nuonuo_scan_invoice"
+        if re.match(r"^/[a-z0-9=_-]{8,}$", path):
+            return "nuonuo_scan_invoice"
+    if host == "files.pdd-fapiao.com" and path.startswith("/invoice/"):
+        if any(segment in path for segment in ("/pdf/", "/xml/", "/ofd/")):
+            return "pdd_direct_invoice"
+    if host.startswith("eicore-invoice-") and host.endswith(".s3.cn-north-1.jdcloud-oss.com"):
+        if path.startswith("/digital-invoice/") and path.endswith((".pdf", ".xml", ".ofd")):
+            return "jdcloud_direct_invoice"
+    if host == "etd.kpbyd.com" and path == "/hub/files/download":
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        file_code = str(query.get("fileCode") or query.get("filecode") or "").lower()
+        if file_code.endswith(("_pdf", "_xml", "_ofd")):
+            return "kpbyd_direct_invoice"
     return ""
 
 
@@ -100,6 +123,10 @@ def extract_direct_invoice_email_fields(body_text="", *, url="", subject=""):
         candidates = re.findall(r"(?<!\d)(\d{20})(?!\d)", all_text)
         if candidates:
             result["invoice_number"] = candidates[0]
+    if not result["invoice_number"]:
+        candidates = re.findall(r"(?<!\d)(\d{20})(?!\d)", str(url or ""))
+        if candidates:
+            result["invoice_number"] = candidates[0]
 
     seller_name = query.get("sellerName") or query.get("sellername") or ""
     if seller_name:
@@ -107,6 +134,7 @@ def extract_direct_invoice_email_fields(body_text="", *, url="", subject=""):
     if not result["seller"]:
         for pattern in (
             r"您收到一张【(.+?)】开具的发票",
+            r"来自【(.+?)】为您开具的电子发票",
             r"您收到来自(.+?)的电子发票",
             r"来自【(.+?)】开具的发票",
         ):
@@ -130,6 +158,22 @@ def extract_direct_invoice_email_fields(body_text="", *, url="", subject=""):
                 break
 
     preferred_kind = (query.get("Wjgs") or query.get("wjgs") or query.get("jflx") or "").strip().lower()
+    if not preferred_kind:
+        file_code = str(query.get("fileCode") or query.get("filecode") or "").strip().lower()
+        if file_code.endswith("_pdf"):
+            preferred_kind = "pdf"
+        elif file_code.endswith("_xml"):
+            preferred_kind = "xml"
+        elif file_code.endswith("_ofd"):
+            preferred_kind = "ofd"
+    if not preferred_kind:
+        if path := urlparse(str(url or "").strip()).path.lower():
+            if path.endswith(".pdf"):
+                preferred_kind = "pdf"
+            elif path.endswith(".xml"):
+                preferred_kind = "xml"
+            elif path.endswith(".ofd"):
+                preferred_kind = "ofd"
     if preferred_kind in {"pdf", "xml", "ofd"}:
         result["preferred_kind"] = preferred_kind
 
@@ -213,7 +257,7 @@ def parse_direct_invoice_xml_fields(xml_bytes):
 
     if root is not None:
         result["invoice_number"] = normalize_token(
-            _xml_first_text(root, {"fphm", "invoice_no", "invoiceno", "invoice_number"})
+            _xml_first_text(root, {"fphm", "invoice_no", "invoiceno", "invoice_number", "invoicenumber", "eiid"})
         )
         result["invoice_code"] = normalize_token(
             _xml_first_text(root, {"fpdm", "invoice_code", "invoicecode"})
@@ -225,10 +269,10 @@ def parse_direct_invoice_xml_fields(xml_bytes):
             _xml_first_text(root, {"gmfmc", "buyername", "buyer_name", "purchaser"})
         )
         result["amount"] = normalize_amount(
-            _xml_first_text(root, {"jshj", "amount", "total_amount", "价税合计"})
+            _xml_first_text(root, {"jshj", "amount", "total_amount", "totaltax-includedamount", "totaltaxincludedamount", "价税合计"})
         )
         result["invoice_date"] = normalize_date(
-            _xml_first_text(root, {"kprq", "invoice_date", "issuedate", "issue_date"})
+            _xml_first_text(root, {"kprq", "invoice_date", "issuedate", "issue_date", "issuetime", "requesttime"})
         )
 
     if not result["invoice_number"]:

@@ -13,6 +13,11 @@ from urllib.parse import parse_qsl, urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
+from email_body_receipts import (
+    build_email_body_receipt_filename,
+    parse_email_body_receipt_fields,
+    render_email_body_receipt_pdf_bytes,
+)
 from provider_baiwang import (
     build_baiwang_group_key,
     collect_baiwang_candidate_urls,
@@ -35,6 +40,13 @@ except ImportError:
     decode = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+try:
+    from zoneinfo import ZoneInfo
+
+    LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+except Exception:
+    LOCAL_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 # 四层漏斗过滤进制 - 硬编码常量
 TIER1_DOMAINS = ['@12306.cn', '@rails.com.cn', '@didichuxing.com', '@gaode.com', '@marriott.com', '@hworld.com', '@cits.com', '@meituan.com', '@carlsonwagonlit.com', '@mycwt.com', '@citsgbt.com']
@@ -74,6 +86,25 @@ INVOICEISH_ATTACHMENT_KEYWORDS = (
     "ofd",
     "xml",
 )
+
+
+def _contains_keyword_casefold(text, keywords):
+    normalized = str(text or "").casefold()
+    return any(str(keyword or "").casefold() in normalized for keyword in keywords)
+
+
+def _classify_email_tier(sender, subject, body_text):
+    _, sender_addr = email.utils.parseaddr(str(sender or ""))
+    sender_domain = sender_addr.split("@")[-1].lower() if "@" in sender_addr else ""
+    sender_domain = f"@{sender_domain}" if sender_domain else ""
+
+    if any(domain in sender_domain for domain in TIER1_DOMAINS):
+        return 1
+    if _contains_keyword_casefold(subject, KEYWORDS_SUBJECT):
+        return 2
+    if _contains_keyword_casefold(body_text, KEYWORDS_BODY):
+        return 3
+    return 4
 BAIWANG_STRONG_URL_TOKENS = (
     "downloadpdf",
     "downloadofd",
@@ -1160,6 +1191,43 @@ class EmailFetcher:
 
         return b"", has_tuple_payload
 
+    @staticmethod
+    def _extract_fetch_sequence_id(response_header):
+        if isinstance(response_header, bytes):
+            header_text = response_header.decode("ascii", errors="ignore")
+        else:
+            header_text = str(response_header or "")
+        match = re.match(r"\s*(\d+)\b", header_text)
+        if not match:
+            return b""
+        return match.group(1).encode("ascii")
+
+    @staticmethod
+    def _to_local_naive(dt_value):
+        if dt_value is None:
+            return None
+        if dt_value.tzinfo is not None:
+            try:
+                dt_value = dt_value.astimezone(LOCAL_TZ)
+            except Exception:
+                pass
+        return dt_value.replace(tzinfo=None)
+
+    @staticmethod
+    def _extract_fetch_internaldate(response_header):
+        if isinstance(response_header, bytes):
+            header_text = response_header.decode("ascii", errors="ignore")
+        else:
+            header_text = str(response_header or "")
+        match = re.search(r'INTERNALDATE\s+"([^"]+)"', header_text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            internal_dt = email.utils.parsedate_to_datetime(match.group(1))
+        except Exception:
+            return None
+        return EmailFetcher._to_local_naive(internal_dt)
+
     def _fetch_message_bytes(self, e_id, fetch_command, mode_label):
         attempt = {
             "mode": mode_label,
@@ -1283,28 +1351,75 @@ class EmailFetcher:
 
         valid_email_ids = []
         total_ids = len(email_ids)
-        for index, e_id in enumerate(email_ids, start=1):
+        batch_size = 100
+        for batch_start in range(0, total_ids, batch_size):
+            chunk = email_ids[batch_start:batch_start + batch_size]
+            processed_ids = set()
+            sequence_set = b",".join(chunk)
             try:
-                status, msg_data = self.mail.fetch(e_id, '(BODY[HEADER.FIELDS (DATE)])')
-                if status == "OK" and msg_data[0]:
-                    msg = email.message_from_bytes(msg_data[0][1])
-                    date_str = msg.get("Date")
-                    if date_str:
-                        dt = email.utils.parsedate_to_datetime(date_str)
-                        dt_naive = dt.replace(tzinfo=None)
-                        if dt_naive < since_dt:
+                status, msg_data = self.mail.fetch(sequence_set, '(INTERNALDATE BODY[HEADER.FIELDS (DATE)])')
+                if status != "OK" or not msg_data:
+                    valid_email_ids.extend(chunk)
+                    logging.warning(f"Failed to batch fetch email dates for local filter: fetch_status_{status}")
+                else:
+                    fallback_index = 0
+                    for response_part in msg_data:
+                        if not isinstance(response_part, tuple) or len(response_part) < 2:
                             continue
-                        if before_dt and dt_naive >= before_dt:
+
+                        response_id = self._extract_fetch_sequence_id(response_part[0])
+                        if not response_id:
+                            while fallback_index < len(chunk) and chunk[fallback_index] in processed_ids:
+                                fallback_index += 1
+                            response_id = chunk[fallback_index] if fallback_index < len(chunk) else b""
+                            fallback_index += 1
+
+                        if not response_id:
                             continue
-                valid_email_ids.append(e_id)
+
+                        processed_ids.add(response_id)
+                        dt_naive = None
+                        parse_error = None
+                        try:
+                            msg = email.message_from_bytes(response_part[1])
+                            date_str = msg.get("Date")
+                            if date_str:
+                                try:
+                                    dt = email.utils.parsedate_to_datetime(date_str)
+                                    dt_naive = self._to_local_naive(dt)
+                                except Exception as e:
+                                    parse_error = e
+                            if dt_naive is None:
+                                dt_naive = self._extract_fetch_internaldate(response_part[0])
+                            if dt_naive is None:
+                                if parse_error:
+                                    logging.warning(f"Failed to parse email date for local filter: {parse_error}")
+                                valid_email_ids.append(response_id)
+                                continue
+                            if dt_naive < since_dt:
+                                continue
+                            if before_dt and dt_naive >= before_dt:
+                                continue
+                            valid_email_ids.append(response_id)
+                        except Exception as e:
+                            # 解析失败仍保留，防错杀
+                            logging.warning(f"Failed to parse email date for local filter: {e}")
+                            valid_email_ids.append(response_id)
+
+                    for e_id in chunk:
+                        if e_id not in processed_ids:
+                            valid_email_ids.append(e_id)
             except Exception as e:
-                # 解析失败仍保留，防错杀
-                logging.warning(f"Failed to parse email date for local filter: {e}")
-                valid_email_ids.append(e_id)
-            if index == 1 or index % 20 == 0 or index == total_ids:
-                self._emit_progress(
-                    f"正在进行本地日期过滤：{index}/{total_ids}，当前保留 {len(valid_email_ids)} 封邮件。"
-                )
+                logging.warning(f"Failed to batch fetch email dates for local filter: {e}")
+                valid_email_ids.extend(chunk)
+
+            processed_count = min(batch_start + len(chunk), total_ids)
+            logging.info(
+                f"Local date filter progress: {processed_count}/{total_ids}, retained {len(valid_email_ids)} emails."
+            )
+            self._emit_progress(
+                f"正在进行本地日期过滤：{processed_count}/{total_ids}，当前保留 {len(valid_email_ids)} 封邮件。"
+            )
 
         logging.info(f"Local filter completed. {len(valid_email_ids)} emails passed.")
         self._emit_progress(f"本地日期过滤完成，最终保留 {len(valid_email_ids)} 封邮件。")
@@ -1411,18 +1526,7 @@ class EmailFetcher:
                                         })
 
                             # 判定层级
-                            tier = 0
-                            sender_domain = sender.split('@')[-1] if '@' in sender else ''
-                            sender_domain = f"@{sender_domain}".lower()
-                            
-                            if any(d in sender_domain for d in TIER1_DOMAINS):
-                                tier = 1
-                            elif any(k in subject for k in KEYWORDS_SUBJECT):
-                                tier = 2
-                            elif any(k in body_text for k in KEYWORDS_BODY):
-                                tier = 3
-                            else:
-                                tier = 4
+                            tier = _classify_email_tier(sender, subject, body_text)
 
                             # --- ZIP / RAR 解包与整理队列 ---
                             process_queue = list(attachments_found)
@@ -1895,21 +1999,83 @@ class EmailFetcher:
 
                     email_diag["attachment_detected"] = bool(email_diag["attachments"])
 
-                    tier = 0
-                    sender_domain = sender.split('@')[-1] if '@' in sender else ''
-                    sender_domain = f"@{sender_domain}".lower()
-
-                    if any(d in sender_domain for d in TIER1_DOMAINS):
-                        tier = 1
-                    elif any(k in subject for k in KEYWORDS_SUBJECT):
-                        tier = 2
-                    elif any(k in body_text for k in KEYWORDS_BODY):
-                        tier = 3
-                    else:
-                        tier = 4
+                    tier = _classify_email_tier(sender, subject, body_text)
 
                     process_queue = list(attachments_found)
                     processed_attachments = []
+
+                    body_receipt_fields = parse_email_body_receipt_fields(
+                        subject=subject,
+                        sender=sender,
+                        body_text=body_text,
+                        email_date=msg.get("Date", ""),
+                    )
+                    if body_receipt_fields:
+                        body_receipt_filename = build_email_body_receipt_filename(email_id_str, body_receipt_fields)
+                        body_receipt_payload = render_email_body_receipt_pdf_bytes(
+                            body_receipt_fields,
+                            body_text,
+                            source_email_id=email_id_str,
+                        )
+                        try:
+                            body_receipt_path = stage_candidate_file(
+                                email_staging_path,
+                                body_receipt_filename,
+                                body_receipt_payload,
+                            )
+                            email_diag["entered_main_chain"] = True
+                            email_diag["staging_write_count"] += 1
+                            results.append({
+                                "filepath": body_receipt_path,
+                                "tier": tier,
+                                "subject": subject,
+                                "is_url": False,
+                                "candidate_bucket": "B",
+                                "candidate_action": "main_chain",
+                                "source_kind": "email_body_receipt",
+                                "prefilter_reason_code": "B_EMAIL_BODY_RECEIPT_MAIN_CHAIN",
+                                "prefilter_signals": _normalize_prefilter_signals(["email_body_receipt_fields"], []),
+                                "email_id": email_id_str,
+                                "sender": sender,
+                                "original_filename": body_receipt_filename,
+                                "attachment_ext": ".pdf",
+                                "payload_size": len(body_receipt_payload),
+                                "mime_content_type": "application/pdf",
+                                "content_disposition": "generated-email-body-receipt",
+                                "attachment_pair_key": os.path.splitext(body_receipt_filename)[0],
+                                "sibling_pdf_present": True,
+                                "sibling_ofd_present": False,
+                                "sibling_xml_present": False,
+                                "provider_unzipped_pair_suspected": False,
+                                "zip_context": "email_body_receipt",
+                            })
+                            self._emit_input_inventory_event({
+                                "email_id": email_id_str,
+                                "sender": sender,
+                                "subject": subject,
+                                "original_filename": body_receipt_filename,
+                                "attachment_ext": ".pdf",
+                                "payload_size": len(body_receipt_payload),
+                                "mime_content_type": "application/pdf",
+                                "content_disposition": "generated-email-body-receipt",
+                                "attachment_pair_key": os.path.splitext(body_receipt_filename)[0],
+                                "sibling_pdf_present": True,
+                                "sibling_ofd_present": False,
+                                "sibling_xml_present": False,
+                                "provider_unzipped_pair_suspected": False,
+                                "zip_context": "email_body_receipt",
+                                "candidate_action": "main_chain",
+                                "candidate_bucket": "B",
+                                "prefilter_reason_code": "B_EMAIL_BODY_RECEIPT_MAIN_CHAIN",
+                                "inventory_status": "staged_for_processing",
+                                "entered_main_chain": True,
+                                "staged_path": body_receipt_path,
+                                "source_kind": "email_body_receipt",
+                                "body_receipt_fields": body_receipt_fields,
+                            })
+                        except Exception as stage_exc:
+                            email_diag["staging_write_failures"] += 1
+                            logging.error(f"Failed to stage email body receipt {body_receipt_filename}: {stage_exc}")
 
                     while process_queue:
                         attachment_info = process_queue.pop(0)
@@ -2306,4 +2472,3 @@ class EmailFetcher:
             time.sleep(EMAIL_FETCH_LOOP_PAUSE_SECONDS)
 
         return results
-

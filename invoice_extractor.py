@@ -5,11 +5,26 @@ import base64
 import copy
 import logging
 import shutil
+import datetime as dt
+import unicodedata
 import fitz  # PyMuPDF
 import requests
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 from document_types import MANUAL_REVIEW_FOLDER
+from email_body_receipts import CANONICAL_MARKER
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+OCR_COMPAT_TRANSLATION = str.maketrans({
+    "⻔": "门",
+    "⻝": "食",
+    "⻨": "麦",
+    "⻆": "角",
+})
+
+
+def normalize_ocr_compat_text(value):
+    return unicodedata.normalize("NFKC", str(value or "")).translate(OCR_COMPAT_TRANSLATION)
 
 class InvoiceExtractor:
     def __init__(self, api_key=None, output_dir="extracted_invoices"):
@@ -77,6 +92,341 @@ class InvoiceExtractor:
         except Exception as exc:
             logging.warning(f"Failed to read embedded PDF text for fast path: {exc}")
             return ""
+
+    @staticmethod
+    def _parse_english_ordinal_date_to_yyyymmdd(value):
+        text = re.sub(r"\b(\d{1,2})(st|nd|rd|th)\b", r"\1", str(value or ""), flags=re.IGNORECASE).strip()
+        for pattern in (
+            r"([A-Za-z]+)\s+(\d{1,2}),\s*(20\d{2})",
+            r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})",
+        ):
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            if pattern.startswith("([A-Za-z]"):
+                months = {
+                    "jan": 1, "january": 1,
+                    "feb": 2, "february": 2,
+                    "mar": 3, "march": 3,
+                    "apr": 4, "april": 4,
+                    "may": 5,
+                    "jun": 6, "june": 6,
+                    "jul": 7, "july": 7,
+                    "aug": 8, "august": 8,
+                    "sep": 9, "sept": 9, "september": 9,
+                    "oct": 10, "october": 10,
+                    "nov": 11, "november": 11,
+                    "dec": 12, "december": 12,
+                }
+                month = months.get(match.group(1).lower())
+                if month:
+                    return f"{int(match.group(3)):04d}{month:02d}{int(match.group(2)):02d}"
+            else:
+                return f"{int(match.group(1)):04d}{int(match.group(2)):02d}{int(match.group(3)):02d}"
+        return ""
+
+    def _try_extract_foreign_invoice_from_pdf_text(self, pdf_path):
+        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2)
+        if not text or "Invoice #" not in text or "Invoice Date:" not in text:
+            return None
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        number_match = re.search(r"Invoice\s+#\s*([0-9A-Za-z-]+)", text, re.IGNORECASE)
+        date_match = re.search(r"Invoice Date:\s*([^\n\r]+)", text, re.IGNORECASE)
+        if not (number_match and date_match):
+            return None
+
+        seller = ""
+        status_tokens = {"paid", "unpaid", "cancelled", "canceled", "refunded", "overdue"}
+        for line in lines[:10]:
+            lowered = line.lower()
+            if lowered in status_tokens:
+                continue
+            if re.search(r"invoice\s+#", line, re.IGNORECASE):
+                break
+            if re.match(r"^\d{1,6}[-\s]", line) or lowered in {"canada", "united states"}:
+                continue
+            seller = line
+            break
+
+        purchaser = "个人"
+        for index, line in enumerate(lines):
+            if line.lower() == "invoiced to":
+                for candidate in lines[index + 1:index + 5]:
+                    if candidate and not re.search(r"\d{3,}", candidate):
+                        purchaser = candidate
+                        break
+                break
+
+        amounts = []
+        for index, line in enumerate(lines):
+            if line.lower() == "transactions":
+                break
+            if line.lower() == "total":
+                for candidate in lines[index + 1:index + 4]:
+                    amount_match = re.search(r"\$?\s*([0-9]+(?:\.[0-9]{2})?)\s*(?:USD)?", candidate, re.IGNORECASE)
+                    if amount_match:
+                        amounts.append(amount_match.group(1))
+                        break
+        if not amounts:
+            amounts = re.findall(r"\$([0-9]+(?:\.[0-9]{2})?)\s*USD", text, re.IGNORECASE)
+
+        date_value = self._parse_english_ordinal_date_to_yyyymmdd(date_match.group(1))
+        amount = f"{float(amounts[-1]):.2f}" if amounts else ""
+        if not (seller and date_value and amount):
+            return None
+
+        return {
+            "is_invoice": True,
+            "Date": date_value,
+            "Purchaser": purchaser,
+            "Seller": seller,
+            "Amount": amount,
+            "InvoiceCode": "",
+            "InvoiceNumber": number_match.group(1),
+            "Type": "其他",
+            "category": "其他",
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+        }
+
+    @staticmethod
+    def _parse_cits_date_to_yyyymmdd(value):
+        text = str(value or "")
+        match = re.search(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
+        if match:
+            return f"{match.group(1)}{int(match.group(2)):02d}{int(match.group(3)):02d}"
+        match = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", text)
+        if match:
+            return f"{match.group(1)}{int(match.group(2)):02d}{int(match.group(3)):02d}"
+        match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{2})\b", text)
+        if match:
+            return f"20{int(match.group(3)):02d}{int(match.group(2)):02d}{int(match.group(1)):02d}"
+        month_map = {
+            "JAN": 1,
+            "FEB": 2,
+            "MAR": 3,
+            "APR": 4,
+            "MAY": 5,
+            "JUN": 6,
+            "JUL": 7,
+            "AUG": 8,
+            "SEP": 9,
+            "OCT": 10,
+            "NOV": 11,
+            "DEC": 12,
+        }
+        match = re.search(r"\b(\d{1,2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})\b", text, re.IGNORECASE)
+        if match:
+            month = month_map.get(match.group(2).upper())
+            if month:
+                return f"20{int(match.group(3)):02d}{month:02d}{int(match.group(1)):02d}"
+        return ""
+
+    @staticmethod
+    def _extract_cits_total_amount(text):
+        amount_token = r"([0-9]{1,3}(?:,[0-9]{3})*\.\d{2}|[0-9]+\.\d{2})"
+        patterns = [
+            rf"Total:\s*CNY\s*{amount_token}",
+            rf"Amount Received:\s*CNY\s*{amount_token}",
+            rf"Grand Total:\s*(?:.|\n){{0,120}}?{amount_token}",
+            rf"{amount_token}\s*CNY\s*(?:[^\n\r]{{0,100}})?\s*\n\s*总价[:：]?",
+            rf"总价[:：]?\s*\n?{amount_token}\s*CNY",
+            rf"总价[:：]?\s*CNY\s*{amount_token}",
+            rf"机票总价[:：]?\s*CNY\s*{amount_token}",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                try:
+                    return f"{float(match.group(1).replace(',', '')):.2f}"
+                except ValueError:
+                    return match.group(1).replace(",", "")
+        fallback_text = re.sub(r"Tax Detail:[^\n\r]+", "", text, flags=re.IGNORECASE)
+        match = re.search(rf"CNY\s*{amount_token}", fallback_text, flags=re.IGNORECASE)
+        if match:
+            try:
+                return f"{float(match.group(1).replace(',', '')):.2f}"
+            except ValueError:
+                return match.group(1).replace(",", "")
+        return ""
+
+    @staticmethod
+    def _extract_cits_hotel_name(text):
+        line_match = re.search(r"([^\n\r]{2,80}?酒店(?:（[^）]+）)?)\s*\n\s*电话[:：]", text)
+        if line_match:
+            value = line_match.group(1)
+        else:
+            value = ""
+            for line in str(text or "").splitlines():
+                candidate = line.strip()
+                if "酒店" not in candidate:
+                    continue
+                if any(token in candidate for token in ["如酒店", "酒店将", "下榻", "酒店是", "酒店前台"]):
+                    continue
+                value = candidate
+                break
+        value = re.sub(r"（[^）]*协议[^）]*）", "", value)
+        value = re.sub(r"\([^)]*协议[^)]*\)", "", value, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", value).strip(" ：:")
+
+    @staticmethod
+    def _infer_cits_month_day_date(text, pdf_path="", document_context=None):
+        context = document_context or {}
+        context_text = "\n".join(
+            str(item or "")
+            for item in [
+                text,
+                os.path.basename(str(pdf_path or "")),
+                os.path.basename(os.path.dirname(str(pdf_path or ""))) if pdf_path else "",
+                context.get("subject", ""),
+                context.get("file_name", ""),
+                context.get("original_filename", ""),
+            ]
+        )
+        month_day = re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})日", context_text)
+        if not month_day:
+            return ""
+
+        ref_date = None
+        mail_date = str(context.get("mail_date_local") or context.get("mail_date") or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            if not mail_date:
+                break
+            try:
+                ref_date = dt.datetime.strptime(mail_date[:19] if fmt.endswith("%S") else mail_date[:10], fmt).date()
+                break
+            except ValueError:
+                continue
+        if ref_date is None and pdf_path:
+            try:
+                ref_date = dt.datetime.fromtimestamp(os.path.getmtime(pdf_path)).date()
+            except Exception:
+                ref_date = None
+        if ref_date is None:
+            parsed_full = InvoiceExtractor._parse_cits_date_to_yyyymmdd(context_text)
+            return parsed_full
+
+        month = int(month_day.group(1))
+        day = int(month_day.group(2))
+        try:
+            candidate = dt.date(ref_date.year, month, day)
+        except ValueError:
+            return ""
+        if candidate > ref_date + dt.timedelta(days=31):
+            try:
+                candidate = dt.date(ref_date.year - 1, month, day)
+            except ValueError:
+                return ""
+        return candidate.strftime("%Y%m%d")
+
+    @staticmethod
+    def _looks_like_cits_hotel_itinerary(text, context_text=""):
+        combined = f"{text}\n{context_text}"
+        return (
+            "酒店" in combined
+            and ("行程单" in combined or "国内行程" in text)
+            and any(marker in text for marker in ["入住日期", "离店日期", "预订详情", "价格及付款信息", "支付方式"])
+        )
+
+    def _try_extract_cits_gbt_from_pdf_text(self, pdf_path, document_context=None):
+        """Local parser for CITS/GBT travel invoices and personal itinerary attachments."""
+        if not pdf_path or not os.path.exists(pdf_path):
+            return None
+        if not str(pdf_path).lower().endswith(".pdf"):
+            return None
+
+        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        if not text:
+            return None
+        compact_text = re.sub(r"\s+", "", text)
+        if not any(marker in compact_text for marker in ["CITSGBT", "CITS-AmericanExpress", "国旅运通"]):
+            return None
+
+        invoice_match = re.search(r"\b(SCCT[0-9]+)\b", text)
+        amount = self._extract_cits_total_amount(text)
+        purchaser = "辉瑞投资有限公司" if "辉瑞投资有限公司" in text or "PFIZER" in text.upper() else "个人"
+        context = document_context or {}
+        context_text = "\n".join(
+            str(item or "")
+            for item in [
+                pdf_path,
+                context.get("subject", ""),
+                context.get("file_name", ""),
+                context.get("original_filename", ""),
+            ]
+        )
+
+        if invoice_match:
+            date_match = re.search(r"Date:\s*\n?.*?(\d{1,2}/\d{1,2}/\d{2})", text, flags=re.DOTALL)
+            date_value = self._parse_cits_date_to_yyyymmdd(date_match.group(1) if date_match else text)
+            has_air_markers = any(
+                marker in text
+                for marker in ["Online Dom Air", "Flight No", "Airline", "Origin", "Destination", "首段行程", "机场"]
+            )
+            invoice_type = "机票" if has_air_markers else "其他"
+            if not (date_value and amount):
+                return None
+            return {
+                "is_invoice": True,
+                "Date": date_value,
+                "Purchaser": purchaser,
+                "Seller": "CITS GBT",
+                "Amount": amount,
+                "InvoiceCode": "",
+                "InvoiceNumber": invoice_match.group(1),
+                "Type": invoice_type,
+                "category": invoice_type,
+                "Departure_Date": "",
+                "Departure_City": "",
+                "Destination_City": "",
+            }
+
+        if self._looks_like_cits_hotel_itinerary(text, context_text):
+            date_value = self._infer_cits_month_day_date(text, pdf_path, context)
+            seller = self._extract_cits_hotel_name(text) or "CITS GBT"
+            if not (date_value and amount):
+                return None
+            return {
+                "is_invoice": True,
+                "Date": date_value,
+                "Purchaser": purchaser,
+                "Seller": seller,
+                "Amount": amount,
+                "InvoiceCode": "",
+                "InvoiceNumber": "",
+                "Type": "住宿水单",
+                "category": "住宿水单",
+                "Departure_Date": "",
+                "Departure_City": "",
+                "Destination_City": "",
+                "_is_folio": True,
+            }
+
+        if "行程" not in text or not any(marker in text for marker in ["航班号", "机票总价", "客票价格", "航空公司"]):
+            return None
+        date_match = re.search(r"出发[:：]?\s*(20\d{2}年\d{1,2}月\d{1,2}日)", text)
+        date_value = self._parse_cits_date_to_yyyymmdd(date_match.group(1) if date_match else text)
+        if not amount:
+            amount_match = re.search(r"机票总价[:：]?\s*CNY\s*([0-9]{1,3}(?:,[0-9]{3})*\.\d{2}|[0-9]+\.\d{2})", text)
+            amount = f"{float(amount_match.group(1).replace(',', '')):.2f}" if amount_match else ""
+        if not (date_value and amount):
+            return None
+        return {
+            "is_invoice": True,
+            "Date": date_value,
+            "Purchaser": purchaser,
+            "Seller": "CITS GBT",
+            "Amount": amount,
+            "InvoiceCode": "",
+            "InvoiceNumber": "",
+            "Type": "非目标公司发票",
+            "category": "非目标公司发票",
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+        }
 
     @staticmethod
     def _looks_like_useful_embedded_pdf_text(text):
@@ -180,6 +530,47 @@ class InvoiceExtractor:
             "Destination_City": "",
         }
 
+    def _try_extract_ride_itinerary_from_pdf_text(self, pdf_path):
+        if not pdf_path or not os.path.exists(pdf_path):
+            return None
+        if not str(pdf_path).lower().endswith(".pdf"):
+            return None
+        text = normalize_ocr_compat_text(self._extract_embedded_pdf_text(pdf_path, max_pages=2)).replace("\xa0", " ")
+        if not text or "行程单" not in text:
+            return None
+        compact = re.sub(r"\s+", "", text)
+        is_gaode = "高德地图" in text or "AMAP" in text.upper()
+        is_didi = "滴滴" in text or "DIDI TRAVEL" in text.upper()
+        if not is_gaode and not is_didi:
+            return None
+
+        amount_match = (
+            re.search(r"合计\s*([0-9]+(?:\.[0-9]{1,2})?)\s*元", text)
+            or re.search(r"合计([0-9]+(?:\.[0-9]{1,2})?)元", compact)
+        )
+        date_match = (
+            re.search(r"行程(?:起止)?时间[:：]\s*(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text)
+            or re.search(r"行程起止日期[:：]\s*(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text)
+            or re.search(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text)
+        )
+        if not amount_match or not date_match:
+            return None
+        return {
+            "is_invoice": False,
+            "Date": f"{date_match.group(1)}{int(date_match.group(2)):02d}{int(date_match.group(3)):02d}",
+            "Purchaser": "个人",
+            "Seller": "高德地图" if is_gaode else "滴滴出行",
+            "Amount": f"{float(amount_match.group(1)):.2f}",
+            "InvoiceCode": "",
+            "InvoiceNumber": "",
+            "Type": "打车",
+            "category": "打车",
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+            "_is_itinerary": True,
+        }
+
     def _try_extract_standard_china_einvoice_from_pdf_text(self, pdf_path):
         """High-confidence fast path for standard Chinese electronic invoices with labeled buyer/seller fields."""
         if not pdf_path or not os.path.exists(pdf_path):
@@ -187,7 +578,7 @@ class InvoiceExtractor:
         if not str(pdf_path).lower().endswith(".pdf"):
             return None
 
-        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        text = normalize_ocr_compat_text(self._extract_embedded_pdf_text(pdf_path, max_pages=2)).replace("\xa0", " ")
         if not text:
             return None
         if "电子发票" not in text or "发票号码" not in text or "开票日期" not in text:
@@ -262,6 +653,122 @@ class InvoiceExtractor:
             "Destination_City": "",
         }
 
+    def _looks_like_company_name_line(self, line):
+        line = re.sub(r"\s+", "", normalize_ocr_compat_text(line)).strip()
+        line = re.sub(r"^(名称|名\s*称)[:：]?", "", line)
+        if not line:
+            return False
+        if re.fullmatch(r"[0-9A-Z]{10,24}", line):
+            return False
+        if re.search(r"\d{4}年\d{1,2}月\d{1,2}日|\d+\.\d{2}|¥|￥", line):
+            return False
+        excluded_tokens = [
+            "名称",
+            "发票",
+            "开票",
+            "购买方",
+            "销售方",
+            "合计",
+            "价税",
+            "规格型号",
+            "项目名称",
+            "单位",
+            "数量",
+            "税率",
+            "税额",
+            "备注",
+            "下载次数",
+            "国家税务总局",
+        ]
+        if any(token in line for token in excluded_tokens):
+            return False
+        return bool(re.search(r"[\u4e00-\u9fff]", line)) and any(
+            token in line
+            for token in ["公司", "有限公司", "酒店", "分公司", "辉瑞", "银行", "集团", "中心", "商行", "个体工商户", "火锅店", "饭店", "餐厅"]
+            + ["饮品", "烧烤", "串串", "食府", "涮肉", "小吃", "面馆", "餐馆", "咖啡", "海鲜", "肯德基", "麦当劳", "金拱", "盒马"]
+        )
+
+    @staticmethod
+    def _clean_standard_invoice_party_line(line):
+        line = re.sub(r"\s+", "", normalize_ocr_compat_text(line)).strip()
+        return re.sub(r"^(名称|名\s*称)[:：]?", "", line).strip()
+
+    @staticmethod
+    def _extract_standard_invoice_tax_id(line):
+        match = re.search(r"([0-9A-Z]{15,24})$", re.sub(r"\s+", "", str(line or "")))
+        return match.group(1) if match else ""
+
+    def _extract_wrapped_standard_invoice_parties(self, compact_lines, date_line_index):
+        if date_line_index < 0:
+            return None
+        tail_lines = compact_lines[date_line_index + 1: date_line_index + 24]
+        company_names = []
+        for line in tail_lines:
+            if self._extract_standard_invoice_tax_id(line):
+                continue
+            cleaned = self._clean_standard_invoice_party_line(line)
+            if self._looks_like_company_name_line(cleaned):
+                company_names.append(cleaned)
+        if len(company_names) >= 2:
+            return company_names[0], company_names[1]
+        return None
+
+    def _extract_parallel_standard_invoice_parties(self, compact_lines):
+        tax_indices = [
+            index
+            for index, line in enumerate(compact_lines)
+            if self._extract_standard_invoice_tax_id(line)
+        ]
+        for first_tax_index, second_tax_index in zip(tax_indices, tax_indices[1:]):
+            if second_tax_index - first_tax_index > 3:
+                continue
+            window_start = max(0, first_tax_index - 12)
+            company_candidates = [
+                (index, self._clean_standard_invoice_party_line(compact_lines[index]))
+                for index in range(window_start, first_tax_index)
+                if self._looks_like_company_name_line(self._clean_standard_invoice_party_line(compact_lines[index]))
+            ]
+            if len(company_candidates) < 2:
+                continue
+            first_company = company_candidates[-2]
+            second_company = company_candidates[-1]
+            label_text = "".join(compact_lines[max(0, first_company[0] - 32): first_company[0]])
+            seller_label_pos = label_text.find("销售方信息")
+            buyer_label_pos = label_text.find("购买方信息")
+            if seller_label_pos >= 0 and buyer_label_pos >= 0:
+                if seller_label_pos < buyer_label_pos:
+                    return second_company[1], first_company[1]
+                return first_company[1], second_company[1]
+        return None
+
+    def _extract_standard_invoice_total_amount(self, text, compact_lines):
+        normalized_text = normalize_ocr_compat_text(text)
+        small_marker = "（小写）"
+        marker_index = normalized_text.find(small_marker)
+        if marker_index >= 0:
+            small_window = normalized_text[marker_index + len(small_marker): marker_index + len(small_marker) + 160]
+            small_amounts = []
+            for match in re.finditer(r"[¥￥]?\s*([0-9]+\.[0-9]{2})\s*[¥￥]?", small_window):
+                small_amounts.append(match.group(1))
+            if small_amounts:
+                return max(small_amounts, key=lambda value: abs(float(value)))
+
+        amount_values = []
+        for match in re.finditer(r"[¥￥]\s*([0-9]+\.[0-9]{2})", normalized_text):
+            amount_values.append(match.group(1))
+
+        for index, line in enumerate(compact_lines):
+            if line in {"¥", "￥"} and index > 0 and re.fullmatch(r"[0-9]+\.[0-9]{2}", compact_lines[index - 1]):
+                amount_values.append(compact_lines[index - 1])
+
+        if not amount_values:
+            for match in re.finditer(r"\b([0-9]+\.[0-9]{2})\b", normalized_text):
+                amount_values.append(match.group(1))
+
+        if not amount_values:
+            return ""
+        return max(amount_values, key=lambda value: abs(float(value)))
+
     def _try_extract_standard_china_einvoice_from_pdf_text_v2(self, pdf_path):
         """ASCII-safe parser for standard Chinese electronic invoice PDFs."""
         if not pdf_path or not os.path.exists(pdf_path):
@@ -269,7 +776,7 @@ class InvoiceExtractor:
         if not str(pdf_path).lower().endswith(".pdf"):
             return None
 
-        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        text = normalize_ocr_compat_text(self._extract_embedded_pdf_text(pdf_path, max_pages=2)).replace("\xa0", " ")
         if not text:
             return None
 
@@ -282,24 +789,27 @@ class InvoiceExtractor:
         compact_lines = [re.sub(r"\s+", "", line or "") for line in text.splitlines()]
         compact_lines = [line for line in compact_lines if line]
 
-        invoice_number = next((line for line in compact_lines if re.fullmatch(r"[0-9]{8,}", line)), "")
+        invoice_number_match = re.search(r"\u53d1\u7968\u53f7\u7801[:\uff1a]?\s*([0-9]{8,})", text)
+        invoice_candidates = [line for line in compact_lines if re.fullmatch(r"[0-9]{8,}", line)]
+        invoice_number = invoice_number_match.group(1) if invoice_number_match else next((line for line in invoice_candidates if len(line) >= 20), "")
+        if not invoice_number and invoice_candidates:
+            invoice_number = invoice_candidates[0]
         if not invoice_number:
             return None
 
         date_match = None
-        for line in compact_lines:
-            match = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})日", line)
+        date_line_index = -1
+        for index, line in enumerate(compact_lines):
+            match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", line)
             if match:
                 date_match = match
+                date_line_index = index
                 break
         if not date_match:
             return None
 
-        amount_match = (
-            re.search(r"\uff08\u5c0f\u5199\uff09\s*[\u00a5\uffe5]?\s*([0-9]+\.[0-9]{2})", text)
-            or re.search(r"[\u00a5\uffe5]\s*([0-9]+\.[0-9]{2})", text)
-        )
-        if not amount_match:
+        amount_value = self._extract_standard_invoice_total_amount(text, compact_lines)
+        if not amount_value:
             return None
 
         compact_text = re.sub(r"\s+", "", text)
@@ -315,34 +825,44 @@ class InvoiceExtractor:
                 invoice_type = candidate_type
                 break
 
-        date_line = date_match.group(0)
-        date_line_index = compact_lines.index(date_line) if date_line in compact_lines else -1
         tail_lines = compact_lines[date_line_index + 1:] if date_line_index >= 0 else compact_lines
-        pairs = []
-        seen_names = set()
-        pair_pattern = re.compile(r"([A-Za-z0-9\u4e00-\u9fff\uff08\uff09()·\-]{2,})\s*\n\s*([0-9A-Z]{10,24})")
-        excluded_names = {
-            "\u540d\u79f0",
-            "\u9500\u552e\u4fe1\u606f",
-            "\u8d2d\u4e70\u65b9\u4fe1\u606f",
-            "\u9500\u552e\u65b9\u4fe1\u606f",
-            "\u8d2d\u4e70\u65b9",
-            "\u9500\u552e\u65b9",
-        }
-        for match in pair_pattern.finditer("\n".join(tail_lines)):
-            name = re.sub(r"\s+", "", match.group(1) or "").strip()
-            tax_id = re.sub(r"\s+", "", match.group(2) or "").strip()
-            if not name or name in seen_names or name in excluded_names or re.fullmatch(r"[0-9A-Z]{10,24}", name):
-                continue
-            seen_names.add(name)
-            pairs.append((name, tax_id))
-            if len(pairs) >= 2:
-                break
-        if len(pairs) < 2:
-            return None
-
-        purchaser = pairs[0][0]
-        seller = pairs[1][0]
+        parties = (
+            self._extract_wrapped_standard_invoice_parties(compact_lines, date_line_index)
+            or self._extract_parallel_standard_invoice_parties(compact_lines)
+        )
+        if parties:
+            purchaser, seller = parties
+        else:
+            pairs = []
+            seen_names = set()
+            pair_pattern = re.compile(r"([A-Za-z0-9\u4e00-\u9fff\uff08\uff09()·\-]{2,})\s*\n\s*([0-9A-Z]{10,24})")
+            excluded_names = {
+                "\u540d\u79f0",
+                "\u9500\u552e\u4fe1\u606f",
+                "\u8d2d\u4e70\u65b9\u4fe1\u606f",
+                "\u9500\u552e\u65b9\u4fe1\u606f",
+                "\u8d2d\u4e70\u65b9",
+                "\u9500\u552e\u65b9",
+            }
+            for match in pair_pattern.finditer("\n".join(tail_lines)):
+                name = self._clean_standard_invoice_party_line(match.group(1))
+                tax_id = self._extract_standard_invoice_tax_id(match.group(2))
+                if (
+                    not name
+                    or name in seen_names
+                    or name in excluded_names
+                    or re.fullmatch(r"[0-9A-Z]{10,24}", name)
+                    or not self._looks_like_company_name_line(name)
+                ):
+                    continue
+                seen_names.add(name)
+                pairs.append((name, tax_id))
+                if len(pairs) >= 2:
+                    break
+            if len(pairs) < 2:
+                return None
+            purchaser = pairs[0][0]
+            seller = pairs[1][0]
         if purchaser == seller:
             return None
 
@@ -352,11 +872,150 @@ class InvoiceExtractor:
             "Date": f"{date_match.group(1)}{int(date_match.group(2)):02d}{int(date_match.group(3)):02d}",
             "Purchaser": purchaser,
             "Seller": seller,
-            "Amount": amount_match.group(1),
+            "Amount": amount_value,
             "InvoiceCode": invoice_code_match.group(1) if invoice_code_match else "",
             "InvoiceNumber": invoice_number,
             "Type": invoice_type,
             "category": invoice_type,
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+        }
+
+    def _parse_hotel_folio_date(self, text):
+        month_map = {
+            "JAN": 1,
+            "FEB": 2,
+            "MAR": 3,
+            "APR": 4,
+            "MAY": 5,
+            "JUN": 6,
+            "JUL": 7,
+            "AUG": 8,
+            "SEP": 9,
+            "OCT": 10,
+            "NOV": 11,
+            "DEC": 12,
+        }
+        for label in ["打印日期", "离店日期"]:
+            match = re.search(label + r"\s*[:：]?\s*(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+            if match:
+                return f"{match.group(1)}{int(match.group(2)):02d}{int(match.group(3)):02d}"
+
+        printed = re.search(r"PRINTED\s+ON\s+(\d{1,2})-([A-Za-z]{3})-(\d{2})", text, re.IGNORECASE)
+        if printed:
+            month = month_map.get(printed.group(2).upper())
+            if month:
+                year = 2000 + int(printed.group(3))
+                return f"{year:04d}{month:02d}{int(printed.group(1)):02d}"
+
+        for pattern in [r"GD:(20\d{2})-(\d{1,2})-(\d{1,2})", r'"depDate"\s*:\s*"(\d{1,2})/(\d{1,2})/(\d{2})"']:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if not match:
+                continue
+            if pattern.startswith("GD"):
+                return f"{match.group(1)}{int(match.group(2)):02d}{int(match.group(3)):02d}"
+            year = 2000 + int(match.group(3))
+            return f"{year:04d}{int(match.group(2)):02d}{int(match.group(1)):02d}"
+
+        if "marriott" in text.lower() or "万豪" in text:
+            date_match = re.search(r"\b(\d{2})-(\d{2})-(\d{2})\b", text)
+            if date_match:
+                year = 2000 + int(date_match.group(3))
+                return f"{year:04d}{int(date_match.group(1)):02d}{int(date_match.group(2)):02d}"
+
+        return ""
+
+    def _try_extract_generic_hotel_folio_from_pdf_text(self, pdf_path):
+        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        if not text:
+            return None
+        compact_text = re.sub(r"\s+", "", text).lower()
+        if "电子发票" in compact_text or "发票号码" in compact_text:
+            return None
+        has_folio_marker = any(
+            marker in compact_text
+            for marker in ["结账单", "住宿明细", "宾客账单", "guestfolio", "folio", "balance"]
+        )
+        has_hotel_marker = any(marker in compact_text for marker in ["酒店", "hotel", "入住日期", "arrival", "departure"])
+        if not has_folio_marker or not has_hotel_marker:
+            return None
+
+        lines = [re.sub(r"\s+", " ", line or "").strip(" :：") for line in text.splitlines()]
+        lines = [line for line in lines if line]
+        seller = lines[0] if lines else ""
+        if " " in seller and "hotel" in seller.lower():
+            seller = seller.split("  ")[0].strip() or seller
+
+        purchaser = ""
+        match = re.search(r"客人姓名\s*[:：]?\s*([\u4e00-\u9fffA-Za-z, ]{1,40})", text)
+        if match:
+            purchaser = match.group(1).strip(" :：")
+        if not purchaser:
+            gn = re.search(r"GN:([^|]+).*?GF:([^|]+)", text)
+            if gn:
+                purchaser = f"{gn.group(1).strip()}, {gn.group(2).strip()}"
+        if not purchaser:
+            fn = re.search(r'"firstName"\s*:\s*"([^"]+)".*?"lastName"\s*:\s*"([^"]+)"', text, re.DOTALL)
+            if fn:
+                purchaser = f"{fn.group(2).strip()}, {fn.group(1).strip()}"
+
+        def _nonzero_amount(value):
+            raw = str(value or "").replace(",", "").strip()
+            if not raw:
+                return ""
+            try:
+                return f"{float(raw):.2f}" if abs(float(raw)) > 0 else ""
+            except ValueError:
+                return raw
+
+        amount_value = ""
+        total_match = re.search(
+            r"Total\s*\n\s*([0-9]{1,3}(?:,[0-9]{3})*\.\d{2}|[0-9]+\.\d{2})",
+            text,
+            re.IGNORECASE,
+        )
+        if total_match:
+            amount_value = _nonzero_amount(total_match.group(1))
+        if not amount_value:
+            folio_match = re.search(r"\[FOLIO:([^\]]+)\]", text, re.IGNORECASE | re.DOTALL)
+            if folio_match:
+                detail_amounts = re.findall(r"\|([0-9]+(?:\.[0-9]{2}))", folio_match.group(1))
+                if detail_amounts:
+                    amount_value = _nonzero_amount(sum(float(value) for value in detail_amounts))
+        if not amount_value:
+            table_charge = re.search(
+                r"\b\d{2}-\d{2}-\d{2}\b\s*\n\s*([0-9]{1,3}(?:,[0-9]{3})*\.\d{2}|[0-9]+\.\d{2})\s*\n\s*([0-9]{1,3}(?:,[0-9]{3})*\.\d{2}|[0-9]+\.\d{2})",
+                text,
+            )
+            if table_charge:
+                amount_value = _nonzero_amount(table_charge.group(1))
+        if not amount_value:
+            for pattern, flags in [
+                (r"付款合计\s*([0-9]+(?:\.[0-9]{2})?)", 0),
+                (r"消费合计\s*([0-9]+(?:\.[0-9]{2})?)", 0),
+                (r"Balance\s+(?:CNY\s*)?([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})", re.IGNORECASE),
+                (r'"balance"\s*:\s*"([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})"', re.IGNORECASE),
+            ]:
+                amount_match = re.search(pattern, text, flags)
+                if amount_match:
+                    amount_value = _nonzero_amount(amount_match.group(1))
+                    if amount_value:
+                        break
+        folio_date = self._parse_hotel_folio_date(text)
+        if not seller or not amount_value or not folio_date:
+            return None
+
+        return {
+            "is_invoice": True,
+            "Date": folio_date,
+            "Purchaser": purchaser or "个人",
+            "Seller": seller,
+            "Amount": amount_value,
+            "InvoiceCode": "",
+            "InvoiceNumber": "",
+            "Type": "住宿水单",
+            "category": "住宿水单",
             "Departure_Date": "",
             "Departure_City": "",
             "Destination_City": "",
@@ -368,6 +1027,10 @@ class InvoiceExtractor:
             return None
         if not str(pdf_path).lower().endswith(".pdf"):
             return None
+
+        generic_result = self._try_extract_generic_hotel_folio_from_pdf_text(pdf_path)
+        if generic_result:
+            return generic_result
 
         text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
         if not text:
@@ -415,16 +1078,53 @@ class InvoiceExtractor:
             "Amount": amount_match.group(1).replace(",", ""),
             "InvoiceCode": "",
             "InvoiceNumber": "",
-            "Type": "住宿",
-            "category": "住宿",
+            "Type": "住宿水单",
+            "category": "住宿水单",
             "Departure_Date": "",
             "Departure_City": "",
             "Destination_City": "",
         }
 
-    def extract_info_via_llm(self, base64_images, custom_rules="", pdf_path=None):
+    def _try_extract_email_body_receipt_from_pdf_text(self, pdf_path):
+        if not pdf_path or not os.path.exists(pdf_path):
+            return None
+        if not str(pdf_path).lower().endswith(".pdf"):
+            return None
+        text = self._extract_embedded_pdf_text(pdf_path, max_pages=2).replace("\xa0", " ")
+        if CANONICAL_MARKER not in text:
+            return None
+
+        def _field(label):
+            match = re.search(rf"{re.escape(label)}[ \t]*[:：][ \t]*([^\n\r]*)", text)
+            return (match.group(1).strip() if match else "")
+
+        amount = _field("价税合计")
+        if amount:
+            try:
+                amount = f"{float(amount.replace(',', '')):.2f}"
+            except ValueError:
+                pass
+
+        result = {
+            "is_invoice": True,
+            "Date": re.sub(r"\D", "", _field("开票日期"))[:8],
+            "Purchaser": _field("购买方名称") or "未知购买方",
+            "Seller": _field("销售方名称") or "未知开票方",
+            "Amount": amount or "0.00",
+            "InvoiceCode": _field("发票代码"),
+            "InvoiceNumber": _field("发票号码"),
+            "Type": _field("票据类型") or "其他",
+            "category": _field("票据类型") or "其他",
+            "Departure_Date": "",
+            "Departure_City": "",
+            "Destination_City": "",
+        }
+        if not result["Date"] or not result["Seller"] or not result["Amount"]:
+            return None
+        return result
+
+    def extract_info_via_llm(self, base64_images, custom_rules="", pdf_path=None, document_context=None):
         """3.2 Construct the Vision/OCR API payload and extract structured JSON using dual engines"""
-        from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_not_exception_type
         import time
 
         class LayoutParsingError(Exception): pass
@@ -664,15 +1364,60 @@ class InvoiceExtractor:
         try:
             if not pdf_path or not os.path.exists(pdf_path):
                 raise ValueError("未提供有效的 pdf_path，Track A 无法读取原始文件。")
-                
+
             abs_pdf_path = os.path.abspath(pdf_path)
             actual_size = os.path.getsize(abs_pdf_path)
-            if actual_size < 1000:
-                raise ValueError(f"文件大小异常: 仅 {actual_size} bytes，拒绝处理。")
-                
+
             # 强制日志输出物理校验信息
             print(f">>> [物理校验] 绝对路径: {abs_pdf_path} | 真实字节: {actual_size}")
-            
+
+            email_body_receipt_result = self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path)
+            if email_body_receipt_result:
+                extraction_trace["engine"] = "local_email_body_receipt_pdf"
+                extraction_trace["reason_code"] = "LOCAL_EMAIL_BODY_RECEIPT_PDF_FAST_PATH"
+                extraction_trace["result"] = copy.deepcopy(email_body_receipt_result)
+                timing_trace["local_email_body_receipt_pdf_ms"] = _elapsed_ms(run_started_at)
+                _finalize_timing()
+                self.last_extraction_trace = copy.deepcopy(extraction_trace)
+                _print_success_summary(email_body_receipt_result)
+                return email_body_receipt_result
+
+            if actual_size < 1000:
+                raise ValueError(f"文件大小异常: 仅 {actual_size} bytes，拒绝处理。")
+
+            foreign_invoice_result = self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path)
+            if foreign_invoice_result:
+                extraction_trace["engine"] = "local_foreign_invoice_pdf"
+                extraction_trace["reason_code"] = "LOCAL_FOREIGN_INVOICE_PDF_FAST_PATH"
+                extraction_trace["result"] = copy.deepcopy(foreign_invoice_result)
+                timing_trace["local_foreign_invoice_pdf_ms"] = _elapsed_ms(run_started_at)
+                _finalize_timing()
+                self.last_extraction_trace = copy.deepcopy(extraction_trace)
+                _print_success_summary(foreign_invoice_result)
+                return foreign_invoice_result
+
+            cits_gbt_result = self._try_extract_cits_gbt_from_pdf_text(abs_pdf_path, document_context=document_context)
+            if cits_gbt_result:
+                extraction_trace["engine"] = "local_cits_gbt_pdf"
+                extraction_trace["reason_code"] = "LOCAL_CITS_GBT_PDF_FAST_PATH"
+                extraction_trace["result"] = copy.deepcopy(cits_gbt_result)
+                timing_trace["local_cits_gbt_pdf_ms"] = _elapsed_ms(run_started_at)
+                _finalize_timing()
+                self.last_extraction_trace = copy.deepcopy(extraction_trace)
+                _print_success_summary(cits_gbt_result)
+                return cits_gbt_result
+
+            ride_itinerary_result = self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path)
+            if ride_itinerary_result:
+                extraction_trace["engine"] = "local_ride_itinerary_pdf"
+                extraction_trace["reason_code"] = "LOCAL_RIDE_ITINERARY_PDF_FAST_PATH"
+                extraction_trace["result"] = copy.deepcopy(ride_itinerary_result)
+                timing_trace["local_ride_itinerary_pdf_ms"] = _elapsed_ms(run_started_at)
+                _finalize_timing()
+                self.last_extraction_trace = copy.deepcopy(extraction_trace)
+                _print_success_summary(ride_itinerary_result)
+                return ride_itinerary_result
+
             ihg_folio_result = self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path)
             if ihg_folio_result:
                 extraction_trace["engine"] = "local_ihg_folio_pdf"
@@ -841,6 +1586,8 @@ class InvoiceExtractor:
 
         invoice_type = _normalized_text(invoice_info.get("Type", ""))
         date_value = invoice_info.get("Departure_Date") if invoice_type == "火车票" else invoice_info.get("Date")
+        if invoice_type == "非目标公司发票":
+            return _has_meaningful_date(date_value) and _has_positive_amount(invoice_info.get("Amount"))
         return (
             _has_meaningful_date(date_value)
             and _has_meaningful_seller(invoice_info.get("Seller"))
@@ -998,4 +1745,3 @@ class InvoiceExtractor:
             })
             self.last_route_trace = copy.deepcopy(route_trace)
             return False, str(e)
-

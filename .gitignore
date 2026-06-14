@@ -15,8 +15,12 @@ diagnostics/
 monitoring/
 output/
 manual_frontend_runs/
+manual_program_runs/
 test_dataset/
 staging/
+.codegraph/
+.codex/
+.runtime/
 dist/
 build/work/
 build/runtime/

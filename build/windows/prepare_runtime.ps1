@@ -123,7 +123,14 @@ function Install-WebView2Runtime {
         throw "Failed to extract WebView2 runtime archive"
     }
 
-    Copy-Item -LiteralPath (Join-Path $extractDir "*") -Destination $runtimeDir -Recurse -Force
+    $payloadRoot = $extractDir
+    $topLevelEntries = @(Get-ChildItem -LiteralPath $extractDir -Force)
+    if ($topLevelEntries.Count -eq 1 -and $topLevelEntries[0].PSIsContainer) {
+        $payloadRoot = $topLevelEntries[0].FullName
+    }
+    foreach ($entry in Get-ChildItem -LiteralPath $payloadRoot -Force) {
+        Copy-Item -LiteralPath $entry.FullName -Destination $runtimeDir -Recurse -Force
+    }
     Remove-PathIfExists -PathValue $extractDir
 
     foreach ($entry in $requiredFiles) {

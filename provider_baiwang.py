@@ -242,11 +242,17 @@ def infer_baiwang_download_kind(url="", content_type="", content_disposition="",
             str(filename or "").lower(),
         ]
     )
-    if "application/pdf" in combined or ".pdf" in combined or "wjgs=pdf" in combined:
+    if (
+        "application/pdf" in combined
+        or "text/pdf" in combined
+        or ".pdf" in combined
+        or "wjgs=pdf" in combined
+        or "formattype=pdf" in combined
+    ):
         return "pdf"
-    if "xml" in combined or "wjgs=xml" in combined:
+    if "xml" in combined or "wjgs=xml" in combined or "formattype=xml" in combined:
         return "xml"
-    if "ofd" in combined or "wjgs=ofd" in combined:
+    if "ofd" in combined or "wjgs=ofd" in combined or "formattype=ofd" in combined:
         return "ofd"
     return ""
 

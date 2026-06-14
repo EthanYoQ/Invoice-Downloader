@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import fitz  # PyMuPDF
 
@@ -335,6 +335,45 @@ class PDFConverter:
         fields = parse_baiwang_xml_fields(response.content) if kind == "xml" else {}
         return [self._describe_baiwang_artifact(artifact_path, kind, response.url, "direct_request", fields)], []
 
+    def _probe_baiwang_preview_api_artifacts(self, session, candidate_urls, artifact_prefix):
+        artifacts = []
+        logs = []
+        for url in candidate_urls:
+            parsed = urlparse(str(url or ""))
+            if "pis.baiwang.com" not in (parsed.hostname or "").lower():
+                continue
+            param = (parse_qs(parsed.query).get("param") or [""])[0].strip()
+            if not param:
+                continue
+            api_url = "https://pis.baiwang.com/bwmg/mix/bw/previewInvoiceQd"
+            try:
+                response = session.post(
+                    api_url,
+                    data=param.encode("utf-8"),
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                    timeout=20,
+                )
+                data = response.json()
+            except Exception as exc:
+                logs.append({"kind": "baiwang_preview_api_error", "url": api_url, "message": str(exc)})
+                continue
+            if not data.get("success"):
+                logs.append({"kind": "baiwang_preview_api_unsuccessful", "url": api_url, "message": data.get("message", "")})
+                continue
+            for fmt in ("XML", "PDF", "OFD"):
+                download_url = (
+                    "https://pis.baiwang.com/bwmg/mix/bw/downloadFormat"
+                    f"?param={quote(param)}&formatType={fmt}"
+                )
+                direct_artifacts, direct_logs = self._probe_direct_artifact(
+                    session,
+                    download_url,
+                    f"{artifact_prefix}_preview_api_{fmt.lower()}",
+                )
+                artifacts.extend(direct_artifacts)
+                logs.extend(direct_logs)
+        return artifacts, logs
+
     def _collect_dom_urls(self, page):
         urls = []
         try:
@@ -449,6 +488,66 @@ class PDFConverter:
             ], []
         finally:
             response.close()
+
+    def _probe_nuonuo_scan_invoice_artifacts(self, session, url, artifact_prefix):
+        artifacts = []
+        logs = []
+        try:
+            response = session.get(
+                url,
+                timeout=20,
+                allow_redirects=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+        except Exception as exc:
+            return [], [{"kind": "nuonuo_shortlink_error", "url": url, "message": str(exc)}]
+
+        final_url = getattr(response, "url", "") or url
+        query = parse_qs(urlparse(final_url).query)
+        param_list = (query.get("paramList") or [""])[0]
+        if not param_list:
+            logs.append({"kind": "nuonuo_missing_param_list", "url": final_url})
+            return artifacts, logs
+
+        endpoint = "https://nnfp.jss.com.cn/sapi/scan2/getIvcDetailShow.do"
+        if (query.get("isOuterPageReq") or [""])[0].lower() == "true":
+            endpoint = "https://nnfp.jss.com.cn/sapi/invoice/scan/IvcDetail.do"
+        payload = {
+            "paramList": param_list,
+            "code": (query.get("code") or [""])[0],
+            "aliView": (query.get("aliView") or [""])[0],
+            "invoiceDetailMiddleUri": "printQrcode",
+            "shortLinkSource": (query.get("shortLinkSource") or [""])[0],
+        }
+        try:
+            detail_response = session.post(endpoint, data=payload, timeout=20)
+            detail = detail_response.json()
+        except Exception as exc:
+            logs.append({"kind": "nuonuo_detail_api_error", "url": endpoint, "message": str(exc)})
+            return artifacts, logs
+
+        if detail.get("status") != "0000":
+            logs.append({"kind": "nuonuo_detail_api_unsuccessful", "url": endpoint, "message": detail.get("msg", "")})
+            return artifacts, logs
+
+        invoice_info = ((detail.get("data") or {}).get("invoiceSimpleVo") or {})
+        for key in ("xmlUrl", "url", "ofdDownloadUrl"):
+            target_url = str(invoice_info.get(key) or "").strip()
+            if not target_url:
+                continue
+            direct_artifacts, direct_logs = self._probe_direct_invoice_artifact(
+                session,
+                target_url,
+                f"{artifact_prefix}_nuonuo_{key.lower()}",
+            )
+            artifacts.extend(direct_artifacts)
+            logs.extend(direct_logs)
+        return artifacts, logs
 
     def _capture_direct_invoice_response_artifact(self, response, artifact_prefix, artifact_index, source_url):
         headers = self._response_headers(response)
@@ -678,6 +777,49 @@ class PDFConverter:
         ordered_candidate_urls = sorted(list(candidate_urls), key=self._baiwang_url_priority)
 
         self._require_requests()
+        with requests.Session() as session:
+            for index, url in enumerate(ordered_candidate_urls, start=1):
+                artifact_prefix = os.path.join(email_staging_path, f"baiwang_{index}")
+                api_artifacts, api_logs = self._probe_baiwang_preview_api_artifacts(
+                    session,
+                    [url],
+                    artifact_prefix,
+                )
+                artifacts.extend(api_artifacts)
+                network_logs.extend(api_logs)
+                direct_artifacts, direct_logs = self._probe_direct_artifact(session, url, artifact_prefix)
+                artifacts.extend(direct_artifacts)
+                network_logs.extend(direct_logs)
+                selected_artifact, _ = self._select_baiwang_recovery_result(artifacts, expected_fields)
+                if selected_artifact:
+                    recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
+                    recovery_meta["captured_network"] = network_logs[:200]
+                    recovery_meta["captured_artifacts"] = [
+                        {
+                            "path": artifact.get("path", ""),
+                            "kind": artifact.get("kind", ""),
+                            "source_url": artifact.get("source_url", ""),
+                            "download_mode": artifact.get("download_mode", ""),
+                            "wrapper_detected": artifact.get("wrapper_detected", False),
+                            "fields": artifact.get("fields", {}),
+                            "expected_match": artifact.get("expected_match"),
+                            "matched_on": artifact.get("matched_on", ""),
+                        }
+                        for artifact in artifacts
+                    ]
+                    recovery_meta.update(
+                        {
+                            "pdf_path": selected_artifact.get("path", ""),
+                            "download_mode": selected_artifact.get("download_mode", ""),
+                            "status": "downloaded",
+                            "reason_code": "",
+                            "failure_stage": "",
+                            "selected_fields": selected_artifact.get("fields", {}),
+                            "matched_on": selected_artifact.get("matched_on", ""),
+                        }
+                    )
+                    return recovery_meta
+
         self._require_playwright()
         with requests.Session() as session:
             with sync_playwright() as playwright:
@@ -851,6 +993,76 @@ class PDFConverter:
         seen_urls = set()
 
         self._require_requests()
+        with requests.Session() as session:
+            for index, url in enumerate(candidate_urls, start=1):
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                artifact_prefix = os.path.join(email_staging_path, f"direct_invoice_{index}")
+                if provider_family == "nuonuo_scan_invoice":
+                    nuonuo_artifacts, nuonuo_logs = self._probe_nuonuo_scan_invoice_artifacts(
+                        session,
+                        url,
+                        artifact_prefix,
+                    )
+                    artifacts.extend(nuonuo_artifacts)
+                    network_logs.extend(nuonuo_logs)
+                direct_artifacts, direct_logs = self._probe_direct_invoice_artifact(session, url, artifact_prefix)
+                artifacts.extend(direct_artifacts)
+                network_logs.extend(direct_logs)
+
+        selected_artifact, select_reason = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
+        if selected_artifact:
+            recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
+            recovery_meta["captured_network"] = network_logs[:200]
+            recovery_meta["captured_artifacts"] = [
+                {
+                    "path": artifact.get("path", ""),
+                    "kind": artifact.get("kind", ""),
+                    "source_url": artifact.get("source_url", ""),
+                    "resolved_url": artifact.get("resolved_url", ""),
+                    "download_mode": artifact.get("download_mode", ""),
+                    "fields": artifact.get("fields", {}),
+                    "expected_match": artifact.get("expected_match"),
+                    "matched_on": artifact.get("matched_on", ""),
+                }
+                for artifact in artifacts
+            ]
+            recovery_meta.update(
+                {
+                    "resolved_url": selected_artifact.get("resolved_url", ""),
+                    "resolved_urls": [selected_artifact.get("resolved_url", "")] if selected_artifact.get("resolved_url") else recovery_meta["resolved_urls"],
+                    "pdf_path": selected_artifact.get("path", ""),
+                    "download_mode": selected_artifact.get("download_mode", ""),
+                    "status": "downloaded",
+                    "reason_code": "",
+                    "failure_stage": "",
+                    "selected_fields": selected_artifact.get("fields", {}),
+                    "matched_on": selected_artifact.get("matched_on", ""),
+                }
+            )
+            return recovery_meta
+        if provider_family != "bwjf_signed_invoice":
+            recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
+            recovery_meta["captured_network"] = network_logs[:200]
+            recovery_meta["captured_artifacts"] = [
+                {
+                    "path": artifact.get("path", ""),
+                    "kind": artifact.get("kind", ""),
+                    "source_url": artifact.get("source_url", ""),
+                    "resolved_url": artifact.get("resolved_url", ""),
+                    "download_mode": artifact.get("download_mode", ""),
+                    "fields": artifact.get("fields", {}),
+                    "expected_match": artifact.get("expected_match"),
+                    "matched_on": artifact.get("matched_on", ""),
+                }
+                for artifact in artifacts
+            ]
+            recovery_meta["reason_code"] = f"DIRECT_INVOICE_{select_reason.upper()}"
+            recovery_meta["failure_stage"] = "provider_recovery"
+            return recovery_meta
+
+        seen_urls = set()
         self._require_playwright()
         with requests.Session() as session:
             with sync_playwright() as playwright:

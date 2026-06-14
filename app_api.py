@@ -14,6 +14,7 @@ from company_rules import DEFAULT_COMPANY, classify_purchaser_relation
 from document_types import MANUAL_REVIEW_FOLDER, get_archive_folder, is_exempt_type
 from email_channel import resolve_channel
 from frontend_run_context import ensure_run_context_dirs, load_run_context, serialize_run_context
+from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
 from user_settings import (
     UserSettingsStore,
     ensure_directory,
@@ -24,8 +25,129 @@ from user_settings import (
 )
 
 
+def build_processing_history_key(info, file_name, pdf_path):
+    import hashlib
+
+    info = info or {}
+    legacy_key = hashlib.md5(
+        f"{info.get('subject', '')}_{file_name}_{info.get('tier', 0)}".encode("utf-8")
+    ).hexdigest()
+    if info.get("is_url", False):
+        expected = info.get("provider_expected_fields") or {}
+        invoice_number = str(expected.get("invoice_number") or expected.get("InvoiceNumber") or "").strip()
+        provider_family = str(info.get("provider_family") or "").strip()
+        email_id = str(info.get("email_id") or "").strip()
+        source_url = str(info.get("source_url") or pdf_path or file_name or "").strip()
+        if provider_family or invoice_number or email_id or source_url:
+            parts = [
+                "url",
+                provider_family or "generic",
+                email_id,
+                invoice_number,
+                source_url,
+            ]
+            return ":".join(parts)
+        return f"url:{legacy_key}"
+
+    try:
+        with open(pdf_path, "rb") as source_file:
+            file_digest = hashlib.sha256(source_file.read()).hexdigest()
+        return f"att:{file_digest}"
+    except Exception:
+        return f"att-legacy:{legacy_key}"
+
+
 class QuotaExceededError(RuntimeError):
     pass
+
+
+def classify_cwt_document_type(info_json, info, file_name, local_cits_fast_path=False):
+    doc_type = str((info_json or {}).get("Type", ""))
+    seller = str((info_json or {}).get("Seller", ""))
+    reason_codes = []
+    file_text = str(file_name or "")
+    file_text_lower = file_text.lower()
+    subject_lower = str((info or {}).get("subject", "")).lower()
+
+    if local_cits_fast_path and doc_type in {"机票", "住宿水单", "非目标公司发票"}:
+        if doc_type == "住宿水单":
+            info_json["_is_folio"] = True
+        reason_codes.append("PRESERVED_LOCAL_CITS_GBT_TYPE")
+        return doc_type, reason_codes
+
+    if "取消" in file_text:
+        info_json["_cwt_cancellation"] = True
+        reason_codes.append("CWT_HOTEL_CANCELLATION")
+        return "住宿确认单", reason_codes
+    if any(kw in seller for kw in ["GBT Travel"]) or "scct" in file_text_lower or "scct" in subject_lower:
+        reason_codes.append("CLASSIFIED_AS_CWT_SERVICE_FEE")
+        return "差旅服务费", reason_codes
+    if any(kw in file_text_lower for kw in ["flight", "air", "机票", "航班", "行程单 - 机票"]):
+        reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT_BY_FILENAME")
+        return "航班行程单", reason_codes
+    if any(kw in doc_type.lower() for kw in ["机票", "航班", "flight", "air"]):
+        reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT")
+        return "航班行程单", reason_codes
+    if any(kw in file_text_lower for kw in ["酒店", "行程单 - 酒店"]):
+        reason_codes.append("CLASSIFIED_AS_CWT_HOTEL_BY_FILENAME")
+        return "住宿确认单", reason_codes
+    reason_codes.append("CLASSIFIED_AS_CWT_HOTEL")
+    return "住宿确认单", reason_codes
+
+
+def normalize_document_type_for_archive(info_json, file_name, cwt_classified=False):
+    doc_type = str((info_json or {}).get("Type", ""))
+    seller = str((info_json or {}).get("Seller", ""))
+    reason_codes = []
+    if cwt_classified:
+        return doc_type, reason_codes
+    if doc_type == "非目标公司发票":
+        reason_codes.append("PRESERVED_NON_TARGET_COMPANY")
+        return doc_type, reason_codes
+
+    file_text = str(file_name or "")
+    file_text_lower = file_text.lower()
+    doc_type_lower = doc_type.lower()
+    folio_signal = (
+        any(kw in doc_type for kw in ["水单", "账单", "结账单", "住宿明细"])
+        or any(kw in doc_type_lower for kw in ["folio"])
+        or any(kw in file_text for kw in ["水单", "结账单", "账单", "住宿明细"])
+        or any(kw in file_text_lower for kw in ["folio"])
+    )
+
+    if folio_signal:
+        doc_type = "住宿水单"
+        info_json["_is_folio"] = True
+        reason_codes.append("CLASSIFIED_AS_HOTEL_FOLIO")
+    elif any(kw in doc_type for kw in ["行程单", "报销单"]) or any(kw in file_text for kw in ["行程单", "行程报销单", "报销单"]):
+        _is_flight = (
+            "机票" in file_text_lower
+            or any(kw in doc_type_lower for kw in ["机票", "航班", "flight", "air"])
+            or any(kw in seller for kw in ["航空", "Airlines", "Air China", "东航", "南航", "国航"])
+        )
+        if _is_flight:
+            doc_type = "航班行程单"
+            reason_codes.append("CLASSIFIED_AS_FLIGHT_ITINERARY")
+        else:
+            doc_type = "打车"
+            info_json["_is_itinerary"] = True
+            reason_codes.append("CLASSIFIED_AS_RIDE_ITINERARY")
+    elif any(kw in doc_type for kw in ["打车", "出租", "滴滴", "高德", "约车"]):
+        doc_type = "打车"
+        reason_codes.append("CLASSIFIED_AS_RIDE_BY_TYPE")
+    elif any(kw in seller for kw in ["滴滴", "高德", "约车", "盛智", "畅行"]):
+        doc_type = "打车"
+        reason_codes.append("CLASSIFIED_AS_RIDE_BY_SELLER")
+    elif any(kw in doc_type for kw in ["火车", "高铁", "铁路"]):
+        doc_type = "火车票"
+        reason_codes.append("CLASSIFIED_AS_TRAIN_BY_TYPE")
+    elif "住宿" in doc_type:
+        doc_type = "住宿发票"
+        reason_codes.append("CLASSIFIED_AS_HOTEL_INVOICE")
+    else:
+        reason_codes.append("CLASSIFICATION_FROM_MODEL_TYPE")
+
+    return doc_type, reason_codes
 
 
 class _FallbackDocumentTraceStore:
@@ -788,6 +910,14 @@ class InvoiceAppAPI:
 
         return re.sub(r"\s+", "", str(value or "")).strip().lower()
 
+    @staticmethod
+    def _compact_entity_text(value):
+        import re
+        import unicodedata
+
+        text = unicodedata.normalize("NFKC", str(value or ""))
+        return re.sub(r"\s+", "", text).strip().lower()
+
     def _extract_pdf_preview_text(self, pdf_path, max_pages=2):
         if not pdf_path or not str(pdf_path).lower().endswith(".pdf") or not os.path.exists(pdf_path):
             return ""
@@ -897,7 +1027,7 @@ class InvoiceAppAPI:
             or recovered_fields.get("invoice_number")
             or ""
         ).strip()
-        seller = self._compact_text(
+        seller = self._compact_entity_text(
             normalized_snapshot.get("Seller")
             or info_json.get("Seller")
             or recovered_fields.get("seller")
@@ -920,7 +1050,7 @@ class InvoiceAppAPI:
         if expected_number:
             return invoice_number == expected_number, "invoice_number"
 
-        expected_seller = self._compact_text(expected.get("seller") or "")
+        expected_seller = self._compact_entity_text(expected.get("seller") or "")
         expected_amount = str(expected.get("amount") or "").strip()
         expected_date = str(expected.get("invoice_date") or "").strip()
 
@@ -973,7 +1103,7 @@ class InvoiceAppAPI:
                 })
                 return result
 
-        if provider_family in {"chinatax_direct_invoice", "bwjf_signed_invoice"}:
+        if provider_family in DIRECT_INVOICE_FAMILIES:
             invoice_number = str(
                 normalized_snapshot.get("InvoiceNumber")
                 or info_json.get("InvoiceNumber")
@@ -992,13 +1122,13 @@ class InvoiceAppAPI:
                 })
                 return result
 
-            seller = self._compact_text(
+            seller = self._compact_entity_text(
                 normalized_snapshot.get("Seller")
                 or info_json.get("Seller")
                 or recovered_fields.get("seller")
                 or ""
             )
-            expected_seller = self._compact_text(expected_fields.get("seller") or "")
+            expected_seller = self._compact_entity_text(expected_fields.get("seller") or "")
             if expected_seller and seller and expected_seller not in seller and seller not in expected_seller:
                 result.update({
                     "accepted": False,
@@ -1952,20 +2082,7 @@ class InvoiceAppAPI:
             trace_store.set_fields(document_id, combine_result=payload)
 
         def _build_history_key(info, file_name, pdf_path):
-            import hashlib
-
-            legacy_key = hashlib.md5(
-                f"{info.get('subject', '')}_{file_name}_{info.get('tier', 0)}".encode("utf-8")
-            ).hexdigest()
-            if info.get("is_url", False):
-                return f"url:{legacy_key}"
-
-            try:
-                with open(pdf_path, "rb") as source_file:
-                    file_digest = hashlib.sha256(source_file.read()).hexdigest()
-                return f"att:{file_digest}"
-            except Exception:
-                return f"att-legacy:{legacy_key}"
+            return build_processing_history_key(info, file_name, pdf_path)
 
         def _finalize_trace_defaults():
             for record in trace_store.iter_records():
@@ -2706,7 +2823,16 @@ class InvoiceAppAPI:
                     # Step C: LLM 信息提取
                     extraction_started_at = time.perf_counter()
                     try:
-                        info_json = extractor.extract_info_via_llm(base64_img, custom_rules=rules_text, pdf_path=pdf_path)
+                        info_json = extractor.extract_info_via_llm(
+                            base64_img,
+                            custom_rules=rules_text,
+                            pdf_path=pdf_path,
+                            document_context={
+                                **(info or {}),
+                                "search_since_date": since_date or "",
+                                "search_before_date": before_date or "",
+                            },
+                        )
                     except Exception as extraction_error:
                         quota_message = self._resolve_quota_message(extraction_error)
                         if quota_message:
@@ -2998,63 +3124,19 @@ class InvoiceAppAPI:
                         or any(kw in file_name.lower() for kw in ["citsgbt", "国旅运通", "cwt", "scct"])
                     )
                     if _is_cwt:
-                        if "取消" in file_name:
-                            doc_type = "住宿确认单"
-                            classification_reason_codes.append("CWT_HOTEL_CANCELLATION")
-                            info_json["_cwt_cancellation"] = True
-                        # SCCT/GBT Travel 发票 → 差旅服务费（最高优先级，不受 LLM type 干扰）
-                        elif any(kw in seller for kw in ["GBT Travel"]) or "scct" in file_name.lower():
-                            doc_type = "差旅服务费"
-                            classification_reason_codes.append("CLASSIFIED_AS_CWT_SERVICE_FEE")
-                        elif any(kw in file_name.lower() for kw in ["flight", "air", "机票", "航班", "行程单 - 机票"]):
-                            doc_type = "航班行程单"
-                            classification_reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT_BY_FILENAME")
-                        elif any(kw in doc_type.lower() for kw in ["机票", "航班", "flight", "air"]):
-                            doc_type = "航班行程单"
-                            classification_reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT")
-                        elif any(kw in file_name.lower() for kw in ["酒店", "行程单 - 酒店"]):
-                            doc_type = "住宿确认单"
-                            classification_reason_codes.append("CLASSIFIED_AS_CWT_HOTEL_BY_FILENAME")
-                        else:
-                            doc_type = "住宿确认单"
-                            classification_reason_codes.append("CLASSIFIED_AS_CWT_HOTEL")
-                    # 1b. 行程单识别 — 区分航班行程单 vs 打车行程单
-                    elif any(kw in doc_type for kw in ["行程单", "报销单"]) or any(kw in file_name for kw in ["行程单", "行程报销单", "报销单"]):
-                        # "行程单 - 机票" 或 doc_type/seller 含航空关键词 → 航班行程单
-                        _fn_lower = file_name.lower()
-                        _is_flight = (
-                            "机票" in _fn_lower
-                            or any(kw in doc_type.lower() for kw in ["机票", "航班", "flight", "air"])
-                            or any(kw in seller for kw in ["航空", "Airlines", "Air China", "东航", "南航", "国航"])
+                        doc_type, cwt_reason_codes = classify_cwt_document_type(
+                            info_json,
+                            info,
+                            file_name,
+                            local_cits_fast_path=(
+                                extraction_trace.get("engine") == "local_cits_gbt_pdf"
+                                or extraction_trace.get("reason_code") == "LOCAL_CITS_GBT_PDF_FAST_PATH"
+                            ),
                         )
-                        if _is_flight:
-                            doc_type = "航班行程单"
-                            classification_reason_codes.append("CLASSIFIED_AS_FLIGHT_ITINERARY")
-                        else:
-                            doc_type = "打车"
-                            info_json["_is_itinerary"] = True
-                            classification_reason_codes.append("CLASSIFIED_AS_RIDE_ITINERARY")
-                    # 1c. 打车发票 (LLM Type 或 Seller 中含网约车关键词)
-                    elif any(kw in doc_type for kw in ["打车", "出租", "滴滴", "高德", "约车"]):
-                        doc_type = "打车"
-                        classification_reason_codes.append("CLASSIFIED_AS_RIDE_BY_TYPE")
-                    elif any(kw in seller for kw in ["滴滴", "高德", "约车", "盛智", "畅行"]):
-                        doc_type = "打车"  # Seller 兜底: LLM Type 不准时用商户名补救
-                        classification_reason_codes.append("CLASSIFIED_AS_RIDE_BY_SELLER")
-                    # 1d. 火车票
-                    elif any(kw in doc_type for kw in ["火车", "高铁", "铁路"]):
-                        doc_type = "火车票"
-                        classification_reason_codes.append("CLASSIFIED_AS_TRAIN_BY_TYPE")
-                    # 1e. 水单 / 结账单 / 住宿明细
-                    elif any(kw in doc_type for kw in ["水单", "Folio", "账单", "folio", "结账单", "住宿明细"]):
-                        doc_type = "住宿水单"
-                        info_json["_is_folio"] = True
-                        classification_reason_codes.append("CLASSIFIED_AS_HOTEL_FOLIO")
-                    elif "住宿" in doc_type:
-                        doc_type = "住宿发票"
-                        classification_reason_codes.append("CLASSIFIED_AS_HOTEL_INVOICE")
+                        classification_reason_codes.extend(cwt_reason_codes)
                     else:
-                        classification_reason_codes.append("CLASSIFICATION_FROM_MODEL_TYPE")
+                        doc_type, normalized_reason_codes = normalize_document_type_for_archive(info_json, file_name)
+                        classification_reason_codes.extend(normalized_reason_codes)
                     if self._compact_text(doc_type) in {
                         self._compact_text("\u673a\u7968"),
                         self._compact_text("\u822a\u73ed\u884c\u7a0b\u5355"),
