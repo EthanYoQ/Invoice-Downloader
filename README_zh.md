@@ -1,4 +1,4 @@
-# InvoiceFlowAI / Invoice Downloader — 邮箱电子发票自动下载、OCR 识别与 Excel 报销汇总
+# InvoiceFlowAI / 发票助手 / Invoice Downloader — 邮箱电子发票自动下载、OCR 识别与 Excel 报销汇总
 
 <div align="center">
 
@@ -17,9 +17,9 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
-**连接 QQ 邮箱 / 163 邮箱 → 自动下载电子发票 → AI OCR 识别 → 本地分类归档 → 生成 Excel 报销汇总**
+**个人职场报销用的 Windows 发票助手 / 发票管家：连接 QQ 邮箱 / 163 邮箱 → 自动下载 PDF/OFD/XML 电子发票和百望云发票链接 → AI OCR 识别 → 本地分类归档 → 生成 Excel 报销汇总**
 
-适合这些搜索和需求：**QQ邮箱发票自动下载**、**163邮箱电子发票归档**、**发票OCR识别**、**Excel报销汇总**、**Windows发票整理工具**。
+适合这些搜索和需求：**发票助手**、**发票管家**、**报销助手**、**电子发票归档**、**发票报销**、**QQ邮箱发票自动下载**、**163邮箱电子发票归档**、**OFD发票下载**、**百望云发票下载**、**Windows发票管理**。
 
 下载：[最新版 Windows 免安装包](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
 

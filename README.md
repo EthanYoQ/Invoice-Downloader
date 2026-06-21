@@ -1,4 +1,4 @@
-# InvoiceFlowAI / Invoice Downloader — Email Invoice OCR to Excel
+# InvoiceFlowAI / Invoice Assistant / Invoice Downloader — Email E-Invoice OCR to Excel
 
 <div align="center">
 
@@ -17,9 +17,9 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
-**Connect QQ Mail / 163 Mail → automatically download e-invoices → AI OCR recognition → local archive → Excel reimbursement summary**
+**A Windows invoice assistant for personal work reimbursement: connect QQ Mail / 163 Mail → download PDF/OFD/XML e-invoices and Baiwang invoice links → AI OCR recognition → local archive → Excel reimbursement summary**
 
-Chinese search intent: **QQ邮箱发票自动下载**, **163邮箱电子发票归档**, **发票OCR识别**, **Excel报销汇总**, **Windows发票整理工具**.
+Chinese search intent: **发票助手**, **发票管家**, **报销助手**, **电子发票归档**, **发票报销**, **QQ邮箱发票自动下载**, **163邮箱电子发票归档**, **OFD发票下载**, **百望云发票下载**, **Windows发票管理**.
 
 Download: [latest Windows portable release](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
 
