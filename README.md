@@ -1,4 +1,4 @@
-# InvoiceFlowAI — AI-Driven Automatic Invoice Archiving Assistant
+# InvoiceFlowAI / Invoice Downloader — Email Invoice OCR to Excel
 
 <div align="center">
 
@@ -17,9 +17,13 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
-**Connect your QQ / 163 mailbox → AI fully automatic invoice scanning → Archive by category locally → Generate Excel summary**
+**Connect QQ Mail / 163 Mail → automatically download e-invoices → AI OCR recognition → local archive → Excel reimbursement summary**
 
-*The entire process requires no manual intervention; all data is stored locally with zero privacy risk*
+Chinese search intent: **QQ邮箱发票自动下载**, **163邮箱电子发票归档**, **发票OCR识别**, **Excel报销汇总**, **Windows发票整理工具**.
+
+Download: [latest Windows portable release](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
+
+*Email and invoice files are processed locally. If you enable GLM OCR / vision recognition, invoice images are sent to your configured model provider for extraction.*
 
 </div>
 

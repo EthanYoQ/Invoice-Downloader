@@ -1,4 +1,4 @@
-# InvoiceFlowAI — AI 驱动的发票自动归档助手
+# InvoiceFlowAI / Invoice Downloader — 邮箱电子发票自动下载、OCR 识别与 Excel 报销汇总
 
 <div align="center">
 
@@ -17,9 +17,13 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
-**连接你的 QQ / 163 邮箱 → AI 全自动扫描发票 → 按类型归档到本地 → 生成 Excel 汇总表**
+**连接 QQ 邮箱 / 163 邮箱 → 自动下载电子发票 → AI OCR 识别 → 本地分类归档 → 生成 Excel 报销汇总**
 
-*整个过程无需人工干预，所有数据仅保存在本地，零隐私风险*
+适合这些搜索和需求：**QQ邮箱发票自动下载**、**163邮箱电子发票归档**、**发票OCR识别**、**Excel报销汇总**、**Windows发票整理工具**。
+
+下载：[最新版 Windows 免安装包](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
+
+*邮件和发票文件在本地处理。启用 GLM OCR / 视觉识别时，发票图片会发送到你配置的模型服务商用于提取。*
 
 </div>
 
