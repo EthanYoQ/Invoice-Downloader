@@ -18,6 +18,7 @@ manual_frontend_runs/
 manual_program_runs/
 test_dataset/
 staging/
+tmp/
 .codegraph/
 .codex/
 .runtime/
@@ -37,3 +38,4 @@ Thumbs.db
 
 # Local worktree metadata
 .claude/worktrees/
+.gstack/

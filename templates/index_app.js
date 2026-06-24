@@ -92,6 +92,9 @@ const UI_COPY = {
         minimize: "最小化窗口",
         minimizing: "正在最小化...",
         minimizeFailed: "最小化窗口失败，请稍后重试。",
+        maximize: "最大化窗口",
+        maximizing: "正在最大化...",
+        maximizeFailed: "最大化窗口失败，请稍后重试。",
         windowSubtitle: "桌面工作区",
     },
     navigation: [
@@ -582,6 +585,7 @@ function DateField({ label, value, onChange, disabled = false }) {
 function AppWindowChrome({ active }) {
     const [closing, setClosing] = useState(false);
     const [minimizing, setMinimizing] = useState(false);
+    const [maximizing, setMaximizing] = useState(false);
     const activeItem = UI_COPY.navigation.find((item) => item.key === active);
 
     async function handleMinimize() {
@@ -593,8 +597,24 @@ function AppWindowChrome({ active }) {
                 throw new Error((result && result.message) || UI_COPY.shell.minimizeFailed);
             }
         } catch (error) {
-            setMinimizing(false);
             window.alert(error.message || UI_COPY.shell.minimizeFailed);
+        } finally {
+            setMinimizing(false);
+        }
+    }
+
+    async function handleMaximize() {
+        if (maximizing) return;
+        setMaximizing(true);
+        try {
+            const result = await callApi("maximize_window");
+            if (!result || !result.success) {
+                throw new Error((result && result.message) || UI_COPY.shell.maximizeFailed);
+            }
+        } catch (error) {
+            window.alert(error.message || UI_COPY.shell.maximizeFailed);
+        } finally {
+            setMaximizing(false);
         }
     }
 
@@ -625,7 +645,7 @@ function AppWindowChrome({ active }) {
                     type="button"
                     className="window-traffic-button window-traffic-button--minimize"
                     onClick={handleMinimize}
-                    disabled={minimizing || closing}
+                    disabled={minimizing || maximizing || closing}
                     aria-label={minimizing ? UI_COPY.shell.minimizing : UI_COPY.shell.minimize}
                     title={minimizing ? UI_COPY.shell.minimizing : UI_COPY.shell.minimize}
                 >
@@ -633,9 +653,19 @@ function AppWindowChrome({ active }) {
                 </button>
                 <button
                     type="button"
+                    className="window-traffic-button window-traffic-button--maximize"
+                    onClick={handleMaximize}
+                    disabled={minimizing || maximizing || closing}
+                    aria-label={maximizing ? UI_COPY.shell.maximizing : UI_COPY.shell.maximize}
+                    title={maximizing ? UI_COPY.shell.maximizing : UI_COPY.shell.maximize}
+                >
+                    <span className="window-traffic-button__glyph"></span>
+                </button>
+                <button
+                    type="button"
                     className="window-traffic-button window-traffic-button--close"
                     onClick={handleClose}
-                    disabled={closing}
+                    disabled={minimizing || maximizing || closing}
                     aria-label={closing ? UI_COPY.shell.closing : UI_COPY.shell.close}
                     title={closing ? UI_COPY.shell.closing : UI_COPY.shell.close}
                 >

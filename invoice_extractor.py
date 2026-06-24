@@ -10,7 +10,7 @@ import unicodedata
 import fitz  # PyMuPDF
 import requests
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
-from document_types import MANUAL_REVIEW_FOLDER
+from document_types import MANUAL_REVIEW_FOLDER, get_document_type_names, normalize_document_type
 from email_body_receipts import CANONICAL_MARKER
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -39,6 +39,14 @@ class InvoiceExtractor:
         self.last_route_trace = {}
         self.last_timing_trace = {}
         os.makedirs(self.output_dir, exist_ok=True)
+
+    @staticmethod
+    def _valid_types():
+        return get_document_type_names()
+
+    @staticmethod
+    def _normalize_type_from_text(value):
+        return normalize_document_type(value)
 
 
     def pdf_to_base64_image(self, pdf_path):
@@ -1153,6 +1161,7 @@ class InvoiceExtractor:
         if isinstance(base64_images, str):
             base64_images = [base64_images]
             
+        type_choices = repr(self._valid_types())
         prompt_text = """
         请从以下提取出的票据文本中提取关键信息，并严格且只能输出一个合法的 JSON 对象。绝对不要输出任何 markdown 标记（如 ```json），直接返回大括号 {} 包裹的内容。
         
@@ -1171,13 +1180,13 @@ class InvoiceExtractor:
             "Amount": "遵循金额强约束规则提取的数字，保留两位小数。如145.00或-145.00，无金额则返回0.00",
             "InvoiceCode": "发票代码(如有则提供，否则返回空字符串\"\")",
             "InvoiceNumber": "发票号码(如有则提供，否则返回空字符串\"\")",
-            "Type": "必须从 ['打车', '行程单', '火车票', '机票', '住宿发票', '住宿水单', '餐饮', '过路费', '其他'] 中选择。注意：带税务局监制章的选'住宿发票'；酒店打印的消费明细/宾客账单选'住宿水单'。",
+            "Type": "必须从 {TYPE_CHOICES} 中选择。注意：带税务局监制章的选'住宿发票'；酒店打印的消费明细/宾客账单选'住宿水单'。",
             "category": "结合整体信息的归档分类短词，如'打车'、'火车票'、'餐饮'等",
             "Departure_Date": "仅当 Type 为火车票时提供，格式如同Date，其他为空",
             "Departure_City": "仅当 Type 为火车票时提供。遵循火车票字段兜底规则，模糊则填'未知'",
             "Destination_City": "仅当 Type 为火车票时提供。遵循火车票字段兜底规则，模糊则填'未知'"
         }
-        """
+        """.replace("{TYPE_CHOICES}", type_choices)
         
         if custom_rules and len(custom_rules.strip()) > 0:
             prompt_text += f"\n此外要求：\n{custom_rules}\n"
@@ -1200,19 +1209,7 @@ class InvoiceExtractor:
                 return {"Type": "解析失败", "Date": "未知", "Seller": "无法读取商户", "Amount": "0.00"}
             
             # Type constraint validation heuristic fallback
-            valid_types = ['打车', '行程单', '火车票', '机票', '住宿', '餐饮', '过路费', '定额发票', '其他']
-            if result.get("Type") not in valid_types:
-                t_str = str(result.get("Type", ""))
-                if "火车" in t_str or "高铁" in t_str:
-                    result["Type"] = "火车票"
-                elif "打车" in t_str or "滴滴" in t_str or "出租" in t_str:
-                    result["Type"] = "打车"
-                elif "餐饮" in t_str or "餐" in t_str:
-                    result["Type"] = "餐饮"
-                elif "宿" in t_str or "酒店" in t_str:
-                    result["Type"] = "住宿"
-                else:
-                    result["Type"] = "其他"
+            result["Type"] = self._normalize_type_from_text(result.get("Type", ""))
                     
             # 强化兜底：不再直接因为缺少 Date/Seller/Amount 就报错抛弃，而是填入未知并放行。
             # 分类白名单拦截网或者 Manual_Check 机制会自然处理这些"半残"发票。

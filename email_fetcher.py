@@ -421,62 +421,8 @@ def _should_drop_baiwang_wrapper_url(url, *, sender_addr="", raw_attachment_exts
     return has_pdf and has_companion
 
 
-def _compact_provider_text(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def _normalize_provider_token(value):
-    return re.sub(r"\s+", "", str(value or "")).strip()
-
-
-def _normalize_provider_amount(value):
-    match = re.search(r"(\d+\.\d{2})", str(value or ""))
-    return match.group(1) if match else ""
-
-
-def _normalize_provider_date(value):
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    match = re.search(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text)
-    if not match:
-        return ""
-    return f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
-
-
 def extract_baiwang_email_fields(body_text):
     return extract_baiwang_email_fields_helper(body_text)
-    result = {
-        "seller": "",
-        "purchaser": "",
-        "amount": "",
-        "invoice_date": "",
-        "invoice_number": "",
-    }
-    if not compact:
-        return result
-
-    seller_match = re.search(r"(?:用户，您好[:：]\s*|您好[:：]\s*)(.+?)为您开具了电子发票", compact)
-    if seller_match:
-        result["seller"] = _normalize_provider_token(seller_match.group(1))
-
-    purchaser_match = re.search(r"购买方名称\s*([^\s]+)", compact)
-    if purchaser_match:
-        result["purchaser"] = _normalize_provider_token(purchaser_match.group(1))
-
-    amount_match = re.search(r"(?:发票金额|价税合计)\s*([0-9]+\.[0-9]{2})", compact)
-    if amount_match:
-        result["amount"] = _normalize_provider_amount(amount_match.group(1))
-
-    date_match = re.search(r"开票日期\s*(20\d{2}[-/年]\d{1,2}[-/月]\d{1,2})", compact)
-    if date_match:
-        result["invoice_date"] = _normalize_provider_date(date_match.group(1))
-
-    number_match = re.search(r"发票号码\s*([0-9]{8,})", compact)
-    if number_match:
-        result["invoice_number"] = number_match.group(1)
-
-    return {key: value for key, value in result.items() if value}
 
 
 def _detect_provider_family(url, *, sender_addr="", subject=""):

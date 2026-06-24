@@ -9,6 +9,16 @@ import time
 import uuid
 from pathlib import Path
 
+from archive_pairing import (
+    build_hotel_pair_renames,
+    build_ride_pair_renames,
+    is_hotel_folio_filename,
+    is_hotel_order_filename,
+    is_ride_itinerary_filename,
+    match_hotel_pairs,
+    match_ride_pairs,
+    parse_archived_filename,
+)
 from build_identity import load_build_identity
 from company_rules import DEFAULT_COMPANY, classify_purchaser_relation
 from document_types import MANUAL_REVIEW_FOLDER, get_archive_folder, is_exempt_type
@@ -3733,15 +3743,6 @@ class InvoiceAppAPI:
             # --- PHASE 2: 票据撮合与交替重命名 ---
             self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": "开始执行发票↔行程单/水单撮合..."})
             
-            def _parse_archived_filename(filename):
-                """从归档文件名解析元数据: 日期_类型_金额_商户.ext 或 日期-出发-到达-火车票.ext"""
-                import re
-                name, ext = os.path.splitext(filename)
-                parts = name.split("_")
-                if len(parts) >= 4:
-                    return {"date": parts[0], "type": parts[1], "amount": parts[2], "seller": "_".join(parts[3:]), "ext": ext}
-                return {"date": parts[0] if parts else "", "type": "", "amount": "", "seller": "", "ext": ext}
-            
             def _reconcile_ride_documents(ride_folder_path):
                 """打车文件夹内的发票↔行程单撮合 + 交替重命名"""
                 if not os.path.isdir(ride_folder_path):
@@ -3754,14 +3755,13 @@ class InvoiceAppAPI:
                     fpath = os.path.join(ride_folder_path, fname)
                     if not os.path.isfile(fpath):
                         continue
-                    meta = _parse_archived_filename(fname)
+                    meta = parse_archived_filename(fname)
                     meta["path"] = fpath
                     meta["filename"] = fname
                     meta["document_id"] = trace_store.get_document_id_by_archive_target(fpath)
                     
                     # 判断是发票还是行程单
-                    is_itn = any(kw in fname for kw in ["行程单", "行程报销单", "报销单"])
-                    if is_itn:
+                    if is_ride_itinerary_filename(fname):
                         itineraries.append(meta)
                         _record_combine_candidate(meta["document_id"], "ride", "itinerary", meta)
                     else:
@@ -3780,58 +3780,17 @@ class InvoiceAppAPI:
                     self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-gray-400", "msg": f"打车目录: 发票{len(invoices)}张, 行程单{len(itineraries)}张, 无法撮合"})
                     return
                 
-                # 联合主键匹配 (日期 + 金额, 含 1.03 税务容差)
-                matched = []
-                used_itn = set()
-                
-                for inv in invoices:
-                    try:
-                        inv_amt = float(inv["amount"])
-                    except (ValueError, TypeError):
-                        continue
-                    inv_date = inv["date"]
-                    
-                    for j, itn in enumerate(itineraries):
-                        if j in used_itn:
-                            continue
-                        try:
-                            itn_amt = float(itn["amount"])
-                        except (ValueError, TypeError):
-                            continue
-                        itn_date = itn["date"]
-                        
-                        # 金额匹配: 精确匹配 或 发票*1.03 ≈ 行程单 (税务容差)
-                        # 注意: 打车发票是月末集中开具, 日期与行程单不同, 不做日期约束
-                        if (abs(inv_amt - itn_amt) < 0.01 or 
-                            abs(inv_amt * 1.03 - itn_amt) < 0.50 or
-                            abs(itn_amt * 1.03 - inv_amt) < 0.50):
-                            matched.append((inv, itn))
-                            used_itn.add(j)
-                            break
+                # 金额匹配: 精确匹配或 1.03 税务容差；打车月末集中开票，不做日期约束。
+                matched = match_ride_pairs(invoices, itineraries)
                 
                 # 交替重命名
                 for idx, (inv, itn) in enumerate(matched, 1):
                     inv_document_id = inv.get("document_id")
                     itn_document_id = itn.get("document_id")
                     try:
-                        mmdd = inv["date"][4:8] if len(inv["date"]) >= 8 else inv["date"]
-                        # 以行程单含税金额为基准
-                        try:
-                            base_amount = f"{float(itn['amount']):.2f}"
-                        except (ValueError, TypeError):
-                            base_amount = itn["amount"]
-                        
-                        # 判断平台 (滴滴 vs 高德)
-                        platform = "滴滴"
-                        if any(kw in inv["filename"] for kw in ["高德", "约车", "盛智"]):
-                            platform = "高德"
-                        if any(kw in itn["filename"] for kw in ["高德", "约车"]):
-                            platform = "高德"
-                        
-                        inv_ext = inv["ext"]
-                        itn_ext = itn["ext"]
-                        inv_new = f"{mmdd}-{platform}-{idx:02d}-发票_{base_amount}元{inv_ext}"
-                        itn_new = f"{mmdd}-{platform}-{idx:02d}-行程单_{base_amount}元{itn_ext}"
+                        rename = build_ride_pair_renames(inv, itn, idx)
+                        inv_new = rename.invoice_filename
+                        itn_new = rename.supporting_filename
                         
                         inv_new_path = os.path.join(ride_folder_path, inv_new)
                         itn_new_path = os.path.join(ride_folder_path, itn_new)
@@ -3859,7 +3818,7 @@ class InvoiceAppAPI:
                             final_filename=itn_new,
                         )
                         
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": f"✅ {platform}配对 #{idx}: {inv_new} ↔ {itn_new}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": f"✅ {rename.pair_label}配对 #{idx}: {inv_new} ↔ {itn_new}"})
                     except Exception as e:
                         _record_combine_result(
                             inv_document_id,
@@ -3925,14 +3884,13 @@ class InvoiceAppAPI:
                     fpath = os.path.join(hotel_folder_path, fname)
                     if not os.path.isfile(fpath):
                         continue
-                    meta = _parse_archived_filename(fname)
+                    meta = parse_archived_filename(fname)
                     meta["path"] = fpath
                     meta["filename"] = fname
                     meta["document_id"] = trace_store.get_document_id_by_archive_target(fpath)
                     
                     # 住宿确认单/航班行程单不参与发票↔水单撮合
-                    is_order = any(kw in fname for kw in ["确认单", "行程单"])
-                    if is_order:
+                    if is_hotel_order_filename(fname):
                         _record_combine_result(
                             meta.get("document_id"),
                             "not_applicable",
@@ -3940,8 +3898,7 @@ class InvoiceAppAPI:
                             "订单确认单不参与发票↔水单撮合。",
                         )
                         continue
-                    is_folio = any(kw in fname.lower() for kw in ["水单", "folio", "账单", "明细"])
-                    if is_folio:
+                    if is_hotel_folio_filename(fname):
                         folios.append(meta)
                         _record_combine_candidate(meta["document_id"], "hotel", "folio", meta)
                     else:
@@ -3960,58 +3917,17 @@ class InvoiceAppAPI:
                     self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-gray-400", "msg": f"住宿目录: 发票{len(invoices)}张, 水单{len(folios)}张, 无法撮合"})
                     return
                 
-                # 联合主键匹配 (金额精确 + 日期 0-3 天容差)
-                from datetime import datetime as dt, timedelta
-                matched = []
-                used_fol = set()
-                
-                for inv in invoices:
-                    try:
-                        inv_amt = float(inv["amount"])
-                    except (ValueError, TypeError):
-                        continue
-                    
-                    for j, fol in enumerate(folios):
-                        if j in used_fol:
-                            continue
-                        try:
-                            fol_amt = float(fol["amount"])
-                        except (ValueError, TypeError):
-                            continue
-                        
-                        # 金额必须精确匹配
-                        if abs(inv_amt - fol_amt) > 0.01:
-                            continue
-                        
-                        # 日期容差 0-3 天
-                        try:
-                            inv_d = dt.strptime(inv["date"], "%Y%m%d").date()
-                            fol_d = dt.strptime(fol["date"], "%Y%m%d").date()
-                            if abs((inv_d - fol_d).days) <= 3:
-                                matched.append((inv, fol))
-                                used_fol.add(j)
-                                break
-                        except (ValueError, TypeError):
-                            # 日期解析失败则跳过日期检查，仅凭金额
-                            matched.append((inv, fol))
-                            used_fol.add(j)
-                            break
+                # 联合主键匹配: 金额精确 + 日期 0-3 天容差；日期解析失败时仅凭金额。
+                matched = match_hotel_pairs(invoices, folios)
                 
                 # 交替重命名
                 for idx, (inv, fol) in enumerate(matched, 1):
                     inv_document_id = inv.get("document_id")
                     fol_document_id = fol.get("document_id")
                     try:
-                        base_date = inv["date"]  # 以发票日期为基准
-                        try:
-                            base_amount = f"{float(inv['amount']):.2f}"
-                        except (ValueError, TypeError):
-                            base_amount = inv["amount"]
-                        
-                        inv_ext = inv["ext"]
-                        fol_ext = fol["ext"]
-                        inv_new = f"{base_date}-住宿-{idx:02d}-发票_{base_amount}元{inv_ext}"
-                        fol_new = f"{base_date}-住宿-{idx:02d}-水单_{base_amount}元{fol_ext}"
+                        rename = build_hotel_pair_renames(inv, fol, idx)
+                        inv_new = rename.invoice_filename
+                        fol_new = rename.supporting_filename
                         
                         inv_new_path = os.path.join(hotel_folder_path, inv_new)
                         fol_new_path = os.path.join(hotel_folder_path, fol_new)
@@ -4714,22 +4630,37 @@ class InvoiceAppAPI:
         threading.Thread(target=_shutdown, daemon=True).start()
         return {"success": True, "message": "窗口关闭中"}
 
-    def minimize_window(self):
+    def _active_desktop_window(self, action_label):
         try:
             import webview
         except ImportError:
-            return {"success": False, "message": "桌面窗口接口不可用"}
+            return None, {"success": False, "message": "桌面窗口接口不可用"}
 
         if not webview.windows:
-            return {"success": False, "message": "当前没有可最小化的桌面窗口"}
+            return None, {"success": False, "message": f"当前没有可{action_label}的桌面窗口"}
+        return webview.windows[0], None
 
-        window = webview.windows[0]
+    def minimize_window(self):
+        window, error = self._active_desktop_window("最小化")
+        if error:
+            return error
 
         try:
             window.minimize()
             return {"success": True, "message": "窗口已最小化"}
         except Exception as exc:
             return {"success": False, "message": f"窗口最小化失败: {exc}"}
+
+    def maximize_window(self):
+        window, error = self._active_desktop_window("最大化")
+        if error:
+            return error
+
+        try:
+            window.maximize()
+            return {"success": True, "message": "窗口已最大化"}
+        except Exception as exc:
+            return {"success": False, "message": f"窗口最大化失败: {exc}"}
 
     def open_manual_check_folder(self):
         manual_path = self._manual_check_path()
