@@ -1609,6 +1609,8 @@ class InvoiceAppAPI:
             return "IMAP_LOGIN_FAILED", "邮箱登录失败，请检查授权码和 IMAP 设置。"
         if "QUOTA_EXHAUSTED" in normalized or "额度" in status:
             return "QUOTA_EXHAUSTED", "GLM API 额度已耗尽，请充值或更换可用的 API Key。"
+        if "UNRESOLVED_MAILBOX_INPUT" in normalized:
+            return "UNRESOLVED_MAILBOX_INPUT", "部分邮件在重试后仍无法读取，本次任务已失败；已读取产物保留供诊断。"
         if "WORKER_START_FAILED" in normalized or "启动失败" in status:
             return "WORKER_START_FAILED", "后台任务启动失败，请重试。"
         return "PROCESSING_FAILED", "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
@@ -2126,6 +2128,7 @@ class InvoiceAppAPI:
         )
         from datetime import datetime, timedelta
         from email_fetcher import EmailFetcher
+        from mailbox_scanner import UnresolvedMailboxInputError
         self._packaged_diag_write("worker_imports_ready", "_processing_worker", "success")
 
         fetcher = None
@@ -2343,6 +2346,30 @@ class InvoiceAppAPI:
             })
             self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "completed", "emails": total_emails, "attachments": total_attachments})
             self._finish_run(True, "处理完成")
+        except UnresolvedMailboxInputError as exc:
+            self._packaged_diag_write(
+                "worker_unresolved_mailbox_input",
+                "_processing_worker",
+                "failure",
+                summary=exc.diagnostic_payload(),
+            )
+            self._safe_emit_stage_event(
+                "frontend_processing_worker",
+                "exit",
+                {
+                    "result": "failed",
+                    "reason": exc.reason_code,
+                    "unresolved_count": exc.unresolved_count,
+                    "uid_hashes": list(exc.uid_hashes),
+                },
+            )
+            self._fail_run(
+                "邮件读取不完整",
+                str(exc),
+                fetcher=fetcher,
+                reason_code=exc.reason_code,
+                user_message=exc.user_message,
+            )
         except Exception as exc:
             self._packaged_diag_write("worker_exception", "_processing_worker", "exception", exc=exc)
             self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": str(exc) or "UNKNOWN_ERROR"})

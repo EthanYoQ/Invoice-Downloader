@@ -21,11 +21,42 @@ class MailboxScanError(RuntimeError):
     """Raised when mailbox scope cannot be established without risking P0."""
 
 
+class UnresolvedMailboxInputError(RuntimeError):
+    reason_code = "UNRESOLVED_MAILBOX_INPUT"
+    user_message = "部分邮件在重试后仍无法读取，本次任务已失败；已读取产物保留供诊断。"
+
+    def __init__(self, uids):
+        normalized = MailboxScanner.normalize_uids(uids)
+        self.unresolved_count = len(normalized)
+        self.uid_hashes = tuple(
+            hashlib.sha256(uid).hexdigest()[:12] for uid in normalized
+        )
+        hashes = ",".join(self.uid_hashes)
+        super().__init__(
+            f"{self.reason_code}; unresolved_count={self.unresolved_count}; uid_hashes={hashes}"
+        )
+
+    def diagnostic_payload(self):
+        return {
+            "event": "unresolved_mailbox_input",
+            "reason_code": self.reason_code,
+            "unresolved_count": self.unresolved_count,
+            "uid_hashes": list(self.uid_hashes),
+        }
+
+
 @dataclass(frozen=True)
 class MessageRef:
     uid: bytes
     message_date: dt.datetime | None
     internal_date: dt.datetime | None
+
+
+@dataclass(frozen=True)
+class MessageBatch:
+    requested_uids: tuple[bytes, ...]
+    messages: tuple[tuple[bytes, bytes], ...]
+    unresolved_uids: tuple[bytes, ...]
 
 
 class MailboxScanner:
@@ -60,12 +91,7 @@ class MailboxScanner:
         if before is not None and before <= since:
             raise ValueError("before must be after since")
 
-        try:
-            status, _ = self.mail.select(mailbox, readonly=True)
-        except Exception as exc:
-            raise MailboxScanError("IMAP SELECT failed") from exc
-        if not self._is_ok(status):
-            raise MailboxScanError("IMAP SELECT failed")
+        self.select_mailbox(mailbox)
 
         uids = self._search_all_uids()
         headers: dict[bytes, MessageRef] = {}
@@ -86,32 +112,71 @@ class MailboxScanner:
         self._emit("imap_scan_complete", searched=len(uids), retained=len(retained))
         return retained
 
+    def select_mailbox(self, mailbox="INBOX"):
+        try:
+            status, _ = self.mail.select(mailbox, readonly=True)
+        except Exception as exc:
+            raise MailboxScanError("IMAP SELECT failed") from exc
+        if not self.is_ok_status(status):
+            raise MailboxScanError("IMAP SELECT failed")
+
+    def iter_message_batches(
+        self, uids: Iterable[bytes], query: str | None = None
+    ):
+        ordered_uids = self.normalize_uids(uids)
+        query = self._ensure_uid_query(query or self.MESSAGE_QUERY)
+        for chunk in self._chunks(ordered_uids, self.body_batch_size):
+            fetched, unresolved = self._fetch_message_subset(chunk, query)
+            ordered_messages = tuple(
+                (uid, fetched[uid]) for uid in chunk if uid in fetched
+            )
+            self._emit(
+                "imap_message_batch_ready",
+                requested_count=len(chunk),
+                buffered_count=len(ordered_messages),
+                unresolved_count=len(unresolved),
+            )
+            yield MessageBatch(tuple(chunk), ordered_messages, tuple(unresolved))
+            del fetched
+            del ordered_messages
+            del unresolved
+
     def fetch_messages(
         self, uids: Iterable[bytes], query: str | None = None
     ) -> dict[bytes, bytes]:
-        ordered_uids = self._stable_uids(uids)
-        query = self._ensure_uid_query(query or self.MESSAGE_QUERY)
-        fetched: dict[bytes, bytes] = {}
-        for chunk in self._chunks(ordered_uids, self.body_batch_size):
-            fetched.update(self._fetch_message_subset(chunk, query))
-        return {uid: fetched[uid] for uid in ordered_uids if uid in fetched}
+        ordered_uids = self.normalize_uids(uids)
+        if len(ordered_uids) > self.body_batch_size:
+            raise ValueError("fetch_messages accepts at most one configured message batch")
+        batches = self.iter_message_batches(ordered_uids, query=query)
+        first = next(batches, None)
+        return dict(first.messages) if first is not None else {}
 
     def _search_all_uids(self) -> list[bytes]:
         try:
             status, response = self.mail.uid("SEARCH", None, "ALL")
         except Exception as exc:
             raise MailboxScanError("UID SEARCH ALL failed") from exc
-        if not self._is_ok(status):
+        if not self.is_ok_status(status):
             raise MailboxScanError("UID SEARCH ALL failed")
 
         tokens = []
+        malformed = False
         for item in response if isinstance(response, (list, tuple)) else [response]:
             if isinstance(item, bytearray):
                 item = bytes(item)
             if not isinstance(item, bytes):
                 continue
-            tokens.extend(re.findall(rb"\b\d+\b", item))
-        return self._stable_uids(tokens)
+            stripped = item.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            if any(not part.isdigit() for part in parts):
+                malformed = True
+                continue
+            tokens.extend(parts)
+        if malformed:
+            raise MailboxScanError("malformed UID SEARCH ALL response")
+        return self.normalize_uids(tokens)
 
     def _fetch_header_subset(self, uids: list[bytes]) -> dict[bytes, MessageRef]:
         if not uids:
@@ -129,20 +194,23 @@ class MailboxScanner:
             parsed.update(self._fetch_header_subset(subset))
         return parsed
 
-    def _fetch_message_subset(self, uids: list[bytes], query: str) -> dict[bytes, bytes]:
+    def _fetch_message_subset(self, uids: list[bytes], query: str):
         if not uids:
-            return {}
+            return {}, []
         response = self._uid_fetch_with_retry(uids, query, "message")
         parsed = self._parse_payloads(response, set(uids)) if response is not None else {}
         missing = [uid for uid in uids if uid not in parsed]
         if not missing:
-            return parsed
+            return parsed, []
         if len(uids) == 1:
             self._emit_failed("message", uids)
-            return parsed
+            return parsed, list(missing)
+        unresolved = []
         for subset in self._split(missing):
-            parsed.update(self._fetch_message_subset(subset, query))
-        return parsed
+            child_parsed, child_unresolved = self._fetch_message_subset(subset, query)
+            parsed.update(child_parsed)
+            unresolved.extend(child_unresolved)
+        return parsed, unresolved
 
     @staticmethod
     def _ensure_uid_query(query: str) -> str:
@@ -160,7 +228,7 @@ class MailboxScanner:
         for _attempt in range(1, self.max_attempts + 1):
             try:
                 status, response = self.mail.uid("FETCH", uid_set, query)
-                if self._is_ok(status) and isinstance(response, (list, tuple)):
+                if self.is_ok_status(status) and isinstance(response, (list, tuple)):
                     return response
                 last_error_type = "fetch_status"
             except Exception as exc:
@@ -178,10 +246,10 @@ class MailboxScanner:
     def _parse_headers(cls, response, requested: set[bytes]) -> dict[bytes, MessageRef]:
         parsed = {}
         for metadata, payload in cls._response_tuples(response):
-            uid = cls._metadata_uid(metadata)
+            uid = cls.extract_uid(metadata)
             if uid not in requested or uid in parsed:
                 continue
-            internal_date = cls._metadata_internal_date(metadata)
+            internal_date = cls.extract_internal_date(metadata)
             message_date = None
             try:
                 header = email.message_from_bytes(payload)
@@ -197,7 +265,7 @@ class MailboxScanner:
     def _parse_payloads(cls, response, requested: set[bytes]) -> dict[bytes, bytes]:
         parsed = {}
         for metadata, payload in cls._response_tuples(response):
-            uid = cls._metadata_uid(metadata)
+            uid = cls.extract_uid(metadata)
             if uid not in requested or uid in parsed or not payload:
                 continue
             parsed[uid] = payload
@@ -219,12 +287,12 @@ class MailboxScanner:
                 yield metadata, payload
 
     @staticmethod
-    def _metadata_uid(metadata: bytes) -> bytes:
+    def extract_uid(metadata: bytes) -> bytes:
         match = _UID_PATTERN.search(metadata)
         return match.group(1) if match else b""
 
     @classmethod
-    def _metadata_internal_date(cls, metadata: bytes) -> dt.datetime | None:
+    def extract_internal_date(cls, metadata: bytes) -> dt.datetime | None:
         match = _INTERNALDATE_PATTERN.search(metadata)
         if not match:
             return None
@@ -249,13 +317,13 @@ class MailboxScanner:
         return value
 
     @staticmethod
-    def _is_ok(status) -> bool:
+    def is_ok_status(status) -> bool:
         if isinstance(status, bytes):
             status = status.decode("ascii", errors="ignore")
         return str(status or "").casefold() == "ok"
 
     @staticmethod
-    def _stable_uids(uids: Iterable[bytes]) -> list[bytes]:
+    def normalize_uids(uids: Iterable[bytes]) -> list[bytes]:
         result = []
         seen = set()
         for uid in uids:

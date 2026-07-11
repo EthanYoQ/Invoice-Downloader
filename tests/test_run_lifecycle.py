@@ -784,6 +784,59 @@ def test_worker_finalizer_failure_removes_completed_facing_log(tmp_path, monkeyp
     assert "must-not-surface" not in api.last_error
 
 
+def test_unresolved_mailbox_input_reaches_one_failed_terminal_after_readable_work(
+    tmp_path, monkeypatch
+):
+    from mailbox_scanner import UnresolvedMailboxInputError
+
+    monkeypatch.chdir(tmp_path)
+    api = InvoiceAppAPI()
+    terminal_events = []
+    finalizers = []
+
+    class Fetcher:
+        def __init__(self, *args, staging_dir, **kwargs):
+            self.staging_dir = Path(staging_dir)
+            self.staging_dir.mkdir(parents=True, exist_ok=True)
+
+        def connect(self):
+            return True
+
+        def fetch_emails_by_date(self, **kwargs):
+            return [b"1", b"2"]
+
+        def extract_attachments(self, _email_ids):
+            (self.staging_dir / "readable-preserved.pdf").write_bytes(b"readable")
+            raise UnresolvedMailboxInputError([b"2"])
+
+        def disconnect(self):
+            finalizers.append("disconnect")
+
+    monkeypatch.setattr("email_fetcher.EmailFetcher", Fetcher)
+    monkeypatch.setattr(api, "_start_truth_audit_async", lambda *args: None)
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: finalizers.append("cleanup"))
+    monkeypatch.setattr(
+        api,
+        "_safe_emit_run_state_event",
+        lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
+    )
+
+    api._processing_worker(
+        "",
+        str(tmp_path / "output"),
+        email_address="a@qq.com",
+        auth_code="x",
+        api_key="y",
+    )
+
+    assert api.run_state == "failed"
+    assert terminal_events == ["failed"]
+    assert finalizers == ["disconnect", "cleanup"]
+    assert "UNRESOLVED_MAILBOX_INPUT" in api.last_error
+    assert "b'2'" not in api.last_error
+    assert all(entry.get("type") != "完成" for entry in api.logs)
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_state", "expected_status", "error_code", "actionable_text"),
     [

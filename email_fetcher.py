@@ -37,7 +37,7 @@ from provider_direct_invoice import (
 from pinned_http import PinnedHttpTransport
 from url_security import PublicUrlPolicy
 from url_trace_sanitizer import sanitize_url_for_log, stable_hash
-from mailbox_scanner import MailboxScanner
+from mailbox_scanner import MailboxScanner, UnresolvedMailboxInputError
 try:
     from pyzbar.pyzbar import decode
 except ImportError:
@@ -1327,7 +1327,7 @@ class EmailFetcher:
         if not self.mail:
             return []
             
-        self.mail.select(mailbox, readonly=True)
+        self._mailbox_scanner().select_mailbox(mailbox)
         results = []
 
         def stage_candidate_file(base_dir, filename, payload):
@@ -1689,10 +1689,11 @@ class EmailFetcher:
         if not self.mail:
             return []
 
-        self.mail.select(mailbox, readonly=True)
+        scanner = self._mailbox_scanner()
+        scanner.select_mailbox(mailbox)
         results = []
-        ordered_email_ids = MailboxScanner._stable_uids(email_ids)
-        prefetched_messages = self._mailbox_scanner().fetch_messages(ordered_email_ids)
+        ordered_email_ids = MailboxScanner.normalize_uids(email_ids)
+        unresolved_email_ids = []
 
         def stage_candidate_file(base_dir, filename, payload):
             os.makedirs(base_dir, exist_ok=True)
@@ -1727,10 +1728,13 @@ class EmailFetcher:
                     "staging_error": error_message,
                 })
 
-        chunk_size = 50
-        for i in range(0, len(ordered_email_ids), chunk_size):
-            chunk = ordered_email_ids[i:i + chunk_size]
-            logging.info(f"Processing chunk {i//chunk_size + 1}/{max(1, (len(ordered_email_ids)+chunk_size-1)//chunk_size)}")
+        batch_total = max(1, (len(ordered_email_ids) + scanner.body_batch_size - 1) // scanner.body_batch_size)
+        for batch_index, message_batch in enumerate(
+            scanner.iter_message_batches(ordered_email_ids), start=1
+        ):
+            chunk = list(message_batch.requested_uids)
+            prefetched_messages = dict(message_batch.messages)
+            logging.info(f"Processing chunk {batch_index}/{batch_total}")
 
             for e_id in chunk:
                 email_id_str = self._safe_email_id(e_id)
@@ -1835,6 +1839,7 @@ class EmailFetcher:
                             email_diag["subject"] = email_diag["subject"] or decode_str(last_parsed_msg.get("Subject"))
                             email_diag["sender"] = email_diag["sender"] or decode_str(last_parsed_msg.get("From", ""))
                         email_diag["terminal_status"] = last_terminal_status
+                        unresolved_email_ids.append(e_id)
                         continue
 
                     msg = selected_msg
@@ -2402,7 +2407,27 @@ class EmailFetcher:
                     if email_diag["terminal_status"] == "uninitialized":
                         email_diag["terminal_status"] = "processing_exception"
                     self._emit_extract_attachments_diagnostic(email_diag)
+                    selected_msg = None
+                    last_parsed_msg = None
+                    msg_candidate = None
+                    msg = None
+                    raw_message_bytes = b""
+                    parts = []
+                    attachments_found = []
+                    process_queue = []
+                    processed_attachments = []
+                    attachment_info = None
+                    processed_attachment = None
+                    payload = None
 
             time.sleep(EMAIL_FETCH_LOOP_PAUSE_SECONDS)
+            prefetched_messages.clear()
+            del prefetched_messages
+            del message_batch
+
+        if unresolved_email_ids:
+            unresolved_error = UnresolvedMailboxInputError(unresolved_email_ids)
+            self._emit_mailbox_scan_diagnostic(unresolved_error.diagnostic_payload())
+            raise unresolved_error
 
         return results

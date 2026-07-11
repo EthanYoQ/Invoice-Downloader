@@ -1,8 +1,10 @@
 import tempfile
 import unittest
 from email.message import EmailMessage
+import pytest
 
 from email_fetcher import EmailFetcher
+from mailbox_scanner import MailboxScanError, UnresolvedMailboxInputError
 
 
 def build_attachment_message(*, sender, subject, body, filename, payload=b"%PDF-1.4\n"):
@@ -183,6 +185,79 @@ class EmailFetcherImapFilterTests(unittest.TestCase):
         ]
         self.assertEqual(body_sets, [b"70,71,72,73,74,75,76,77,78,79,80", b"77"])
         self.assertEqual(len(result), 11)
+
+
+def test_extract_attachments_second_select_failure_stops_before_uid_fetch(tmp_path):
+    raw = build_attachment_message(
+        sender="billing@example.com",
+        subject="Invoice",
+        body="Attached",
+        filename="invoice.pdf",
+    )
+    mail = FakeUidMail({b"1": raw})
+    select_calls = 0
+
+    def select(_mailbox, readonly=True):
+        nonlocal select_calls
+        select_calls += 1
+        assert readonly is True
+        return ("ok", [b""]) if select_calls == 1 else ("NO", [b"failed"])
+
+    mail.select = select
+    fetcher = EmailFetcher("invoice-user@example.com", "auth-code", staging_dir=str(tmp_path))
+    fetcher.mail = mail
+    assert fetcher.fetch_emails_by_date("2026-06-01", "2026-06-14") == [b"1"]
+    uid_calls_before_second_select = len(mail.uid_calls)
+
+    with pytest.raises(MailboxScanError, match="SELECT"):
+        fetcher.extract_attachments([b"1"])
+
+    assert len(mail.uid_calls) == uid_calls_before_second_select
+
+
+def test_readable_inputs_are_staged_then_unreadable_uid_raises_safe_aggregate(tmp_path):
+    raw = build_attachment_message(
+        sender="billing@example.com",
+        subject="Invoice 1",
+        body="Attached",
+        filename="invoice-1.pdf",
+    )
+    mail = FakeUidMail({b"1": raw, b"2": b"private-message-body"})
+    original_uid = mail.uid
+
+    def uid(command, *args):
+        if command.upper() != "FETCH" or "HEADER.FIELDS" in args[1]:
+            return original_uid(command, *args)
+        mail.uid_calls.append((command, args))
+        requested = args[0].split(b",")
+        parts = []
+        for sequence, requested_uid in enumerate(requested, 1):
+            if requested_uid == b"1":
+                parts.append((b"1 (UID 1 RFC822", raw))
+        return "ok", parts
+
+    mail.uid = uid
+    monitoring = tmp_path / "monitoring"
+    fetcher = EmailFetcher(
+        "invoice-user@example.com",
+        "auth-code",
+        staging_dir=str(tmp_path / "staging"),
+        monitoring_dir=str(monitoring),
+    )
+    fetcher.mail = mail
+
+    with pytest.raises(UnresolvedMailboxInputError) as caught:
+        fetcher.extract_attachments([b"1", b"2"])
+
+    assert caught.value.unresolved_count == 1
+    safe_error = repr(caught.value)
+    assert "auth-code" not in safe_error
+    assert "private-message-body" not in safe_error
+    assert "UID 2" not in safe_error and "b'2'" not in safe_error
+    assert len(caught.value.uid_hashes) == 1
+    assert list((tmp_path / "staging").rglob("invoice-1.pdf"))
+    diagnostics = (monitoring / "extract_attachments_diagnostics.jsonl").read_text(encoding="utf-8")
+    assert "fetch_no_usable_bytes" in diagnostics
 
 
 if __name__ == "__main__":

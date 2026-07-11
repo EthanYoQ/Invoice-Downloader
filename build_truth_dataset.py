@@ -81,6 +81,7 @@ from email_fetcher import (  # noqa: E402
     prioritize_invoice_links,
 )
 from invoice_extractor import InvoiceExtractor, normalize_ocr_compat_text  # noqa: E402
+from mailbox_scanner import MailboxScanner  # noqa: E402
 from pdf_converter import PDFConverter  # noqa: E402
 from provider_baiwang import parse_baiwang_xml_fields  # noqa: E402
 from provider_direct_invoice import (  # noqa: E402
@@ -180,14 +181,26 @@ def parse_mail_date(message) -> str:
 
 
 def fetch_internaldate_local(fetcher: EmailFetcher, email_id) -> str:
+    normalized = MailboxScanner.normalize_uids([email_id])
+    if len(normalized) != 1:
+        return ""
+    requested_uid = normalized[0]
     try:
-        status, data = fetcher.mail.fetch(email_id, "(INTERNALDATE)")
+        status, data = fetcher.mail.uid(
+            "FETCH", requested_uid, "(UID INTERNALDATE)"
+        )
     except Exception:
         return ""
-    if status != "OK" or not data:
+    if not MailboxScanner.is_ok_status(status) or not data:
         return ""
     for part in data:
-        parsed = EmailFetcher._extract_fetch_internaldate(part)
+        metadata = part[0] if isinstance(part, tuple) and part else part
+        if not isinstance(metadata, (bytes, bytearray)):
+            continue
+        metadata = bytes(metadata)
+        if MailboxScanner.extract_uid(metadata) != requested_uid:
+            continue
+        parsed = MailboxScanner.extract_internal_date(metadata)
         if parsed:
             return parsed.strftime("%Y-%m-%d %H:%M:%S")
     return ""
@@ -1394,7 +1407,7 @@ def fetch_email_text_evidence(email_ids, source_root: Path, mailbox: str) -> dic
     if not fetcher.connect():
         return evidence
     try:
-        fetcher.mail.select(mailbox)
+        fetcher._mailbox_scanner().select_mailbox(mailbox)
         for email_id in email_ids:
             raw_bytes = b""
             for mode_label, fetch_command in (("RFC822", "(RFC822)"), ("BODY.PEEK[]", "(BODY.PEEK[])")):

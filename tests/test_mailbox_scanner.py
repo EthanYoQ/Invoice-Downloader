@@ -129,7 +129,40 @@ def test_scan_raises_on_search_failure_instead_of_claiming_empty_mailbox():
         MailboxScanner(SearchFailureMail(b"", None)).scan(dt.date(2026, 6, 1), None)
 
 
-def test_fetch_messages_batches_25_maps_uid_metadata_and_retries_only_missing_subsets():
+def test_search_accepts_multiple_chunks_none_and_interleaved_entries_stably():
+    def fetch(uid_set, _query):
+        return "ok", [
+            _header_part(index, int(uid))
+            for index, uid in enumerate(uid_set.split(b","), 1)
+        ]
+
+    mail = FakeUidMail(b"unused", fetch)
+
+    def uid(command, *args):
+        mail.uid_calls.append((command, args))
+        if command.upper() == "SEARCH":
+            return "ok", [b"91 7", None, (b"ignored",), bytearray(b"91 105"), b""]
+        return fetch(*args)
+
+    mail.uid = uid
+    refs = MailboxScanner(mail).scan(dt.date(2026, 6, 1), dt.date(2026, 6, 14))
+
+    assert [ref.uid for ref in refs] == [b"91", b"7", b"105"]
+
+
+def test_empty_search_is_empty_but_nonempty_malformed_ok_response_fails_closed():
+    empty = FakeUidMail(b"", lambda *_args: (_ for _ in ()).throw(AssertionError("no FETCH")))
+    assert MailboxScanner(empty).scan(dt.date(2026, 6, 1), None) == []
+
+    malformed = FakeUidMail(
+        b"not-a-uid response",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("no FETCH")),
+    )
+    with pytest.raises(MailboxScanError, match="malformed UID SEARCH"):
+        MailboxScanner(malformed).scan(dt.date(2026, 6, 1), None)
+
+
+def test_iter_message_batches_caps_buffer_at_25_and_maps_each_uid_once():
     messages = {str(uid).encode(): _message(uid) for uid in range(1, 206)}
     calls = []
 
@@ -144,14 +177,27 @@ def test_fetch_messages_batches_25_maps_uid_metadata_and_retries_only_missing_su
             parts.extend([b"noise", (f"{sequence} (UID {uid.decode()} RFC822".encode(), messages[uid])])
         return "ok", parts
 
+    events = []
     mail = FakeUidMail(b"", fetch)
-    fetched = MailboxScanner(mail, body_batch_size=25, max_attempts=1).fetch_messages(list(messages))
+    scanner = MailboxScanner(
+        mail,
+        body_batch_size=25,
+        max_attempts=1,
+        diagnostic_callback=events.append,
+    )
+    seen = []
+    batch_sizes = []
+    for batch in scanner.iter_message_batches(list(messages)):
+        batch_sizes.append(len(batch.messages))
+        seen.extend(uid for uid, _payload in batch.messages)
 
-    assert list(fetched) == list(messages)
-    assert fetched[b"205"] == messages[b"205"]
+    assert seen == list(messages)
+    assert max(batch_sizes) <= 25
     assert all(len(call.split(b",")) <= 25 for call in calls)
     assert sum(b"77" in call.split(b",") for call in calls) == 2
     assert len(calls) == 10
+    buffered = [event["buffered_count"] for event in events if event["event"] == "imap_message_batch_ready"]
+    assert buffered and max(buffered) <= 25
 
 
 def test_fetch_messages_deduplicates_input_and_rejects_payload_without_uid_metadata():
