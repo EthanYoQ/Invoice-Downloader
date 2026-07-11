@@ -1,18 +1,39 @@
-"""Credential-free validation of immutable batch evidence against finalized truth."""
+"""Fresh, credential-free validation of a completed batch against finalized truth."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
+import posixpath
+import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Mapping
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
+from strict_truth_audit import compare as run_strict_audit
 from truth_contracts import TruthContractError, TruthManifest
+
+
+UTC = dt.timezone.utc
+PERFORMANCE_SCOPE_FIELDS = (
+    "date_from",
+    "date_to",
+    "before_exclusive",
+    "account_domain",
+    "account_channel",
+    "mailbox",
+    "target_identifier",
+    "run_mode",
+    "hardware_mode",
+    "hardware_fingerprint",
+)
 
 
 class BatchValidationError(ValueError):
@@ -20,6 +41,14 @@ class BatchValidationError(ValueError):
         self.code = code
         self.detail = detail
         super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_json_bytes(value)).hexdigest()
 
 
 def _load_json(path: Path, code: str) -> dict[str, Any]:
@@ -42,8 +71,169 @@ def _decimal(value: Any, *, code: str) -> Decimal:
     return result
 
 
-def _resolved(value: Any) -> Path:
-    return Path(str(value or "")).resolve()
+def _utc(value: Any, *, code: str) -> dt.datetime:
+    text = str(value or "").strip()
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BatchValidationError(code) from exc
+    if parsed.tzinfo is None:
+        raise BatchValidationError(code)
+    return parsed.astimezone(UTC)
+
+
+def _utc_text(value: dt.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def canonical_windows_path(value: str | Path) -> str:
+    text = str(value).replace("\\", "/")
+    return posixpath.normpath(text).casefold()
+
+
+def resolve_current_revision() -> str:
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BatchValidationError("trusted_revision_unavailable") from exc
+    if not revision:
+        raise BatchValidationError("trusted_revision_unavailable")
+    return revision
+
+
+def _default_reparse_checker(path: Path) -> bool:
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise BatchValidationError("inventory_read_failed", path.name) from exc
+    attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & 0x400)
+
+
+def _sha256_file(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+    except OSError as exc:
+        raise BatchValidationError("inventory_read_failed", path.name) from exc
+    return digest.hexdigest(), size
+
+
+@dataclass(frozen=True)
+class InventoryEntry:
+    relative_path: str
+    absolute_path: str
+    canonical_path: str
+    size: int
+    sha256: str
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "relative_path": self.relative_path,
+            "absolute_path": self.absolute_path,
+            "canonical_path": self.canonical_path,
+            "size": self.size,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class InventorySnapshot:
+    root: str
+    digest: str
+    entries: tuple[InventoryEntry, ...]
+
+    @property
+    def by_canonical_path(self) -> Mapping[str, InventoryEntry]:
+        return MappingProxyType({entry.canonical_path: entry for entry in self.entries})
+
+
+def compute_inventory(
+    output_root: str | Path,
+    *,
+    reparse_checker: Callable[[Path], bool] | None = None,
+) -> InventorySnapshot:
+    root_input = Path(output_root).absolute()
+    checker = reparse_checker or _default_reparse_checker
+    if not root_input.is_dir():
+        raise BatchValidationError("missing_output_root")
+    if checker(root_input):
+        raise BatchValidationError("reparse_point_rejected", root_input.name)
+    try:
+        root = root_input.resolve(strict=True)
+    except OSError as exc:
+        raise BatchValidationError("inventory_read_failed", root_input.name) from exc
+    entries: list[InventoryEntry] = []
+
+    def visit(directory: Path) -> None:
+        try:
+            children = sorted(os.scandir(directory), key=lambda item: item.name.casefold())
+        except OSError as exc:
+            raise BatchValidationError("inventory_read_failed", directory.name) from exc
+        for child in children:
+            path = Path(child.path)
+            if checker(path):
+                raise BatchValidationError("reparse_point_rejected", path.name)
+            try:
+                child_stat = child.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise BatchValidationError("inventory_read_failed", path.name) from exc
+            if stat.S_ISDIR(child_stat.st_mode):
+                visit(path)
+                continue
+            if not stat.S_ISREG(child_stat.st_mode):
+                raise BatchValidationError("non_regular_output_artifact", path.name)
+            sha256, size = _sha256_file(path)
+            try:
+                resolved_path = path.resolve(strict=True)
+                resolved_path.relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise BatchValidationError("inventory_path_escape", path.name) from exc
+            absolute = str(resolved_path)
+            entries.append(InventoryEntry(
+                relative_path=path.relative_to(root).as_posix(),
+                absolute_path=absolute,
+                canonical_path=canonical_windows_path(absolute),
+                size=size,
+                sha256=sha256,
+            ))
+
+    visit(root)
+    entries.sort(key=lambda item: canonical_windows_path(item.relative_path))
+    canonical_paths = [entry.canonical_path for entry in entries]
+    if len(canonical_paths) != len(set(canonical_paths)):
+        raise BatchValidationError("duplicate_inventory_path")
+    digest_payload = [
+        {"relative_path": entry.relative_path, "size": entry.size, "sha256": entry.sha256}
+        for entry in entries
+    ]
+    return InventorySnapshot(root=str(root), digest=_sha256_json(digest_payload), entries=tuple(entries))
+
+
+def compute_scope_digest(value: Mapping[str, Any]) -> str:
+    scope = {field: str(value.get(field) or "").strip() for field in PERFORMANCE_SCOPE_FIELDS}
+    if not all(scope.values()):
+        raise BatchValidationError("incomplete_performance_scope")
+    scope["account_domain"] = scope["account_domain"].lower()
+    scope["account_channel"] = scope["account_channel"].lower()
+    return _sha256_json(scope)
+
+
+def compute_performance_record_digest(value: Mapping[str, Any]) -> str:
+    return _sha256_json({key: item for key, item in value.items() if key != "record_digest"})
 
 
 @dataclass(frozen=True)
@@ -53,8 +243,17 @@ class BatchValidationResult:
     run_root: str
     candidate_revision: str
     candidate_version: str
+    manifest_sha256: str
+    inventory_sha256: str
+    scope_digest: str
+    validation_started_at_utc: str
+    audit_started_at_utc: str
+    audit_completed_at_utc: str
+    validation_completed_at_utc: str
     counts: Mapping[str, int]
     scope: Mapping[str, str]
+    assignments: tuple[Mapping[str, Any], ...]
+    fresh_audit: Mapping[str, Any]
 
     def to_mapping(self) -> dict[str, Any]:
         return {
@@ -63,8 +262,17 @@ class BatchValidationResult:
             "run_root": self.run_root,
             "candidate_revision": self.candidate_revision,
             "candidate_version": self.candidate_version,
+            "manifest_sha256": self.manifest_sha256,
+            "inventory_sha256": self.inventory_sha256,
+            "scope_digest": self.scope_digest,
+            "validation_started_at_utc": self.validation_started_at_utc,
+            "audit_started_at_utc": self.audit_started_at_utc,
+            "audit_completed_at_utc": self.audit_completed_at_utc,
+            "validation_completed_at_utc": self.validation_completed_at_utc,
             "counts": dict(self.counts),
             "scope": dict(self.scope),
+            "assignments": [dict(item) for item in self.assignments],
+            "fresh_audit": dict(self.fresh_audit),
         }
 
 
@@ -75,6 +283,11 @@ class PerformanceVerdict:
     target_seconds: str
     speedup_fraction: str
     threshold_fraction: str
+    scope_digest: str
+    baseline_revision: str
+    candidate_revision: str
+    baseline_record_digest: str
+    candidate_record_digest: str
     passed: bool
 
     def to_mapping(self) -> dict[str, Any]:
@@ -84,6 +297,11 @@ class PerformanceVerdict:
             "target_seconds": self.target_seconds,
             "speedup_fraction": self.speedup_fraction,
             "threshold_fraction": self.threshold_fraction,
+            "scope_digest": self.scope_digest,
+            "baseline_revision": self.baseline_revision,
+            "candidate_revision": self.candidate_revision,
+            "baseline_record_digest": self.baseline_record_digest,
+            "candidate_record_digest": self.candidate_record_digest,
             "passed": self.passed,
         }
 
@@ -91,72 +309,112 @@ class PerformanceVerdict:
 class BatchValidator:
     CONFIG_PATH = Path("monitoring/run_config.json")
     EVIDENCE_PATH = Path("diagnostics/run_evidence.json")
-    AUDIT_PATH = Path("diagnostics/strict_truth_audit.json")
+    SUPPLIED_AUDIT_PATH = Path("diagnostics/strict_truth_audit.json")
 
-    def validate(self, manifest: TruthManifest | Mapping[str, Any] | str | Path, run_root: str | Path) -> BatchValidationResult:
+    def __init__(
+        self,
+        *,
+        revision_resolver: Callable[[], str] | None = None,
+        clock: Callable[[], dt.datetime] | None = None,
+        audit_runner: Callable[[dict, Path], dict] | None = None,
+        reparse_checker: Callable[[Path], bool] | None = None,
+    ) -> None:
+        self._revision_resolver = revision_resolver or resolve_current_revision
+        self._clock = clock or (lambda: dt.datetime.now(UTC))
+        self._audit_runner = audit_runner or run_strict_audit
+        self._reparse_checker = reparse_checker or _default_reparse_checker
+
+    def validate(
+        self,
+        manifest: TruthManifest | Mapping[str, Any] | str | Path,
+        run_root: str | Path,
+    ) -> BatchValidationResult:
+        validation_started = self._now()
         try:
             truth = self._truth(manifest)
         except TruthContractError as exc:
             raise BatchValidationError(exc.code, exc.detail) from exc
-        root = Path(run_root).resolve()
+        truth_mapping = truth.to_mapping()
+        manifest_sha256 = _sha256_json(truth_mapping)
+        root = Path(run_root).absolute()
         if not root.is_dir():
             raise BatchValidationError("invalid_run_root")
         config = _load_json(root / self.CONFIG_PATH, "missing_run_config")
         evidence = _load_json(root / self.EVIDENCE_PATH, "missing_run_evidence")
-        audit = _load_json(root / self.AUDIT_PATH, "missing_strict_audit")
+        revision = str(self._revision_resolver() or "").strip()
+        if not revision:
+            raise BatchValidationError("trusted_revision_unavailable")
+        run_id, version, scope = self._validate_config(config, truth, root, revision)
+        run_end = self._validate_run_evidence(evidence, root, run_id, revision, version)
+        if validation_started <= run_end:
+            raise BatchValidationError("validation_precedes_run_end")
 
-        run_id = str(config.get("run_id") or "").strip()
-        revision = str(config.get("candidate_revision") or "").strip()
-        version = str(config.get("candidate_version") or "").strip()
-        if not run_id:
-            raise BatchValidationError("missing_run_id")
-        if not revision or not version:
-            raise BatchValidationError("missing_candidate_version")
-        if _resolved(config.get("run_root")) != root:
-            raise BatchValidationError("scope_mismatch", "run_root")
-
-        active_run_config = config.get("active_run_config", {})
-        if not isinstance(active_run_config, Mapping):
-            raise BatchValidationError("invalid_run_config")
-
-        config_scope = {
-            "date_from": str(config.get("locked_date_from") or config.get("date_from") or ""),
-            "date_to": str(config.get("locked_date_to") or config.get("date_to") or ""),
-            "before_exclusive": str(config.get("before_exclusive") or ""),
-            "account_domain": str(config.get("email_domain") or config.get("account_domain") or "").lower(),
-            "account_channel": str(config.get("account_channel") or "").lower(),
-            "mailbox": str(config.get("mailbox") or ""),
-            "target_company": str(
-                config.get("target_company")
-                or config.get("target_company_id")
-                or active_run_config.get("company")
-                or ""
-            ),
+        inventory = compute_inventory(root / "output", reparse_checker=self._reparse_checker)
+        audit_started = self._now()
+        if audit_started < validation_started:
+            raise BatchValidationError("invalid_validator_clock")
+        fresh = self._audit_runner(truth_mapping, root)
+        audit_completed = self._now()
+        if audit_completed < audit_started or audit_started <= run_end:
+            raise BatchValidationError("invalid_fresh_audit_time")
+        post_audit_inventory = compute_inventory(root / "output", reparse_checker=self._reparse_checker)
+        if post_audit_inventory.digest != inventory.digest:
+            raise BatchValidationError("inventory_changed_during_validation")
+        inventory = post_audit_inventory
+        counts, assignments = self._validate_fresh_audit(fresh, truth, root, inventory)
+        self._validate_supplied_audit(
+            root,
+            run_id=run_id,
+            revision=revision,
+            manifest_sha256=manifest_sha256,
+            inventory=inventory,
+            run_end=run_end,
+            invocation_start=validation_started,
+        )
+        validation_completed = self._now()
+        if validation_completed < audit_completed:
+            raise BatchValidationError("invalid_validator_clock")
+        scope_digest = _sha256_json(scope)
+        fresh_bound = {
+            "run_id": run_id,
+            "run_root": str(root),
+            "candidate_revision": revision,
+            "candidate_version": version,
+            "manifest_sha256": manifest_sha256,
+            "inventory_sha256": inventory.digest,
+            "scope_digest": scope_digest,
+            "audit_started_at_utc": _utc_text(audit_started),
+            "audit_completed_at_utc": _utc_text(audit_completed),
+            "artifact_count": int(fresh.get("artifact_count", 0) or 0),
+            "exit_code": 0,
+            "counts": dict(counts),
         }
-        truth_scope = {
-            "date_from": truth.date_from.isoformat(),
-            "date_to": truth.date_to.isoformat(),
-            "before_exclusive": truth.before_exclusive.isoformat(),
-            "account_domain": truth.account_domain,
-            "account_channel": truth.account_channel,
-            "mailbox": truth.mailbox,
-            "target_company": truth.target_company,
-        }
-        if config_scope != truth_scope:
-            mismatch = next(key for key in truth_scope if config_scope.get(key) != truth_scope[key])
-            raise BatchValidationError("scope_mismatch", mismatch)
-
-        self._validate_evidence(evidence, root, run_id, revision, version)
-        counts = self._validate_audit(audit, truth, root, run_id, revision)
         return BatchValidationResult(
             passed=True,
             run_id=run_id,
             run_root=str(root),
             candidate_revision=revision,
             candidate_version=version,
-            counts=counts,
-            scope=truth_scope,
+            manifest_sha256=manifest_sha256,
+            inventory_sha256=inventory.digest,
+            scope_digest=scope_digest,
+            validation_started_at_utc=_utc_text(validation_started),
+            audit_started_at_utc=_utc_text(audit_started),
+            audit_completed_at_utc=_utc_text(audit_completed),
+            validation_completed_at_utc=_utc_text(validation_completed),
+            counts=MappingProxyType(dict(counts)),
+            scope=MappingProxyType(dict(scope)),
+            assignments=tuple(MappingProxyType(dict(item)) for item in assignments),
+            fresh_audit=MappingProxyType(fresh_bound),
         )
+
+    def _now(self) -> dt.datetime:
+        value = self._clock()
+        if not isinstance(value, dt.datetime):
+            raise BatchValidationError("invalid_validator_clock")
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
     @staticmethod
     def _truth(value: TruthManifest | Mapping[str, Any] | str | Path) -> TruthManifest:
@@ -167,50 +425,82 @@ class BatchValidator:
         return TruthManifest.from_path(value)
 
     @staticmethod
-    def _validate_evidence(evidence: Mapping[str, Any], root: Path, run_id: str, revision: str, version: str) -> None:
-        if str(evidence.get("run_id") or "") != run_id or _resolved(evidence.get("run_root")) != root:
-            raise BatchValidationError("scope_mismatch", "run evidence")
-        if evidence.get("candidate_revision") != revision or evidence.get("candidate_version") != version:
+    def _validate_config(
+        config: Mapping[str, Any],
+        truth: TruthManifest,
+        root: Path,
+        revision: str,
+    ) -> tuple[str, str, dict[str, str]]:
+        run_id = str(config.get("run_id") or "").strip()
+        version = str(config.get("candidate_version") or "").strip()
+        if not run_id:
+            raise BatchValidationError("missing_run_id")
+        if not version:
+            raise BatchValidationError("missing_candidate_version")
+        if str(config.get("candidate_revision") or "") != revision:
             raise BatchValidationError("version_mismatch")
-        if not str(evidence.get("hardware_mode") or "").strip():
-            raise BatchValidationError("missing_hardware_mode")
-        if "started_monotonic_seconds" not in evidence or "ended_monotonic_seconds" not in evidence:
-            raise BatchValidationError("missing_timing_boundary")
-        start = _decimal(evidence["started_monotonic_seconds"], code="invalid_timing_boundary")
-        end = _decimal(evidence["ended_monotonic_seconds"], code="invalid_timing_boundary")
-        elapsed = _decimal(evidence.get("elapsed_seconds"), code="invalid_timing_boundary")
-        if end < start or elapsed != end - start:
-            raise BatchValidationError("invalid_timing_boundary")
+        if canonical_windows_path(str(config.get("run_root") or "")) != canonical_windows_path(str(root)):
+            raise BatchValidationError("scope_mismatch", "run_root")
+        active = config.get("active_run_config", {})
+        if not isinstance(active, Mapping):
+            raise BatchValidationError("invalid_run_config")
+        scope = {
+            "date_from": str(config.get("locked_date_from") or config.get("date_from") or ""),
+            "date_to": str(config.get("locked_date_to") or config.get("date_to") or ""),
+            "before_exclusive": str(config.get("before_exclusive") or ""),
+            "account_domain": str(config.get("email_domain") or config.get("account_domain") or "").lower(),
+            "account_channel": str(config.get("account_channel") or "").lower(),
+            "mailbox": str(config.get("mailbox") or ""),
+            "target_identifier": str(
+                config.get("target_company") or config.get("target_company_id") or active.get("company") or ""
+            ),
+            "run_mode": str(config.get("run_mode") or ""),
+            "hardware_mode": str(config.get("hardware_mode") or ""),
+            "hardware_fingerprint": str(config.get("hardware_fingerprint") or ""),
+        }
+        expected = {
+            "date_from": truth.date_from.isoformat(),
+            "date_to": truth.date_to.isoformat(),
+            "before_exclusive": truth.before_exclusive.isoformat(),
+            "account_domain": truth.account_domain,
+            "account_channel": truth.account_channel,
+            "mailbox": truth.mailbox,
+            "target_identifier": truth.target_company,
+        }
+        for field, value in expected.items():
+            if scope.get(field) != value:
+                raise BatchValidationError("scope_mismatch", field)
+        if not all(scope.values()):
+            raise BatchValidationError("incomplete_run_scope")
+        return run_id, version, scope
 
     @staticmethod
-    def _validate_audit(
-        audit: Mapping[str, Any],
-        truth: TruthManifest,
+    def _validate_run_evidence(
+        evidence: Mapping[str, Any],
         root: Path,
         run_id: str,
         revision: str,
-    ) -> dict[str, int]:
-        if _resolved(audit.get("run_root")) != root:
-            raise BatchValidationError("scope_mismatch", "strict audit run_root")
-        if audit.get("candidate_revision") != revision or audit.get("run_id") != run_id:
-            raise BatchValidationError("stale_audit")
-        generated = str(audit.get("generated_at_utc") or "")
-        try:
-            generated_at = dt.datetime.fromisoformat(generated.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise BatchValidationError("stale_audit") from exc
-        if generated_at.tzinfo is None:
-            raise BatchValidationError("stale_audit")
-        audit_summary = audit.get("truth_summary")
-        if not isinstance(audit_summary, Mapping):
-            raise BatchValidationError("scope_mismatch", "strict audit truth summary")
-        for field in (
-            "dataset", "date_from", "date_to", "before_exclusive", "mailbox",
-            "account_domain", "target_company", "included_count", "pending_review_count", "finalized",
-        ):
-            if audit_summary.get(field) != truth.summary.get(field):
-                raise BatchValidationError("scope_mismatch", f"strict audit {field}")
+        version: str,
+    ) -> dt.datetime:
+        if str(evidence.get("run_id") or "") != run_id:
+            raise BatchValidationError("scope_mismatch", "run evidence id")
+        if canonical_windows_path(str(evidence.get("run_root") or "")) != canonical_windows_path(str(root)):
+            raise BatchValidationError("scope_mismatch", "run evidence root")
+        if evidence.get("candidate_revision") != revision or evidence.get("candidate_version") != version:
+            raise BatchValidationError("version_mismatch")
+        start = _decimal(evidence.get("started_monotonic_seconds"), code="invalid_timing_boundary")
+        end = _decimal(evidence.get("ended_monotonic_seconds"), code="invalid_timing_boundary")
+        elapsed = _decimal(evidence.get("elapsed_seconds"), code="invalid_timing_boundary")
+        if end < start or elapsed != end - start:
+            raise BatchValidationError("invalid_timing_boundary")
+        wall_start = _utc(evidence.get("started_at_utc"), code="invalid_run_time")
+        wall_end = _utc(evidence.get("ended_at_utc"), code="invalid_run_time")
+        if wall_end < wall_start:
+            raise BatchValidationError("invalid_run_time")
+        return wall_end
 
+    @staticmethod
+    def _strict_counts(audit: Mapping[str, Any]) -> dict[str, int]:
         try:
             p0 = int((audit.get("p0_conclusion") or {}).get("count", -1))
             p1 = int((audit.get("user_p1_conclusion") or {}).get("count", -1))
@@ -219,77 +509,123 @@ class BatchValidator:
             raise BatchValidationError("invalid_audit_result") from exc
         manual_rows = audit.get("manual_check_rows")
         manual = len(manual_rows) if isinstance(manual_rows, list) else -1
-        if audit.get("exit_code") != 0 or any(count != 0 for count in (p0, p1, p2, manual)):
+        return {"p0": p0, "p1": p1, "p2": p2, "manual": manual}
+
+    @classmethod
+    def _validate_fresh_audit(
+        cls,
+        audit: Mapping[str, Any],
+        truth: TruthManifest,
+        root: Path,
+        inventory: InventorySnapshot,
+    ) -> tuple[dict[str, int], list[dict[str, Any]]]:
+        if not isinstance(audit, Mapping):
+            raise BatchValidationError("invalid_audit_result")
+        if canonical_windows_path(str(audit.get("run_root") or "")) != canonical_windows_path(str(root)):
+            raise BatchValidationError("scope_mismatch", "fresh audit root")
+        counts = cls._strict_counts(audit)
+        if any(count != 0 for count in counts.values()):
             raise BatchValidationError("strict_audit_failed")
         matched = audit.get("matched_rows")
-        if not isinstance(matched, list):
+        if not isinstance(matched, list) or len(matched) != len(truth.included):
             raise BatchValidationError("matched_count_mismatch")
-        paths = [str(row.get("matched_path") or "") for row in matched if isinstance(row, Mapping)]
-        for path_value in paths:
-            candidate = Path(path_value)
-            if not path_value or not candidate.is_absolute():
-                raise BatchValidationError("invalid_artifact_assignment")
-            try:
-                candidate.resolve().relative_to(root)
-            except ValueError as exc:
-                raise BatchValidationError("invalid_artifact_assignment") from exc
-        if len(paths) != len(set(paths)):
+        raw_paths = [str(row.get("matched_path") or "") for row in matched if isinstance(row, Mapping)]
+        canonical_paths = [canonical_windows_path(path) for path in raw_paths]
+        if len(raw_paths) != len(matched):
+            raise BatchValidationError("invalid_artifact_assignment")
+        if len(canonical_paths) != len(set(canonical_paths)):
             raise BatchValidationError("duplicate_artifact_assignment")
-        truth_ids = [str(row.get("truth_id") or "") for row in matched if isinstance(row, Mapping)]
+        inventory_map = inventory.by_canonical_path
+        assignments = []
+        truth_ids = []
+        for row, canonical in zip(matched, canonical_paths):
+            path_value = str(row.get("matched_path") or "")
+            if not path_value or not Path(path_value).is_absolute():
+                raise BatchValidationError("invalid_artifact_assignment")
+            entry = inventory_map.get(canonical)
+            if entry is None:
+                raise BatchValidationError("invalid_artifact_assignment")
+            claimed_hash = str(row.get("artifact_sha256") or row.get("sha256") or "")
+            if claimed_hash and claimed_hash.lower() != entry.sha256:
+                raise BatchValidationError("artifact_hash_mismatch")
+            truth_id = str(row.get("truth_id") or "")
+            truth_ids.append(truth_id)
+            assignments.append({
+                **dict(row),
+                "matched_path": entry.absolute_path,
+                "canonical_path": entry.canonical_path,
+                "artifact_sha256": entry.sha256,
+                "artifact_size": entry.size,
+            })
         expected_ids = {row.truth_id for row in truth.included}
-        if len(matched) != len(truth.included) or set(truth_ids) != expected_ids:
+        if set(truth_ids) != expected_ids or len(truth_ids) != len(set(truth_ids)):
             raise BatchValidationError("matched_count_mismatch")
-        return {"p0": p0, "p1": p1, "p2": p2, "manual": manual, "matched": len(matched)}
+        counts["matched"] = len(assignments)
+        return counts, assignments
+
+    @staticmethod
+    def _validate_supplied_audit(
+        root: Path,
+        *,
+        run_id: str,
+        revision: str,
+        manifest_sha256: str,
+        inventory: InventorySnapshot,
+        run_end: dt.datetime,
+        invocation_start: dt.datetime,
+    ) -> None:
+        path = root / BatchValidator.SUPPLIED_AUDIT_PATH
+        if not path.exists():
+            return
+        supplied = _load_json(path, "stale_supplied_audit")
+        generated = _utc(supplied.get("generated_at_utc"), code="stale_supplied_audit")
+        expected = {
+            "run_id": run_id,
+            "candidate_revision": revision,
+            "manifest_sha256": manifest_sha256,
+            "inventory_sha256": inventory.digest,
+        }
+        if any(str(supplied.get(field) or "") != value for field, value in expected.items()):
+            raise BatchValidationError("stale_supplied_audit")
+        if canonical_windows_path(str(supplied.get("run_root") or "")) != canonical_windows_path(str(root)):
+            raise BatchValidationError("stale_supplied_audit")
+        if generated <= run_end or generated > invocation_start:
+            raise BatchValidationError("stale_supplied_audit")
+        rows = supplied.get("matched_rows")
+        if not isinstance(rows, list):
+            raise BatchValidationError("stale_supplied_audit")
+        inventory_map = inventory.by_canonical_path
+        seen = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise BatchValidationError("stale_supplied_audit")
+            canonical = canonical_windows_path(str(row.get("matched_path") or ""))
+            if canonical in seen or canonical not in inventory_map:
+                raise BatchValidationError("stale_supplied_audit")
+            seen.add(canonical)
+            if str(row.get("artifact_sha256") or "").lower() != inventory_map[canonical].sha256:
+                raise BatchValidationError("stale_supplied_audit")
 
     def write_report(self, result: BatchValidationResult, run_root: str | Path) -> Path:
-        root = Path(run_root).resolve()
+        root = Path(run_root).absolute()
         diagnostics = root / "diagnostics"
         diagnostics.mkdir(parents=True, exist_ok=True)
-        resolved_diagnostics = diagnostics.resolve()
+        if self._reparse_checker(diagnostics):
+            raise BatchValidationError("output_path_escape")
+        if not canonical_windows_path(str(diagnostics)).startswith(canonical_windows_path(str(root)) + "/"):
+            raise BatchValidationError("output_path_escape")
+        output = diagnostics / "batch_validation.json"
+        descriptor, temp_name = tempfile.mkstemp(prefix="batch_validation.", suffix=".tmp", dir=diagnostics)
         try:
-            resolved_diagnostics.relative_to(root)
-        except ValueError as exc:
-            raise BatchValidationError("output_path_escape") from exc
-        output = resolved_diagnostics / "batch_validation.json"
-        payload = json.dumps(result.to_mapping(), ensure_ascii=False, indent=2)
-        descriptor, temp_name = tempfile.mkstemp(prefix="batch_validation.", suffix=".tmp", dir=resolved_diagnostics)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(payload)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(json.dumps(result.to_mapping(), ensure_ascii=False, indent=2).encode("utf-8"))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_name, output)
         except BaseException:
-            try:
-                Path(temp_name).unlink(missing_ok=True)
-            finally:
-                raise
+            Path(temp_name).unlink(missing_ok=True)
+            raise
         return output
-
-
-def compare_performance(baseline_json: str | Path, candidate_json: str | Path) -> PerformanceVerdict:
-    baseline_payload = _load_json(Path(baseline_json), "invalid_baseline_metrics")
-    candidate_payload = _load_json(Path(candidate_json), "invalid_candidate_metrics")
-    for field in ("scope_id", "hardware_mode"):
-        left = str(baseline_payload.get(field) or "")
-        right = str(candidate_payload.get(field) or "")
-        if not left or left != right:
-            raise BatchValidationError("performance_contract_mismatch", field)
-    baseline = _performance_elapsed(baseline_payload)
-    candidate = _performance_elapsed(candidate_payload)
-    if baseline <= 0:
-        raise BatchValidationError("invalid performance seconds")
-    threshold = Decimal("0.30")
-    target = (baseline * (Decimal("1") - threshold)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    speedup = (baseline - candidate) / baseline
-    return PerformanceVerdict(
-        baseline_seconds=format(baseline, "f"),
-        candidate_seconds=format(candidate, "f"),
-        target_seconds=format(target, ".2f"),
-        speedup_fraction=format(speedup, ".8f"),
-        threshold_fraction=format(threshold, ".2f"),
-        passed=candidate <= target,
-    )
 
 
 def _performance_elapsed(payload: Mapping[str, Any]) -> Decimal:
@@ -301,10 +637,73 @@ def _performance_elapsed(payload: Mapping[str, Any]) -> Decimal:
     return elapsed
 
 
+def _validate_performance_record(payload: Mapping[str, Any], *, candidate: bool, revision: str) -> tuple[Decimal, str, str]:
+    if "scope_id" in payload:
+        raise BatchValidationError("arbitrary_scope_id")
+    scope_digest = compute_scope_digest(payload)
+    if payload.get("scope_digest") != scope_digest:
+        raise BatchValidationError("scope_digest_mismatch")
+    run_id = str(payload.get("run_id") or "").strip()
+    if not run_id:
+        raise BatchValidationError("invalid_performance_run")
+    wall_start = _utc(payload.get("started_at_utc"), code="invalid_performance_time")
+    wall_end = _utc(payload.get("ended_at_utc"), code="invalid_performance_time")
+    if wall_end < wall_start:
+        raise BatchValidationError("invalid_performance_time")
+    record_revision = str(payload.get("revision") or "").strip()
+    if not record_revision:
+        raise BatchValidationError("performance_revision_missing")
+    if candidate and record_revision != revision:
+        raise BatchValidationError("performance_revision_mismatch")
+    record_digest = compute_performance_record_digest(payload)
+    if payload.get("record_digest") != record_digest:
+        raise BatchValidationError("performance_record_digest_mismatch")
+    return _performance_elapsed(payload), scope_digest, record_digest
+
+
+def compare_performance(
+    baseline_json: str | Path,
+    candidate_json: str | Path,
+    *,
+    revision_resolver: Callable[[], str] | None = None,
+) -> PerformanceVerdict:
+    baseline_payload = _load_json(Path(baseline_json), "invalid_baseline_metrics")
+    candidate_payload = _load_json(Path(candidate_json), "invalid_candidate_metrics")
+    revision = str((revision_resolver or resolve_current_revision)() or "").strip()
+    baseline, baseline_scope, baseline_record = _validate_performance_record(
+        baseline_payload, candidate=False, revision=revision,
+    )
+    candidate, candidate_scope, candidate_record = _validate_performance_record(
+        candidate_payload, candidate=True, revision=revision,
+    )
+    if baseline_scope != candidate_scope:
+        raise BatchValidationError("performance_contract_mismatch")
+    if baseline_payload.get("run_id") == candidate_payload.get("run_id"):
+        raise BatchValidationError("performance_run_reused")
+    if baseline <= 0:
+        raise BatchValidationError("invalid performance seconds")
+    threshold = Decimal("0.30")
+    target = (baseline * (Decimal("1") - threshold)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    speedup = (baseline - candidate) / baseline
+    return PerformanceVerdict(
+        baseline_seconds=format(baseline, "f"),
+        candidate_seconds=format(candidate, "f"),
+        target_seconds=format(target, ".2f"),
+        speedup_fraction=format(speedup, ".8f"),
+        threshold_fraction=format(threshold, ".2f"),
+        scope_digest=baseline_scope,
+        baseline_revision=str(baseline_payload["revision"]),
+        candidate_revision=str(candidate_payload["revision"]),
+        baseline_record_digest=baseline_record,
+        candidate_record_digest=candidate_record,
+        passed=candidate <= target,
+    )
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate a finalized truth manifest against immutable run evidence.")
-    parser.add_argument("--truth-manifest", required=True, help="Path to the finalized truth manifest JSON")
-    parser.add_argument("--run-root", required=True, help="Path to the completed run root")
+    parser = argparse.ArgumentParser(description="Validate finalized truth against fresh run evidence.")
+    parser.add_argument("--truth-manifest", required=True, help="Path to finalized truth JSON")
+    parser.add_argument("--run-root", required=True, help="Path to completed run root")
     args = parser.parse_args()
     validator = BatchValidator()
     try:
@@ -313,7 +712,7 @@ def main() -> int:
     except (BatchValidationError, TruthContractError) as exc:
         print(json.dumps({"passed": False, "error_code": exc.code}, ensure_ascii=False))
         return 1
-    print(json.dumps({"passed": True, "counts": dict(result.counts), "output": str(output.resolve())}, ensure_ascii=False))
+    print(json.dumps({"passed": True, "counts": dict(result.counts), "output": str(output.absolute())}, ensure_ascii=False))
     return 0
 
 

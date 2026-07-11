@@ -1,8 +1,19 @@
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
 from build_truth_dataset import (
+    TruthBuildError,
     fetch_internaldate_local,
+    load_truth_build_identity,
     parse_generic_xml,
     resolve_email_text_evidence,
     truth_hotel_folio_date,
+    validate_truth_build_paths,
 )
 
 
@@ -71,3 +82,88 @@ def test_truth_hotel_date_preserves_printed_date_priority():
     text = "离店日期: 2026-05-22\n打印日期: 2026-05-21\n酒店结账单"
 
     assert truth_hotel_folio_date(text) == "2026-05-21"
+
+
+def _source_snapshot(root: Path) -> dict[str, tuple[str, int]]:
+    snapshot = {}
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        snapshot[path.relative_to(root).as_posix()] = (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            path.stat().st_mtime_ns,
+        )
+    return snapshot
+
+
+def _offline_source(tmp_path: Path, *, include_identity=True) -> Path:
+    source = tmp_path / "source"
+    source.mkdir()
+    config = {
+        "target_company": "目标公司",
+        "account_domain": "qq.com",
+        "mailbox": "INBOX",
+        "date_from": "2026-06-01",
+        "date_to": "2026-06-13",
+        "before_exclusive": "2026-06-14",
+    } if include_identity else {"mailbox": "INBOX"}
+    (source / "truth_collection_config.json").write_text(json.dumps(config), encoding="utf-8")
+    for name in ("document_index.jsonl", "link_downloads.jsonl", "url_candidates.jsonl", "mailbox_inventory.jsonl"):
+        (source / name).write_text("", encoding="utf-8")
+    return source
+
+
+def test_skip_collect_cli_is_source_read_only_and_blocks_imap_imports(tmp_path):
+    source = _offline_source(tmp_path)
+    output = tmp_path / "output"
+    before = _source_snapshot(source)
+    entry = Path(__file__).resolve().parents[1] / "build_truth_dataset.py"
+    hook = """
+import builtins, importlib, runpy, sys
+blocked = {'email_fetcher', 'mailbox_scanner', 'pdf_converter', 'user_settings', 'imaplib'}
+original_import = builtins.__import__
+original_dynamic = importlib.import_module
+def guarded(name, *args, **kwargs):
+    if name.split('.')[0] in blocked:
+        raise RuntimeError('blocked import:' + name)
+    return original_import(name, *args, **kwargs)
+def guarded_dynamic(name, *args, **kwargs):
+    if name.split('.')[0] in blocked:
+        raise RuntimeError('blocked dynamic import:' + name)
+    return original_dynamic(name, *args, **kwargs)
+builtins.__import__ = guarded
+importlib.import_module = guarded_dynamic
+source, output, entry = sys.argv[1:4]
+sys.argv = ['build_truth_dataset.py', '--date-from', '2026-06-01', '--date-to', '2026-06-13',
+            '--before-exclusive', '2026-06-14', '--mailbox', 'INBOX', '--source-root', source,
+            '--output-root', output, '--skip-collect']
+runpy.run_path(entry, run_name='__main__')
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", hook, str(source), str(output), str(entry)],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert _source_snapshot(source) == before
+    assert (output / "truth_build_config.json").exists()
+    assert (output / "truth_manifest.json").exists()
+
+
+def test_skip_collect_requires_immutable_target_identity(tmp_path):
+    source = _offline_source(tmp_path, include_identity=False)
+
+    with pytest.raises(TruthBuildError) as exc_info:
+        load_truth_build_identity(source, explicit_target="", explicit_domain="")
+
+    assert exc_info.value.code == "target_company_required"
+
+
+@pytest.mark.parametrize("placement", ["same", "inside"])
+def test_truth_output_cannot_mutate_source_tree(tmp_path, placement):
+    source = _offline_source(tmp_path)
+    output = source if placement == "same" else source / "generated"
+
+    with pytest.raises(TruthBuildError) as exc_info:
+        validate_truth_build_paths(source, output)
+
+    assert exc_info.value.code == "output_overlaps_source"

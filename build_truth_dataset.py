@@ -2,6 +2,7 @@ import argparse
 import csv
 import datetime as dt
 import email
+import email.header
 import email.utils
 import hashlib
 import html
@@ -67,14 +68,6 @@ ROOT = repo_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from email_fetcher import (  # noqa: E402
-    EmailFetcher,
-    decode_str,
-)
-from mailbox_scanner import MailboxScanner  # noqa: E402
-from pdf_converter import PDFConverter  # noqa: E402
-from user_settings import UserSettingsStore  # noqa: E402
-
 
 TIER1_DOMAINS = (
     "@12306.cn", "@rails.com.cn", "@didichuxing.com", "@gaode.com", "@marriott.com",
@@ -87,6 +80,20 @@ DIRECT_INVOICE_FAMILIES = (
     "nuonuo_scan_invoice", "pdd_direct_invoice", "jdcloud_direct_invoice", "kpbyd_direct_invoice",
 )
 OCR_COMPAT_TRANSLATION = str.maketrans({"⻔": "门", "⻝": "食", "⻨": "麦", "⻆": "角"})
+
+
+class TruthBuildError(ValueError):
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def decode_str(value) -> str:
+    try:
+        return str(email.header.make_header(email.header.decode_header(str(value or ""))))
+    except (LookupError, UnicodeError):
+        return str(value or "")
 
 
 def normalize_ocr_compat_text(value) -> str:
@@ -245,29 +252,41 @@ def parse_mail_date(message) -> str:
         return ""
 
 
-def fetch_internaldate_local(fetcher: EmailFetcher, email_id) -> str:
-    normalized = MailboxScanner.normalize_uids([email_id])
-    if len(normalized) != 1:
+def _truth_uid(value) -> bytes | None:
+    raw = value.decode("ascii", errors="ignore") if isinstance(value, bytes) else str(value or "")
+    raw = raw.strip()
+    return raw.encode("ascii") if raw.isdigit() else None
+
+
+def fetch_internaldate_local(fetcher, email_id) -> str:
+    requested_uid = _truth_uid(email_id)
+    if requested_uid is None:
         return ""
-    requested_uid = normalized[0]
     try:
         status, data = fetcher.mail.uid(
             "FETCH", requested_uid, "(UID INTERNALDATE)"
         )
     except Exception:
         return ""
-    if not MailboxScanner.is_ok_status(status) or not data:
+    status_text = status.decode("ascii", errors="ignore") if isinstance(status, bytes) else str(status or "")
+    if status_text.upper() != "OK" or not data:
         return ""
     for part in data:
         metadata = part[0] if isinstance(part, tuple) and part else part
         if not isinstance(metadata, (bytes, bytearray)):
             continue
         metadata = bytes(metadata)
-        if MailboxScanner.extract_uid(metadata) != requested_uid:
+        uid_match = re.search(rb"\bUID\s+(\d+)\b", metadata, flags=re.IGNORECASE)
+        if not uid_match or uid_match.group(1) != requested_uid:
             continue
-        parsed = MailboxScanner.extract_internal_date(metadata)
-        if parsed:
-            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        date_match = re.search(rb'INTERNALDATE\s+"([^"]+)"', metadata, flags=re.IGNORECASE)
+        if not date_match:
+            continue
+        try:
+            parsed = email.utils.parsedate_to_datetime(date_match.group(1).decode("ascii"))
+            return parsed.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            continue
     return ""
 
 
@@ -426,7 +445,16 @@ def compute_tier(sender: str, subject: str, body_text: str) -> int:
 
 
 def collect_raw_evidence(args, source_root: Path):
+    from email_fetcher import EmailFetcher
+    from pdf_converter import PDFConverter
+    from user_settings import UserSettingsStore
+
     settings = UserSettingsStore().load()
+    args.target_company = str(getattr(args, "target_company", "") or settings.get("company") or "").strip()
+    settings_email = str(settings.get("email") or "").strip()
+    args.account_domain = str(getattr(args, "account_domain", "") or (
+        settings_email.rsplit("@", 1)[1] if "@" in settings_email else ""
+    )).lower()
     email_address = settings["email"]
     auth_code = settings["auth_code"]
     fetcher = EmailFetcher(
@@ -1504,6 +1532,9 @@ def fetch_email_text_evidence(email_ids, source_root: Path, mailbox: str) -> dic
     email_ids = sorted({str(item) for item in email_ids if str(item)})
     if not email_ids:
         return {}
+    from email_fetcher import EmailFetcher
+    from user_settings import UserSettingsStore
+
     settings = UserSettingsStore().load()
     fetcher = EmailFetcher(
         settings["email"],
@@ -2037,9 +2068,47 @@ def row_in_truth_window(row: dict, date_from: str, before_exclusive: str) -> boo
     return True
 
 
+def validate_truth_build_paths(source_root: Path, output_root: Path) -> None:
+    source = source_root.resolve()
+    output = output_root.resolve()
+    try:
+        output.relative_to(source)
+    except ValueError:
+        pass
+    else:
+        raise TruthBuildError("output_overlaps_source")
+
+
+def load_truth_build_identity(
+    source_root: Path,
+    *,
+    explicit_target: str,
+    explicit_domain: str,
+) -> dict[str, str]:
+    config_path = source_root / "truth_collection_config.json"
+    saved = {}
+    if config_path.is_file():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            saved = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TruthBuildError("invalid_collection_config") from exc
+    target = str(explicit_target or saved.get("target_company") or saved.get("target_identifier") or "").strip()
+    if not target:
+        raise TruthBuildError("target_company_required")
+    domain = str(explicit_domain or saved.get("account_domain") or "").strip().lower()
+    if not domain:
+        raise TruthBuildError("account_domain_required")
+    return {"target_company": target, "account_domain": domain}
+
+
 def build_truth(args, source_root: Path, output_root: Path):
-    settings = UserSettingsStore().load()
-    target_company = str(getattr(args, "target_company", "") or settings.get("company") or "").strip()
+    identity = load_truth_build_identity(
+        source_root,
+        explicit_target=str(getattr(args, "target_company", "") or ""),
+        explicit_domain=str(getattr(args, "account_domain", "") or ""),
+    )
+    target_company = identity["target_company"]
     doc_rows = read_jsonl(source_root / "document_index.jsonl")
     link_rows = read_jsonl(source_root / "link_downloads.jsonl")
     url_rows = read_jsonl(source_root / "url_candidates.jsonl")
@@ -2333,7 +2402,7 @@ def build_truth(args, source_root: Path, output_root: Path):
             "date_to": args.date_to,
             "before_exclusive": args.before_exclusive,
             "mailbox": args.mailbox,
-            "account_domain": settings.get("email", "").split("@")[-1] if "@" in settings.get("email", "") else "",
+            "account_domain": identity["account_domain"],
             "target_company": target_company,
             "included_count": len(included),
             "excluded_count": len(excluded),
@@ -2359,6 +2428,7 @@ def main():
     parser.add_argument("--before-exclusive", default="")
     parser.add_argument("--mailbox", default="INBOX")
     parser.add_argument("--target-company", default="")
+    parser.add_argument("--account-domain", default="")
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--skip-collect", action="store_true")
@@ -2369,12 +2439,24 @@ def main():
 
     source_root = Path(args.source_root).resolve()
     output_root = Path(args.output_root).resolve()
-    source_root.mkdir(parents=True, exist_ok=True)
+    validate_truth_build_paths(source_root, output_root)
+    if args.skip_collect:
+        if not source_root.is_dir():
+            raise TruthBuildError("missing_source_root")
+        identity = load_truth_build_identity(
+            source_root,
+            explicit_target=args.target_company,
+            explicit_domain=args.account_domain,
+        )
+        args.target_company = identity["target_company"]
+        args.account_domain = identity["account_domain"]
+    else:
+        source_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
-    write_json(source_root / "truth_collection_config.json", vars(args))
     if not args.skip_collect:
         inventory = collect_raw_evidence(args, source_root)
         print(json.dumps({"event": "collected", **{k: inventory[k] for k in ["email_count", "document_count", "url_candidate_count", "link_download_count"]}}, ensure_ascii=False), flush=True)
+    write_json(output_root / "truth_build_config.json", vars(args))
     manifest = build_truth(args, source_root, output_root)
     print(json.dumps({"event": "truth_built", **manifest["summary"]}, ensure_ascii=False, indent=2), flush=True)
     return 0 if manifest["summary"]["finalized"] else 2

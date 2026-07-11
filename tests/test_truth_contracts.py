@@ -1,6 +1,8 @@
 import ast
 import copy
 import json
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -18,6 +20,12 @@ FORBIDDEN_MODULES = {
     "archive_service",
     "candidate_pipeline",
     "invoice_extractor",
+}
+OFFLINE_FORBIDDEN_MODULES = FORBIDDEN_MODULES | {
+    "email_fetcher",
+    "mailbox_scanner",
+    "pdf_converter",
+    "user_settings",
 }
 
 
@@ -192,6 +200,63 @@ def test_truth_builder_does_not_use_runtime_extractor_or_classifier_rules():
     assert "candidate_pipeline" not in imports
     assert "archive_service" not in imports
     assert forbidden_calls == []
+
+
+def test_independent_boundary_blocks_runtime_and_dynamic_imports_in_subprocess():
+    root = Path(__file__).resolve().parents[1]
+    script = r"""
+import builtins, importlib, sys
+blocked = {'app_api', 'archive_service', 'candidate_pipeline', 'invoice_extractor'}
+original_import = builtins.__import__
+original_dynamic = importlib.import_module
+def guarded(name, *args, **kwargs):
+    if name.split('.')[0] in blocked:
+        raise RuntimeError('blocked import:' + name)
+    return original_import(name, *args, **kwargs)
+def guarded_dynamic(name, *args, **kwargs):
+    if name.split('.')[0] in blocked:
+        raise RuntimeError('blocked dynamic import:' + name)
+    return original_dynamic(name, *args, **kwargs)
+builtins.__import__ = guarded
+importlib.import_module = guarded_dynamic
+sys.path.insert(0, sys.argv[1])
+for module in ('truth_contracts', 'strict_truth_audit', 'batch_validation'):
+    importlib.import_module(module)
+print('independent-import-ok')
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        capture_output=True, text=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "independent-import-ok"
+
+
+def test_no_hidden_dynamic_runtime_imports_and_offline_builder_has_no_top_level_imap_imports():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("truth_contracts.py", "strict_truth_audit.py", "batch_validation.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"), filename=name)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            called = (
+                isinstance(node.func, ast.Name) and node.func.id == "__import__"
+            ) or (
+                isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"
+            )
+            if called:
+                assert str(node.args[0].value).split(".")[0] not in FORBIDDEN_MODULES
+
+    builder_tree = ast.parse((root / "build_truth_dataset.py").read_text(encoding="utf-8"), filename="build_truth_dataset.py")
+    top_level_imports = set()
+    for node in builder_tree.body:
+        if isinstance(node, ast.Import):
+            top_level_imports.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top_level_imports.add(node.module.split(".")[0])
+    assert top_level_imports.isdisjoint(OFFLINE_FORBIDDEN_MODULES)
 
 
 def test_serialized_contract_preserves_public_manifest_field_names():
