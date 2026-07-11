@@ -9,6 +9,17 @@ import pdf_converter
 from email_fetcher import _build_link_candidate_decision
 from pdf_converter import PDFConverter
 from provider_direct_invoice import infer_direct_invoice_family
+from url_security import PublicUrlPolicy, PublicUrlPolicyError
+
+
+PUBLIC_ADDRESS = "93.184.216.34"
+
+
+def public_test_policy(peer_address=PUBLIC_ADDRESS):
+    return PublicUrlPolicy(
+        resolver=lambda host, port: [PUBLIC_ADDRESS],
+        peer_getter=lambda response: peer_address,
+    )
 
 
 class FakeResponse:
@@ -104,6 +115,58 @@ class FakeRequests:
         return FakeSession()
 
 
+class RecordingSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self.responses.pop(0)
+
+
+class FakeRoute:
+    def __init__(self):
+        self.action = None
+
+    def continue_(self):
+        self.action = "continue"
+
+    def abort(self, reason=None):
+        self.action = ("abort", reason)
+
+
+class FakeBrowserRequest:
+    def __init__(self, url):
+        self.url = url
+
+
+class FakeDomPage:
+    def locator(self, selector):
+        return self
+
+    def evaluate_all(self, script):
+        return [
+            "https://public.example/invoice.pdf?token=public-secret",
+            "http://127.0.0.1/admin?token=private-secret",
+        ]
+
+    def content(self):
+        return ""
+
+
+class FakeBrowserResponse(FakeResponse):
+    def __init__(self, url, peer_address, **kwargs):
+        super().__init__(url, **kwargs)
+        self._peer_address = peer_address
+
+    def server_addr(self):
+        return {"ipAddress": self._peer_address, "port": 443}
+
+    def body(self):
+        return self.content
+
+
 NUONUO_XML = """<?xml version="1.0" encoding="utf-8"?>
 <EInvoice><SellerName>长沙楼上餐饮管理有限公司</SellerName><BuyerName>辉瑞投资有限公司</BuyerName>
 <TotalTax-includedAmount>399.40</TotalTax-includedAmount><InvoiceNumber>26432000001233579481</InvoiceNumber>
@@ -116,6 +179,123 @@ BAIWANG_XML = """<?xml version="1.0" encoding="utf-8"?>
 
 
 class ProviderUrlRecoveryTests(unittest.TestCase):
+    def test_private_direct_candidate_is_rejected_before_session_connection(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        session = RecordingSession([])
+
+        artifacts, logs = converter._probe_direct_invoice_artifact(
+            session,
+            "http://127.0.0.1/invoice.pdf?token=private-secret",
+            str(Path(converter.staging_dir) / "private"),
+        )
+
+        self.assertEqual(artifacts, [])
+        self.assertEqual(session.calls, [])
+        self.assertEqual(logs[0]["kind"], "URL_POLICY_REJECTED")
+        self.assertNotIn("private-secret", json.dumps(logs))
+
+    def test_public_request_rejects_private_redirect_without_following_it(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        session = RecordingSession(
+            [
+                FakeResponse(
+                    "https://public.example/start",
+                    status_code=302,
+                    headers={"Location": "http://127.0.0.1/admin?token=private-secret"},
+                )
+            ]
+        )
+
+        with self.assertRaises(PublicUrlPolicyError) as caught:
+            converter._request_public(session, "GET", "https://public.example/start")
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertFalse(session.calls[0][2]["allow_redirects"])
+        self.assertNotIn("private-secret", str(caught.exception))
+
+    def test_public_request_rejects_connected_private_peer(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(peer_address="10.0.0.9"),
+        )
+        session = RecordingSession(
+            [FakeResponse("https://public.example/invoice.pdf")]
+        )
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._request_public(
+                session, "GET", "https://public.example/invoice.pdf"
+            )
+
+    def test_browser_route_aborts_private_document_or_resource_requests(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        for url in (
+            "http://127.0.0.1/document",
+            "http://10.0.0.5/private-resource.js?token=private-secret",
+        ):
+            with self.subTest(url=url):
+                route = FakeRoute()
+                converter._guard_browser_request(route, FakeBrowserRequest(url))
+                self.assertEqual(route.action[0], "abort")
+
+        route = FakeRoute()
+        converter._guard_browser_request(
+            route, FakeBrowserRequest("https://public.example/invoice")
+        )
+        self.assertEqual(route.action, "continue")
+
+    def test_dom_private_urls_are_removed_before_provider_probe(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        logs = []
+
+        urls = converter._validated_dom_urls(
+            FakeDomPage(), "https://public.example/start", logs
+        )
+
+        self.assertEqual(
+            urls, ["https://public.example/invoice.pdf?token=public-secret"]
+        )
+        self.assertEqual(logs[0]["kind"], "URL_POLICY_REJECTED")
+        self.assertNotIn("private-secret", json.dumps(logs))
+
+    def test_captured_private_response_url_is_rejected_before_body_read(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        response = FakeBrowserResponse(
+            "http://127.0.0.1/invoice.pdf?token=private-secret",
+            "127.0.0.1",
+            content=b"%PDF-1.5\nprivate",
+            headers={"content-type": "application/pdf"},
+        )
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._capture_direct_invoice_response_artifact(
+                response,
+                str(Path(converter.staging_dir) / "capture"),
+                1,
+                "https://public.example/start",
+            )
+
+    def test_browser_response_rejects_peer_not_in_validated_dns_set(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        response = FakeBrowserResponse(
+            "https://public.example/invoice.pdf", "10.0.0.9"
+        )
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._validate_browser_response(response)
+
     def test_direct_invoice_acceptance_normalizes_seller_parentheses(self):
         api = InvoiceAppAPI()
         api._extract_pdf_preview_text = lambda *args, **kwargs: ""
@@ -189,7 +369,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
     def test_direct_file_invoice_recovery_downloads_without_chromium(self):
         original_requests = pdf_converter.requests
         pdf_converter.requests = FakeRequests
-        converter = PDFConverter(staging_dir=tempfile.mkdtemp())
+        converter = PDFConverter(staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy())
         converter._require_playwright = lambda: (_ for _ in ()).throw(AssertionError("Chromium should not be required"))
         cases = [
             (
@@ -255,7 +435,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
     def test_direct_invoice_recovery_downloads_fpyun_pdf_without_chromium(self):
         original_requests = pdf_converter.requests
         pdf_converter.requests = FakeRequests
-        converter = PDFConverter(staging_dir=tempfile.mkdtemp())
+        converter = PDFConverter(staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy())
         converter._require_playwright = lambda: (_ for _ in ()).throw(AssertionError("Chromium should not be required"))
         try:
             result = converter._recover_direct_invoice_group(
@@ -273,7 +453,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
     def test_baiwang_preview_invoice_downloads_pdf_without_chromium(self):
         original_requests = pdf_converter.requests
         pdf_converter.requests = FakeRequests
-        converter = PDFConverter(staging_dir=tempfile.mkdtemp())
+        converter = PDFConverter(staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy())
         converter._require_playwright = lambda: (_ for _ in ()).throw(AssertionError("Chromium should not be required"))
         try:
             result = converter._recover_baiwang_group(
@@ -291,7 +471,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
     def test_nuonuo_shortlink_recovers_invoice_pdf_without_chromium(self):
         original_requests = pdf_converter.requests
         pdf_converter.requests = FakeRequests
-        converter = PDFConverter(staging_dir=tempfile.mkdtemp())
+        converter = PDFConverter(staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy())
         converter._require_playwright = lambda: (_ for _ in ()).throw(AssertionError("Chromium should not be required"))
         try:
             result = converter._recover_direct_invoice_group(

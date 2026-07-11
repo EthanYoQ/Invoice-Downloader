@@ -44,6 +44,7 @@ from provider_direct_invoice import (
     normalize_token as normalize_direct_token,
     parse_direct_invoice_xml_fields,
 )
+from url_security import PublicUrlPolicy, PublicUrlPolicyError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -77,11 +78,14 @@ class PDFConverter:
         ],
     }
 
-    def __init__(self, staging_dir="staging", timeout_ms=30000):
+    def __init__(self, staging_dir="staging", timeout_ms=30000, url_policy=None):
         self.staging_dir = os.path.abspath(staging_dir)
         self.timeout_ms = timeout_ms
         self.generic_timeout_ms = max(8000, min(int(timeout_ms or 0) or 30000, 12000))
         self.provider_settle_timeout_ms = max(1500, min(int(timeout_ms or 0) or 30000, 4000))
+        self.url_policy = url_policy or PublicUrlPolicy()
+        self._browser_validated_urls = {}
+        self._browser_policy_rejections = []
 
     @staticmethod
     def _elapsed_ms(started_at):
@@ -205,8 +209,112 @@ class PDFConverter:
             )
         return "", ""
 
+    @staticmethod
+    def _header_value(headers, name):
+        target = str(name or "").lower()
+        for key, value in dict(headers or {}).items():
+            if str(key).lower() == target:
+                return value
+        return ""
+
+    @staticmethod
+    def _policy_rejection_log(exc, source):
+        return {
+            "kind": "URL_POLICY_REJECTED",
+            "url": exc.safe_url,
+            "message": exc.reason,
+            "source": source,
+        }
+
+    def _request_public(self, session, method, url, max_redirects=10, **kwargs):
+        current = self.url_policy.validate(url)
+        request_method = str(method or "GET").upper()
+        request_kwargs = dict(kwargs)
+        request_kwargs.pop("allow_redirects", None)
+        request_kwargs["allow_redirects"] = False
+        request_kwargs["stream"] = True
+
+        for redirect_count in range(max_redirects + 1):
+            response = getattr(session, request_method.lower())(
+                current.url, **request_kwargs
+            )
+            try:
+                response_url = str(getattr(response, "url", "") or current.url)
+                connected_target = (
+                    current
+                    if response_url == current.url
+                    else self.url_policy.validate(response_url)
+                )
+                self.url_policy.verify_response_peer(response, connected_target)
+
+                status = int(getattr(response, "status_code", 0) or 0)
+                location = self._header_value(getattr(response, "headers", {}), "location")
+                if status not in {301, 302, 303, 307, 308} or not location:
+                    return response
+                if redirect_count >= max_redirects:
+                    raise PublicUrlPolicyError(current.url, "too many redirects")
+                next_target = self.url_policy.resolve_redirect(connected_target, location)
+            except Exception:
+                response.close()
+                raise
+
+            response.close()
+            if status in {301, 302, 303} and request_method != "HEAD":
+                request_method = "GET"
+                request_kwargs.pop("data", None)
+                request_kwargs.pop("json", None)
+            current = next_target
+
+        raise PublicUrlPolicyError(current.url, "too many redirects")
+
+    def _guard_browser_request(self, route, request):
+        try:
+            validated = self.url_policy.validate(request.url)
+            self._browser_validated_urls[request.url] = validated
+        except PublicUrlPolicyError as exc:
+            self._browser_policy_rejections.append(
+                self._policy_rejection_log(exc, "browser_request")
+            )
+            logging.warning("%s", exc)
+            route.abort("blockedbyclient")
+            return
+        route.continue_()
+
+    def _validate_browser_response(self, response):
+        response_url = str(getattr(response, "url", "") or "")
+        request = getattr(response, "request", None)
+        request_url = str(getattr(request, "url", "") or response_url)
+        validated = self._browser_validated_urls.get(request_url)
+        response_target = self.url_policy.validate(response_url)
+        if validated is None:
+            validated = response_target
+        elif (validated.host, validated.port) != (
+            response_target.host,
+            response_target.port,
+        ):
+            raise PublicUrlPolicyError(
+                response_url, "browser response target changed unexpectedly"
+            )
+        try:
+            server_address = response.server_addr()
+            peer_address = (server_address or {}).get("ipAddress", "")
+        except Exception as exc:
+            raise PublicUrlPolicyError(
+                response_url, "browser connected peer could not be verified"
+            ) from exc
+        return self.url_policy.verify_peer_address(peer_address, validated)
+
+    def _goto_public_page(self, page, url, timeout_ms):
+        validated = self.url_policy.validate(url)
+        response = page.goto(
+            validated.url, timeout=timeout_ms, wait_until="domcontentloaded"
+        )
+        if response:
+            self._validate_browser_response(response)
+        return response
+
     def _goto_provider_page(self, page, url):
-        response = page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
+        response = self._goto_public_page(page, url, self.timeout_ms)
         try:
             page.wait_for_load_state("networkidle", timeout=self.provider_settle_timeout_ms)
         except Exception:
@@ -276,6 +384,15 @@ class PDFConverter:
             )
             raise RuntimeError(message) from exc
 
+    def _new_browser_context(self, browser):
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            accept_downloads=True,
+            service_workers="block",
+        )
+        context.route("**/*", self._guard_browser_request)
+        return context
+
     def _build_candidate_urls(self, text_content, subject, candidate_info):
         if candidate_info and candidate_info.get("provider_family") == "baiwang":
             return collect_baiwang_candidate_urls(
@@ -310,7 +427,9 @@ class PDFConverter:
             )
         }
         try:
-            response = session.get(url, timeout=20, allow_redirects=True, headers=headers)
+            response = self._request_public(session, "GET", url, timeout=20, headers=headers)
+        except PublicUrlPolicyError as exc:
+            return [], [self._policy_rejection_log(exc, "direct_probe")]
         except Exception as exc:
             return [], [{"kind": "direct_probe_error", "url": url, "message": str(exc)}]
 
@@ -347,13 +466,18 @@ class PDFConverter:
                 continue
             api_url = "https://pis.baiwang.com/bwmg/mix/bw/previewInvoiceQd"
             try:
-                response = session.post(
+                response = self._request_public(
+                    session,
+                    "POST",
                     api_url,
                     data=param.encode("utf-8"),
                     headers={"Content-Type": "application/json; charset=utf-8"},
                     timeout=20,
                 )
                 data = response.json()
+            except PublicUrlPolicyError as exc:
+                logs.append(self._policy_rejection_log(exc, "baiwang_preview_api"))
+                continue
             except Exception as exc:
                 logs.append({"kind": "baiwang_preview_api_error", "url": api_url, "message": str(exc)})
                 continue
@@ -400,6 +524,16 @@ class PDFConverter:
             unique_urls.append(normalized)
         return unique_urls
 
+    def _validated_dom_urls(self, page, base_url, logs):
+        public_urls = []
+        for dom_url in self._collect_dom_urls(page):
+            candidate = urljoin(base_url, dom_url)
+            try:
+                public_urls.append(self.url_policy.validate(candidate).url)
+            except PublicUrlPolicyError as exc:
+                logs.append(self._policy_rejection_log(exc, "dom_url"))
+        return public_urls
+
     def _describe_baiwang_artifact(self, path, kind, source_url, mode, fields):
         artifact = {
             "path": path,
@@ -442,7 +576,11 @@ class PDFConverter:
             )
         }
         try:
-            response = session.get(url, timeout=20, allow_redirects=True, headers=headers, stream=True)
+            response = self._request_public(
+                session, "GET", url, timeout=20, headers=headers, stream=True
+            )
+        except PublicUrlPolicyError as exc:
+            return [], [self._policy_rejection_log(exc, "direct_invoice_probe")]
         except Exception as exc:
             return [], [{"kind": "direct_probe_error", "url": url, "message": str(exc)}]
 
@@ -493,10 +631,11 @@ class PDFConverter:
         artifacts = []
         logs = []
         try:
-            response = session.get(
+            response = self._request_public(
+                session,
+                "GET",
                 url,
                 timeout=20,
-                allow_redirects=True,
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -504,6 +643,8 @@ class PDFConverter:
                     )
                 },
             )
+        except PublicUrlPolicyError as exc:
+            return [], [self._policy_rejection_log(exc, "nuonuo_shortlink")]
         except Exception as exc:
             return [], [{"kind": "nuonuo_shortlink_error", "url": url, "message": str(exc)}]
 
@@ -525,8 +666,13 @@ class PDFConverter:
             "shortLinkSource": (query.get("shortLinkSource") or [""])[0],
         }
         try:
-            detail_response = session.post(endpoint, data=payload, timeout=20)
+            detail_response = self._request_public(
+                session, "POST", endpoint, data=payload, timeout=20
+            )
             detail = detail_response.json()
+        except PublicUrlPolicyError as exc:
+            logs.append(self._policy_rejection_log(exc, "nuonuo_detail_api"))
+            return artifacts, logs
         except Exception as exc:
             logs.append({"kind": "nuonuo_detail_api_error", "url": endpoint, "message": str(exc)})
             return artifacts, logs
@@ -550,6 +696,7 @@ class PDFConverter:
         return artifacts, logs
 
     def _capture_direct_invoice_response_artifact(self, response, artifact_prefix, artifact_index, source_url):
+        self._validate_browser_response(response)
         headers = self._response_headers(response)
         kind = infer_direct_download_kind(
             response.url,
@@ -649,6 +796,7 @@ class PDFConverter:
         return None, "no_valid_pdf"
 
     def _capture_response_artifact(self, response, artifact_prefix, artifact_index):
+        self._validate_browser_response(response)
         headers = self._response_headers(response)
         kind = infer_baiwang_download_kind(
             response.url,
@@ -824,7 +972,7 @@ class PDFConverter:
         with requests.Session() as session:
             with sync_playwright() as playwright:
                 browser = self._launch_chromium_browser(playwright, "baiwang recovery")
-                context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+                context = self._new_browser_context(browser)
                 try:
                     for index, url in enumerate(ordered_candidate_urls, start=1):
                         artifact_prefix = os.path.join(email_staging_path, f"baiwang_{index}")
@@ -839,6 +987,13 @@ class PDFConverter:
                         captured_responses = []
 
                         def _on_response(response):
+                            try:
+                                self._validate_browser_response(response)
+                            except PublicUrlPolicyError as exc:
+                                network_logs.append(
+                                    self._policy_rejection_log(exc, "browser_response")
+                                )
+                                return
                             headers = self._response_headers(response)
                             captured_responses.append(
                                 {
@@ -870,8 +1025,9 @@ class PDFConverter:
                             )
                             recovery_meta["wrapper_detected"] = recovery_meta["wrapper_detected"] or wrapper_detected
 
-                            for dom_url in self._collect_dom_urls(page):
-                                candidate_dom_url = urljoin(page.url, dom_url)
+                            for candidate_dom_url in self._validated_dom_urls(
+                                page, page.url, network_logs
+                            ):
                                 if not is_baiwang_family_url(candidate_dom_url, sender_addr="", subject=subject):
                                     continue
                                 dom_artifacts, dom_logs = self._probe_direct_artifact(
@@ -886,11 +1042,17 @@ class PDFConverter:
                                 artifacts.extend(self._attempt_click_downloads(page, artifact_prefix))
 
                             for response_item in captured_responses:
-                                artifact = self._capture_response_artifact(
-                                    response_item["response"],
-                                    artifact_prefix,
-                                    len(artifacts) + 1,
-                                )
+                                try:
+                                    artifact = self._capture_response_artifact(
+                                        response_item["response"],
+                                        artifact_prefix,
+                                        len(artifacts) + 1,
+                                    )
+                                except PublicUrlPolicyError as exc:
+                                    network_logs.append(
+                                        self._policy_rejection_log(exc, "captured_response")
+                                    )
+                                    continue
                                 if artifact:
                                     artifacts.append(artifact)
                                 else:
@@ -905,6 +1067,10 @@ class PDFConverter:
                             selected_artifact, _ = self._select_baiwang_recovery_result(artifacts, expected_fields)
                             if selected_artifact:
                                 break
+                        except PublicUrlPolicyError as exc:
+                            network_logs.append(
+                                self._policy_rejection_log(exc, "browser_navigation")
+                            )
                         except PlaywrightTimeoutError:
                             network_logs.append({"kind": "navigation_timeout", "url": url})
                         except Exception as exc:
@@ -1067,7 +1233,7 @@ class PDFConverter:
         with requests.Session() as session:
             with sync_playwright() as playwright:
                 browser = self._launch_chromium_browser(playwright, "direct invoice recovery")
-                context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+                context = self._new_browser_context(browser)
                 try:
                     for index, url in enumerate(candidate_urls, start=1):
                         if url in seen_urls:
@@ -1091,6 +1257,13 @@ class PDFConverter:
                         captured_responses = []
 
                         def _on_response(response):
+                            try:
+                                self._validate_browser_response(response)
+                            except PublicUrlPolicyError as exc:
+                                network_logs.append(
+                                    self._policy_rejection_log(exc, "browser_response")
+                                )
+                                return
                             headers = self._response_headers(response)
                             captured_responses.append(
                                 {
@@ -1127,8 +1300,9 @@ class PDFConverter:
                                 artifacts.extend(resolved_artifacts)
                                 network_logs.extend(resolved_logs)
 
-                            for dom_url in self._collect_dom_urls(page):
-                                candidate_dom_url = urljoin(page.url, dom_url)
+                            for candidate_dom_url in self._validated_dom_urls(
+                                page, page.url, network_logs
+                            ):
                                 if not is_direct_invoice_family_url(candidate_dom_url):
                                     continue
                                 dom_artifacts, dom_logs = self._probe_direct_invoice_artifact(
@@ -1140,12 +1314,18 @@ class PDFConverter:
                                 network_logs.extend(dom_logs)
 
                             for response_item in captured_responses:
-                                artifact = self._capture_direct_invoice_response_artifact(
-                                    response_item["response"],
-                                    artifact_prefix,
-                                    len(artifacts) + 1,
-                                    url,
-                                )
+                                try:
+                                    artifact = self._capture_direct_invoice_response_artifact(
+                                        response_item["response"],
+                                        artifact_prefix,
+                                        len(artifacts) + 1,
+                                        url,
+                                    )
+                                except PublicUrlPolicyError as exc:
+                                    network_logs.append(
+                                        self._policy_rejection_log(exc, "captured_response")
+                                    )
+                                    continue
                                 if artifact:
                                     artifacts.append(artifact)
                                 else:
@@ -1160,6 +1340,10 @@ class PDFConverter:
                             selected_artifact, _ = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
                             if selected_artifact:
                                 break
+                        except PublicUrlPolicyError as exc:
+                            network_logs.append(
+                                self._policy_rejection_log(exc, "browser_navigation")
+                            )
                         except PlaywrightTimeoutError:
                             network_logs.append({"kind": "navigation_timeout", "url": url})
                         except Exception as exc:
@@ -1254,10 +1438,11 @@ class PDFConverter:
         self._require_playwright()
         with sync_playwright() as playwright:
             browser = self._launch_chromium_browser(playwright, "web invoice conversion")
-            context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+            context = self._new_browser_context(browser)
 
             for index, url in enumerate(invoice_urls):
-                logging.info("Visiting URL: %s", url)
+                safe_log_url = self.url_policy.sanitize(url)
+                logging.info("Visiting URL: %s", safe_log_url)
                 page = context.new_page()
                 link_started_at = __import__("time").perf_counter()
                 pdf_path = os.path.join(email_staging_path, f"web_invoice_{index + 1}.pdf")
@@ -1281,9 +1466,9 @@ class PDFConverter:
                     downloaded_items.append(dict(link_meta))
 
                 try:
-                    response = page.goto(url, timeout=self.generic_timeout_ms, wait_until="domcontentloaded")
+                    response = self._goto_public_page(page, url, self.generic_timeout_ms)
                     if not response:
-                        logging.warning("No response from URL: %s", url)
+                        logging.warning("No response from URL: %s", safe_log_url)
                         link_meta.update(
                             {
                                 "status": "failed",
@@ -1308,9 +1493,9 @@ class PDFConverter:
                     )
                     if reason_code:
                         log_level = logging.error if reason_code == "URL_AUTH_WALL_DETECTED" else logging.info
-                        log_level("%s at %s", reason_code, url)
+                        log_level("%s at %s", reason_code, safe_log_url)
                         with open(os.path.join(self.staging_dir, "process_log.txt"), "a", encoding="utf-8") as handle:
-                            handle.write(f"[INFO] {reason_code}: {url} (Email: {subject})\n")
+                            handle.write(f"[INFO] {reason_code}: {safe_log_url} (Email: {subject})\n")
                         link_meta.update(
                             {
                                 "status": "skipped" if reason_code == "URL_NON_INVOICE_PAGE_SKIPPED" else "failed",
@@ -1338,10 +1523,23 @@ class PDFConverter:
                         )
                         if return_metadata:
                             _append_link_result()
+                except PublicUrlPolicyError as exc:
+                    logging.error("%s", exc)
+                    link_meta.update(
+                        {
+                            "source_url": exc.safe_url,
+                            "resolved_url": exc.safe_url,
+                            "status": "failed",
+                            "reason_code": "URL_POLICY_REJECTED",
+                            "message": exc.reason,
+                        }
+                    )
+                    if return_metadata:
+                        _append_link_result()
                 except PlaywrightTimeoutError:
-                    logging.error("Timeout (%sms) while loading %s", self.generic_timeout_ms, url)
+                    logging.error("Timeout (%sms) while loading %s", self.generic_timeout_ms, safe_log_url)
                     with open(os.path.join(self.staging_dir, "process_log.txt"), "a", encoding="utf-8") as handle:
-                        handle.write(f"[ERROR] Timeout loading URL: {url} (Email: {subject})\n")
+                        handle.write(f"[ERROR] Timeout loading URL: {safe_log_url} (Email: {subject})\n")
                     link_meta.update(
                         {
                             "status": "failed",
@@ -1352,7 +1550,7 @@ class PDFConverter:
                     if return_metadata:
                         _append_link_result()
                 except Exception as exc:
-                    logging.error("Error processing URL %s: %s", url, exc)
+                    logging.error("Error processing URL %s: %s", safe_log_url, exc)
                     link_meta.update(
                         {
                             "status": "failed",
