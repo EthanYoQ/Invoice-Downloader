@@ -21,36 +21,36 @@ class _FrozenBytearray(bytes):
     pass
 
 
-def _freeze_value(value: Any) -> Any:
+def freeze_legacy_value(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze_value(item) for key, item in value.items()})
+        return MappingProxyType({key: freeze_legacy_value(item) for key, item in value.items()})
     if isinstance(value, list):
-        return _FrozenList(_freeze_value(item) for item in value)
+        return _FrozenList(freeze_legacy_value(item) for item in value)
     if isinstance(value, tuple):
-        return tuple(_freeze_value(item) for item in value)
+        return tuple(freeze_legacy_value(item) for item in value)
     if isinstance(value, set):
-        return _FrozenSet(_freeze_value(item) for item in value)
+        return _FrozenSet(freeze_legacy_value(item) for item in value)
     if isinstance(value, bytearray):
         return _FrozenBytearray(value)
     return value
 
 
-def _thaw_value(value: Any) -> Any:
+def thaw_legacy_value(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {key: _thaw_value(item) for key, item in value.items()}
+        return {key: thaw_legacy_value(item) for key, item in value.items()}
     if isinstance(value, _FrozenList):
-        return [_thaw_value(item) for item in value]
+        return [thaw_legacy_value(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_thaw_value(item) for item in value)
+        return tuple(thaw_legacy_value(item) for item in value)
     if isinstance(value, _FrozenSet):
-        return {_thaw_value(item) for item in value}
+        return {thaw_legacy_value(item) for item in value}
     if isinstance(value, _FrozenBytearray):
         return bytearray(value)
     return value
 
 
 def _freeze_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    return _freeze_value(dict(value or {}))
+    return freeze_legacy_value(dict(value or {}))
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,7 @@ class DocumentCandidate:
         )
 
     def to_legacy(self) -> dict[str, Any]:
-        return _thaw_value(self.metadata)
+        return thaw_legacy_value(self.metadata)
 
 
 class CandidatePipeline:

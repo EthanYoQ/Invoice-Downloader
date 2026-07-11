@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
-from candidate_pipeline import DocumentCandidate
+from candidate_pipeline import DocumentCandidate, freeze_legacy_value, thaw_legacy_value
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -36,10 +36,14 @@ class ExtractionOutcome:
         if self.status not in _TERMINAL_STATUSES:
             raise ValueError(f"Unsupported extraction terminal status: {self.status}")
         object.__setattr__(self, "trace_context", MappingProxyType(dict(self.trace_context)))
+        object.__setattr__(self, "payload", freeze_legacy_value(self.payload))
 
     @property
     def is_terminal(self) -> bool:
         return self.status in _TERMINAL_STATUSES
+
+    def to_legacy_payload(self) -> Any:
+        return thaw_legacy_value(self.payload)
 
     @classmethod
     def resolved(cls, candidate: DocumentCandidate, payload: Any) -> "ExtractionOutcome":
@@ -58,7 +62,12 @@ class ExtractionOutcome:
 
 
 def _safe_failure(candidate: DocumentCandidate, exc: BaseException) -> ExtractionOutcome:
-    if isinstance(exc, TimeoutError):
+    http_status = getattr(exc, "http_status", None)
+    if http_status == 402:
+        status, reason = "quota_exhausted", "REMOTE_QUOTA_EXHAUSTED"
+    elif http_status in {401, 403}:
+        status, reason = "auth_failed", "REMOTE_AUTH_FAILED"
+    elif isinstance(exc, TimeoutError):
         status, reason = "timeout", "REMOTE_TIMEOUT"
     elif isinstance(exc, PermissionError):
         status, reason = "auth_failed", "REMOTE_AUTH_FAILED"

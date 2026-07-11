@@ -11,6 +11,7 @@ import pytest
 from archive_service import ArchiveService
 from candidate_pipeline import CandidatePipeline, DocumentCandidate
 from extraction_pipeline import ExtractionOutcome, ExtractionPipeline
+from glm_runtime import GlmRequestError
 
 
 def _candidate(sequence: int, name: str | None = None, **metadata) -> DocumentCandidate:
@@ -70,6 +71,16 @@ def test_local_result_bypasses_remote_runtime():
     assert remote_calls == []
     assert outcomes[0].status == "resolved"
     assert outcomes[0].payload == {"source": candidate.source_path}
+
+
+def test_extraction_outcome_payload_is_deeply_immutable_and_can_be_thawed():
+    source = {"nested": {"values": [1, 2]}}
+    outcome = ExtractionOutcome.resolved(_candidate(0), source)
+    source["nested"]["values"].append(3)
+
+    assert outcome.to_legacy_payload() == {"nested": {"values": [1, 2]}}
+    with pytest.raises((AttributeError, TypeError)):
+        outcome.payload["nested"]["values"] += (3,)  # type: ignore[index,operator]
 
 
 def test_unresolved_safe_remote_work_overlaps_but_never_exceeds_verified_two():
@@ -169,6 +180,36 @@ def test_worker_failures_become_sanitized_terminal_outcomes(
     assert outcome.reason_code == expected_reason
     assert "secret" not in outcome.message
     assert outcome.is_terminal
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_reason"),
+    [
+        (
+            GlmRequestError("text", http_status=401, reason="http_error"),
+            "auth_failed",
+            "REMOTE_AUTH_FAILED",
+        ),
+        (
+            GlmRequestError("text", http_status=402, reason="http_error"),
+            "quota_exhausted",
+            "REMOTE_QUOTA_EXHAUSTED",
+        ),
+    ],
+)
+def test_real_glm_terminal_errors_map_to_explicit_outcomes(
+    failure, expected_status, expected_reason
+):
+    def remote(_candidate):
+        raise failure
+
+    outcome = ExtractionPipeline(
+        local_parser=lambda _candidate: None,
+        remote_extractor=remote,
+    ).extract([_candidate(0)])[0]
+
+    assert outcome.status == expected_status
+    assert outcome.reason_code == expected_reason
 
 
 def test_stop_is_explicit_and_every_candidate_has_one_terminal_outcome():
@@ -301,6 +342,28 @@ def test_archive_report_fails_closed_for_unresolved_and_duplicate_input_identity
     assert report.unresolved_count == 1
     assert report.duplicate_count == 1
     assert report.can_complete is False
+
+
+def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_path: Path):
+    events = 0
+
+    def broken_sink(_event):
+        nonlocal events
+        events += 1
+        raise RuntimeError("event sink failed")
+
+    outcomes = [
+        ExtractionOutcome.resolved(_candidate(index), {"sequence": index})
+        for index in range(2)
+    ]
+    report = ArchiveService(
+        writer=lambda outcome, _root: f"{outcome.candidate.sequence}.pdf",
+        event_sink=broken_sink,
+    ).archive(outcomes, tmp_path)
+
+    assert report.archived_count == 2
+    assert report.terminal_count == 2
+    assert events == 2
 
 
 def test_progress_is_monotonic_bounded_and_has_stable_total():

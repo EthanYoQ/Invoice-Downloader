@@ -61,12 +61,13 @@ class ArchiveService:
         ordered = sorted(tuple(outcomes), key=lambda item: item.candidate.sequence)
         legacy_rows: list[dict[str, Any]] = []
         for outcome in ordered:
-            if outcome.status != "resolved" or not isinstance(outcome.payload, Mapping):
+            payload = outcome.to_legacy_payload()
+            if outcome.status != "resolved" or not isinstance(payload, Mapping):
                 raise RuntimeError(
                     f"PIPELINE_BATCH_UNRESOLVED:{outcome.candidate.identity.document_id}:"
                     f"{outcome.reason_code or outcome.status}"
                 )
-            legacy_rows.append(dict(outcome.payload))
+            legacy_rows.append(dict(payload))
         return batch_writer(legacy_rows)
 
     def archive(
@@ -112,14 +113,17 @@ class ArchiveService:
             archived_outcome = ArchivedOutcome(outcome=outcome, archive_path=archive_path)
             archived.append(archived_outcome)
             if self._event_sink is not None:
-                self._event_sink(
-                    {
-                        "document_id": document_id,
-                        "sequence": outcome.candidate.sequence,
-                        "status": outcome.status,
-                        "archive_path": archive_path,
-                    }
-                )
+                try:
+                    self._event_sink(
+                        {
+                            "document_id": document_id,
+                            "sequence": outcome.candidate.sequence,
+                            "status": outcome.status,
+                            "archive_path": archive_path,
+                        }
+                    )
+                except Exception:
+                    pass
 
         return ArchiveReport(
             outcomes=tuple(archived),
