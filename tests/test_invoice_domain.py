@@ -146,6 +146,51 @@ class InvoiceRecordTests(unittest.TestCase):
             with self.subTest(value=type(value).__name__), self.assertRaises(FrozenInstanceError):
                 value.identity = self.identity
 
+    def test_route_info_direct_construction_accepts_date_or_none(self):
+        dated_route = RouteInfo(
+            departure_date=date(2026, 6, 1),
+            departure_city="长沙",
+            destination_city="杭州",
+        )
+        empty_route = RouteInfo(departure_date=None)
+
+        self.assertEqual(dated_route.departure_date, date(2026, 6, 1))
+        self.assertIsNone(empty_route.departure_date)
+
+    def test_route_info_direct_construction_rejects_non_date_or_datetime_values(self):
+        invalid_values = (
+            datetime(2026, 6, 1, 8, 30),
+            datetime(2026, 6, 1, 8, 30, tzinfo=timezone.utc),
+            "20260601",
+            True,
+            False,
+            20260601,
+            object(),
+        )
+        for departure_date in invalid_values:
+            with self.subTest(departure_date=departure_date), self.assertRaisesRegex(
+                TypeError,
+                "RouteInfo.departure_date must be date or None",
+            ):
+                RouteInfo(departure_date=departure_date)
+
+    def test_route_info_legacy_parsing_and_round_trip_remain_compatible(self):
+        legacy = {
+            "Date": "20260601",
+            "Amount": "702.00",
+            "Type": "火车票",
+            "Departure_Date": "2026-05-31",
+            "Departure_City": "长沙",
+            "Destination_City": "杭州",
+        }
+
+        record = InvoiceRecord.from_legacy(legacy, self.identity)
+
+        self.assertEqual(record.route.departure_date, date(2026, 5, 31))
+        self.assertEqual(record.route.departure_city, "长沙")
+        self.assertEqual(record.route.destination_city, "杭州")
+        self.assertEqual(record.to_legacy(), legacy)
+
     def test_from_legacy_exposes_typed_values_and_round_trips_every_key(self):
         legacy = {
             "is_invoice": True,

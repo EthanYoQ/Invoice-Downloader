@@ -180,6 +180,12 @@ class RouteInfo:
     departure_city: str = ""
     destination_city: str = ""
 
+    def __post_init__(self) -> None:
+        if self.departure_date is not None and (
+            not isinstance(self.departure_date, date) or isinstance(self.departure_date, datetime)
+        ):
+            raise TypeError("RouteInfo.departure_date must be date or None")
+
 
 @dataclass(frozen=True)
 class InvoiceRecord:
