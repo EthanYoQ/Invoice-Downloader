@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[English](README.md) | **中文**
+[English](README.en.md) | **中文**
 
 </div>
 
@@ -27,11 +27,29 @@
 
 </div>
 
+<p align="center">
+  <img src="./docs/images/invoiceflowai-hero-zh.png" alt="InvoiceFlowAI Windows 发票助手真实启动配置、处理中心与安全提示界面" />
+</p>
+
 ---
 
 ## 🎬 视频介绍
 
 https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
+
+## 🖥️ 软件界面预览
+
+### 启动配置：邮箱、识别引擎、日期范围与本地输出
+
+![InvoiceFlowAI 启动配置界面，使用示例邮箱、遮罩凭据、日期范围和本地归档配置](docs/images/invoiceflowai-setup-zh.png)
+
+### 处理中心：进度、计数与实时日志
+
+![InvoiceFlowAI 处理中心，展示任务进度、已扫描邮件、已识别发票、异常处理和实时日志](docs/images/invoiceflowai-processing-zh.png)
+
+### 安全提示：使用结果前进行人工复核
+
+![InvoiceFlowAI 免责声明，说明邮箱授权、API 使用、数据安全和人工复核要求](docs/images/invoiceflowai-disclaimer-zh.png)
 
 ---
 
@@ -333,4 +351,3 @@ Made with ❤️ by **EthanYoQ / Yong Qi**
 [报告问题](https://github.com/EthanYoQ/Invoice-Downloader/issues) · [智谱AI开放平台](https://open.bigmodel.cn/) · [163邮箱帮助](https://help.mail.163.com/) · [QQ邮箱帮助](https://service.mail.qq.com/detail/0/339)
 
 </div>
-

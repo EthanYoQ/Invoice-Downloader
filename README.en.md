@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**English** | [English](README.en.md)
+**English** | [中文](README.md)
 
 </div>
 
@@ -27,11 +27,29 @@ Download: [latest Windows portable release](https://github.com/EthanYoQ/Invoice-
 
 </div>
 
+<p align="center">
+  <img src="./docs/images/invoiceflowai-hero-en.png" alt="InvoiceFlowAI Windows invoice assistant with real setup, processing, and safety screens" />
+</p>
+
 ---
 
 ## 🎬 Video Introduction
 
 https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
+
+## 🖥️ Interface Preview
+
+### Setup: Mailbox, Recognition, Date Range, and Local Output
+
+![InvoiceFlowAI setup screen with sanitized example mailbox, masked credentials, date range, and local archive configuration](docs/images/invoiceflowai-setup-zh.png)
+
+### Processing Center: Progress, Counters, and Live Logs
+
+![InvoiceFlowAI processing center showing progress, scanned email count, recognized invoice count, exceptions, and execution logs](docs/images/invoiceflowai-processing-zh.png)
+
+### Safety Notice: Review Before Using Results
+
+![InvoiceFlowAI disclaimer explaining mailbox authorization, API usage, data security, and manual review requirements](docs/images/invoiceflowai-disclaimer-zh.png)
 
 ---
 
@@ -333,5 +351,3 @@ Made with ❤️ by **EthanYoQ / Yong Qi**
 [Report Issues](https://github.com/EthanYoQ/Invoice-Downloader/issues) · [Zhipu AI Open Platform](https://open.bigmodel.cn/) · [163 Mailbox Help](https://help.mail.163.com/) · [QQ Mailbox Help](https://service.mail.qq.com/detail/0/339)
 
 </div>
-
-
