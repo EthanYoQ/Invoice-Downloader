@@ -9,7 +9,7 @@ import re
 import datetime
 import time
 import zipfile
-from urllib.parse import parse_qsl, urljoin, urlparse, unquote
+from urllib.parse import parse_qsl, urlparse, unquote
 from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
@@ -37,6 +37,7 @@ from provider_direct_invoice import (
 from pinned_http import PinnedHttpTransport
 from url_security import PublicUrlPolicy
 from url_trace_sanitizer import sanitize_url_for_log, stable_hash
+from mailbox_scanner import MailboxScanner
 try:
     from pyzbar.pyzbar import decode
 except ImportError:
@@ -1232,18 +1233,33 @@ class EmailFetcher:
         raw_bytes = b""
 
         try:
-            status, msg_data = self.mail.fetch(e_id, fetch_command)
-            attempt["status"] = status
-            raw_bytes, has_tuple_payload = self._extract_fetch_bytes(msg_data)
-            attempt["has_tuple_payload"] = bool(has_tuple_payload)
+            fetched = self._mailbox_scanner().fetch_messages([e_id], query=fetch_command)
+            raw_bytes = fetched.get(e_id, b"")
+            attempt["status"] = "OK" if raw_bytes else "NO_PAYLOAD"
+            attempt["has_tuple_payload"] = bool(raw_bytes)
             attempt["raw_bytes_len"] = len(raw_bytes)
-            if status != "OK":
-                attempt["error"] = f"fetch_status_{status}"
+            if not raw_bytes:
+                attempt["error"] = "uid_fetch_no_payload"
         except Exception as exc:
             attempt["status"] = "EXCEPTION"
-            attempt["error"] = str(exc)
+            attempt["error"] = type(exc).__name__
 
         return raw_bytes, attempt
+
+    def _emit_mailbox_scan_diagnostic(self, payload):
+        self._append_jsonl_best_effort(
+            self._monitoring_path("mailbox_scan_diagnostics.jsonl"),
+            {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **payload,
+            },
+        )
+
+    def _mailbox_scanner(self):
+        return MailboxScanner(
+            self.mail,
+            diagnostic_callback=self._emit_mailbox_scan_diagnostic,
+        )
 
     def connect(self):
         try:
@@ -1286,137 +1302,25 @@ class EmailFetcher:
             logging.error("Not connected to IMAP server.")
             return []
 
-        self.mail.select(mailbox, readonly=True)
+        def to_date(value, field_name):
+            if value is None:
+                return None
+            if isinstance(value, datetime.datetime):
+                return value.date()
+            if isinstance(value, datetime.date):
+                return value
+            if isinstance(value, str):
+                return datetime.datetime.strptime(value, "%Y-%m-%d").date()
+            raise TypeError(f"{field_name} must be a date or YYYY-MM-DD string")
 
-        if isinstance(since_date, datetime.date):
-            since_date_str = since_date.strftime("%d-%b-%Y")
-        else:
-            try:
-                dt = datetime.datetime.strptime(since_date, "%Y-%m-%d")
-                since_date_str = dt.strftime("%d-%b-%Y")
-            except:
-                since_date_str = since_date
-            
-        search_criteria_parts = [f'(SINCE "{since_date_str}")']
-        
-        if before_date:
-            if isinstance(before_date, datetime.date):
-                before_date_str = before_date.strftime("%d-%b-%Y")
-            else:
-                try:
-                    dt = datetime.datetime.strptime(before_date, "%Y-%m-%d")
-                    before_date_str = dt.strftime("%d-%b-%Y")
-                except:
-                    before_date_str = before_date
-            search_criteria_parts.append(f'(BEFORE "{before_date_str}")')
-
-        search_criteria = " ".join(search_criteria_parts)
-        logging.info(f"Searching emails with criteria: {search_criteria}")
-        self._emit_progress(f"正在 IMAP 搜索：{search_criteria}")
-        
-        status, messages = self.mail.search(None, search_criteria)
-        
-        if status != "OK" or not messages[0]:
-            logging.info("No emails found or search failed.")
-            self._emit_progress("IMAP 搜索完成，命中 0 封邮件。")
-            return []
-
-        email_ids = messages[0].split()
-        logging.info(f"IMAP returned {len(email_ids)} emails. Applying local Python date filter...")
-        self._emit_progress(f"IMAP 搜索完成，命中 {len(email_ids)} 封邮件；正在进行本地日期过滤。")
-        
-        # 本地时间二次强制过滤 (防御 IMAP SINCE/BEFORE 失效)
-        if isinstance(since_date, datetime.date) and not isinstance(since_date, datetime.datetime):
-            since_dt = datetime.datetime.combine(since_date, datetime.datetime.min.time())
-        elif isinstance(since_date, str):
-            since_dt = datetime.datetime.strptime(since_date, "%Y-%m-%d")
-        else:
-            since_dt = since_date
-            
-        before_dt = None
-        if before_date:
-            if isinstance(before_date, datetime.date) and not isinstance(before_date, datetime.datetime):
-                before_dt = datetime.datetime.combine(before_date, datetime.datetime.min.time())
-            elif isinstance(before_date, str):
-                before_dt = datetime.datetime.strptime(before_date, "%Y-%m-%d")
-            else:
-                before_dt = before_date
-
-        valid_email_ids = []
-        total_ids = len(email_ids)
-        batch_size = 100
-        for batch_start in range(0, total_ids, batch_size):
-            chunk = email_ids[batch_start:batch_start + batch_size]
-            processed_ids = set()
-            sequence_set = b",".join(chunk)
-            try:
-                status, msg_data = self.mail.fetch(sequence_set, '(INTERNALDATE BODY[HEADER.FIELDS (DATE)])')
-                if status != "OK" or not msg_data:
-                    valid_email_ids.extend(chunk)
-                    logging.warning(f"Failed to batch fetch email dates for local filter: fetch_status_{status}")
-                else:
-                    fallback_index = 0
-                    for response_part in msg_data:
-                        if not isinstance(response_part, tuple) or len(response_part) < 2:
-                            continue
-
-                        response_id = self._extract_fetch_sequence_id(response_part[0])
-                        if not response_id:
-                            while fallback_index < len(chunk) and chunk[fallback_index] in processed_ids:
-                                fallback_index += 1
-                            response_id = chunk[fallback_index] if fallback_index < len(chunk) else b""
-                            fallback_index += 1
-
-                        if not response_id:
-                            continue
-
-                        processed_ids.add(response_id)
-                        dt_naive = None
-                        parse_error = None
-                        try:
-                            msg = email.message_from_bytes(response_part[1])
-                            date_str = msg.get("Date")
-                            if date_str:
-                                try:
-                                    dt = email.utils.parsedate_to_datetime(date_str)
-                                    dt_naive = self._to_local_naive(dt)
-                                except Exception as e:
-                                    parse_error = e
-                            if dt_naive is None:
-                                dt_naive = self._extract_fetch_internaldate(response_part[0])
-                            if dt_naive is None:
-                                if parse_error:
-                                    logging.warning(f"Failed to parse email date for local filter: {parse_error}")
-                                valid_email_ids.append(response_id)
-                                continue
-                            if dt_naive < since_dt:
-                                continue
-                            if before_dt and dt_naive >= before_dt:
-                                continue
-                            valid_email_ids.append(response_id)
-                        except Exception as e:
-                            # 解析失败仍保留，防错杀
-                            logging.warning(f"Failed to parse email date for local filter: {e}")
-                            valid_email_ids.append(response_id)
-
-                    for e_id in chunk:
-                        if e_id not in processed_ids:
-                            valid_email_ids.append(e_id)
-            except Exception as e:
-                logging.warning(f"Failed to batch fetch email dates for local filter: {e}")
-                valid_email_ids.extend(chunk)
-
-            processed_count = min(batch_start + len(chunk), total_ids)
-            logging.info(
-                f"Local date filter progress: {processed_count}/{total_ids}, retained {len(valid_email_ids)} emails."
-            )
-            self._emit_progress(
-                f"正在进行本地日期过滤：{processed_count}/{total_ids}，当前保留 {len(valid_email_ids)} 封邮件。"
-            )
-
-        logging.info(f"Local filter completed. {len(valid_email_ids)} emails passed.")
-        self._emit_progress(f"本地日期过滤完成，最终保留 {len(valid_email_ids)} 封邮件。")
-        return valid_email_ids
+        since = to_date(since_date, "since_date")
+        before = to_date(before_date, "before_date")
+        self._emit_progress("正在读取邮箱 UID 并进行本地日期过滤。")
+        refs = self._mailbox_scanner().scan(since, before, mailbox=mailbox)
+        email_ids = [ref.uid for ref in refs]
+        logging.info("Local UID date filter retained %s emails.", len(email_ids))
+        self._emit_progress(f"本地日期过滤完成，最终保留 {len(email_ids)} 封邮件。")
+        return email_ids
 
     def _legacy_extract_attachments_pre_release_prep(self, email_ids, mailbox="INBOX"):
         """1.3 Extract direct file attachments via 4-tier funnel filtering"""
@@ -1446,10 +1350,10 @@ class EmailFetcher:
             
             for e_id in chunk:
                 try:
-                    status, msg_data = self.mail.fetch(e_id, '(RFC822)')
-                    if status != "OK":
+                    raw_message = self._mailbox_scanner().fetch_messages([e_id]).get(e_id, b"")
+                    if not raw_message:
                         continue
-                    
+                    msg_data = [(b"UID FETCH", raw_message)]
                     for response_part in msg_data:
                         if isinstance(response_part, tuple):
                             msg = email.message_from_bytes(response_part[1])
@@ -1787,6 +1691,8 @@ class EmailFetcher:
 
         self.mail.select(mailbox, readonly=True)
         results = []
+        ordered_email_ids = MailboxScanner._stable_uids(email_ids)
+        prefetched_messages = self._mailbox_scanner().fetch_messages(ordered_email_ids)
 
         def stage_candidate_file(base_dir, filename, payload):
             os.makedirs(base_dir, exist_ok=True)
@@ -1822,9 +1728,9 @@ class EmailFetcher:
                 })
 
         chunk_size = 50
-        for i in range(0, len(email_ids), chunk_size):
-            chunk = email_ids[i:i + chunk_size]
-            logging.info(f"Processing chunk {i//chunk_size + 1}/{max(1, (len(email_ids)+chunk_size-1)//chunk_size)}")
+        for i in range(0, len(ordered_email_ids), chunk_size):
+            chunk = ordered_email_ids[i:i + chunk_size]
+            logging.info(f"Processing chunk {i//chunk_size + 1}/{max(1, (len(ordered_email_ids)+chunk_size-1)//chunk_size)}")
 
             for e_id in chunk:
                 email_id_str = self._safe_email_id(e_id)
@@ -1866,7 +1772,17 @@ class EmailFetcher:
                         }:
                             break
 
-                        raw_message_bytes, fetch_attempt = self._fetch_message_bytes(e_id, fetch_command, mode_label)
+                        if attempt_index == 0 and e_id in prefetched_messages:
+                            raw_message_bytes = prefetched_messages[e_id]
+                            fetch_attempt = {
+                                "mode": "UID_BATCH_RFC822",
+                                "status": "OK",
+                                "has_tuple_payload": True,
+                                "raw_bytes_len": len(raw_message_bytes),
+                                "error": "",
+                            }
+                        else:
+                            raw_message_bytes, fetch_attempt = self._fetch_message_bytes(e_id, fetch_command, mode_label)
                         email_diag["fetch_attempts"].append(fetch_attempt)
                         if fetch_attempt["raw_bytes_len"] > 0:
                             email_diag["fetch_has_usable_bytes"] = True
