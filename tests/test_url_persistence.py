@@ -576,8 +576,8 @@ def test_live_purchaser_mismatch_log_redacts_url_candidate_but_preserves_attachm
         with (
             patch("invoice_extractor.InvoiceExtractor", FakeExtractor),
             patch("pdf_converter.PDFConverter.process_invoice_links", recovered_result),
-            patch("app_api.classify_purchaser_relation", return_value="non_target"),
-            patch("app_api.is_exempt_type", return_value=False),
+            patch("company_rules.classify_purchaser_relation", return_value="non_target"),
+            patch("document_types.is_exempt_type", return_value=False),
             patch("app_api.time.sleep", return_value=None),
         ):
             api._run_processing_loop(
