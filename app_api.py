@@ -43,6 +43,19 @@ from user_settings import (
 )
 
 
+DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS = 120.0
+
+
+class TruthAuditTimeout(RuntimeError):
+    reason_code = "TRUTH_AUDIT_TIMEOUT"
+    user_message = "真值审计收尾超时，请查看诊断报告后重试。"
+
+
+class ProcessingLoopFailure(RuntimeError):
+    reason_code = "PROCESSING_FAILED"
+    user_message = "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
+
+
 def build_processing_history_key(info, file_name, pdf_path):
     import hashlib
 
@@ -387,7 +400,7 @@ class _FallbackDocumentTraceStore:
         return ranks.get(severity, 0)
 
 class InvoiceAppAPI:
-    def __init__(self):
+    def __init__(self, truth_audit_timeout_seconds=None):
         self._run_context = load_run_context()
         ensure_run_context_dirs(self._run_context)
         self._diag_lock = threading.Lock()
@@ -406,6 +419,11 @@ class InvoiceAppAPI:
         self.quota_message = ""
         self._worker_thread = None
         self._truth_audit_thread = None
+        self._truth_audit_quarantine = None
+        self._truth_audit_publish_lock = None
+        if truth_audit_timeout_seconds is None:
+            truth_audit_timeout_seconds = DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS
+        self._truth_audit_timeout_seconds = max(0.001, float(truth_audit_timeout_seconds))
         self._run_lifecycle = RunLifecycle()
         self._active_run_handle = None
         self._active_temp_dir = None
@@ -974,7 +992,36 @@ class InvoiceAppAPI:
     def _start_truth_audit_async(self, email_address, auth_code):
         if not self._run_context.get("enabled") or not email_address or not auth_code:
             self._truth_audit_thread = None
+            self._truth_audit_quarantine = None
+            self._truth_audit_publish_lock = None
             return
+
+        context = dict(self._run_context)
+        run_id = str(
+            (self._active_run_handle.run_id if self._active_run_handle is not None else "")
+            or self._current_run_id
+            or context.get("run_id", "")
+            or uuid.uuid4().hex
+        )
+        run_root = Path(context.get("run_root") or context.get("monitoring_dir") or Path.cwd()).resolve()
+        monitoring_dir = Path(context.get("monitoring_dir") or (run_root / "monitoring")).resolve()
+        try:
+            monitoring_dir.relative_to(run_root)
+        except ValueError:
+            monitoring_dir = run_root / "monitoring"
+        safe_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", run_id).strip("-.") or "run"
+        report_path = monitoring_dir / "email_truth_audit.json"
+        error_path = monitoring_dir / "email_truth_audit_error.json"
+        quarantine_dir = monitoring_dir / "quarantined" / safe_run_id
+        quarantine = threading.Event()
+        publish_lock = threading.Lock()
+        date_from = self._effective_date_from
+        date_to = self._effective_date_to
+
+        def _publish(filename, payload):
+            with publish_lock:
+                target_dir = quarantine_dir if quarantine.is_set() else monitoring_dir
+                self._diag_write_json(str(target_dir / filename), payload)
 
         def _runner():
             try:
@@ -984,32 +1031,38 @@ class InvoiceAppAPI:
                 report = collect_truth_table(
                     email_address,
                     auth_code,
-                    self._effective_date_from,
-                    self._effective_date_to,
+                    date_from,
+                    date_to,
                 )
-                self._diag_write_json(self._monitoring_path("email_truth_audit.json"), report)
+                _publish(report_path.name, report)
             except ModuleNotFoundError as exc:
-                self._diag_write_json(
-                    self._monitoring_path("email_truth_audit_error.json"),
+                _publish(
+                    error_path.name,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "skipped",
                         "reason": "AUDIT_EMAIL_TRUTH_MODULE_MISSING",
-                        "detail": str(exc),
+                        "error_type": type(exc).__name__,
+                        "error_hash": stable_hash(str(exc))[:12],
                     },
                 )
             except Exception as exc:
-                self._diag_write_json(
-                    self._monitoring_path("email_truth_audit_error.json"),
+                _publish(
+                    error_path.name,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "error": str(exc),
+                        "reason": "TRUTH_AUDIT_FAILED",
+                        "error_type": type(exc).__name__,
+                        "error_hash": stable_hash(str(exc))[:12],
                     },
                 )
 
         thread = threading.Thread(target=_runner, name="InvoiceFlowTruthAudit", daemon=True)
         self._truth_audit_thread = thread
+        self._truth_audit_quarantine = quarantine
+        self._truth_audit_publish_lock = publish_lock
         thread.start()
+        return thread
 
     def _await_truth_audit(self):
         thread = self._truth_audit_thread
@@ -1017,8 +1070,22 @@ class InvoiceAppAPI:
             return
         if thread is threading.current_thread():
             raise RuntimeError("truth audit cannot join its own thread")
-        thread.join()
+        # The accepted strict audit takes about 5-12 seconds locally; 120 seconds
+        # leaves a conservative production margin while still bounding finalization.
+        thread.join(self._truth_audit_timeout_seconds)
+        if thread.is_alive():
+            publish_lock = self._truth_audit_publish_lock
+            if publish_lock is not None:
+                with publish_lock:
+                    if self._truth_audit_quarantine is not None:
+                        self._truth_audit_quarantine.set()
+            self._truth_audit_thread = None
+            self._truth_audit_quarantine = None
+            self._truth_audit_publish_lock = None
+            raise TruthAuditTimeout("TRUTH_AUDIT_TIMEOUT")
         self._truth_audit_thread = None
+        self._truth_audit_quarantine = None
+        self._truth_audit_publish_lock = None
 
     def _inspect_pdf_health(self, pdf_path):
         if not pdf_path or not str(pdf_path).lower().endswith(".pdf"):
@@ -1453,11 +1520,31 @@ class InvoiceAppAPI:
         self.status_text = self.quota_message
         self._append_log("额度", self.quota_message, "text-rose-600")
 
+    @staticmethod
+    def _safe_failure_contract(status_text, error_message):
+        status = str(status_text or "")
+        error = str(error_message or "")
+        normalized = f"{status} {error}".upper()
+        if "MISSING_REQUIRED_CREDENTIALS" in normalized:
+            return "MISSING_REQUIRED_CREDENTIALS", "缺少必要凭证，请填写邮箱、授权码和 API Key。"
+        if "IMAP_LOGIN_FAILED" in normalized or "邮箱登录失败" in status:
+            return "IMAP_LOGIN_FAILED", "邮箱登录失败，请检查授权码和 IMAP 设置。"
+        if "QUOTA_EXHAUSTED" in normalized or "额度" in status:
+            return "QUOTA_EXHAUSTED", "GLM API 额度已耗尽，请充值或更换可用的 API Key。"
+        if "WORKER_START_FAILED" in normalized or "启动失败" in status:
+            return "WORKER_START_FAILED", "后台任务启动失败，请重试。"
+        return "PROCESSING_FAILED", "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
+
     def _finish_run(self, success, status_text, last_error=""):
         handle = self._active_run_handle or self._prepare_run_lifecycle()
         if handle.state not in {RunState.COMPLETED, RunState.FAILED}:
             if not success:
-                handle.fail(RuntimeError(last_error or status_text or "RUN_FAILED"))
+                reason_code, user_message = self._safe_failure_contract(status_text, last_error)
+                handle.fail(
+                    RuntimeError(last_error or status_text or reason_code),
+                    reason_code=reason_code,
+                    user_message=user_message,
+                )
             self._mark_finalizing()
             self._start_async_finalizers()
 
@@ -2037,7 +2124,13 @@ class InvoiceAppAPI:
                     "msg": "邮箱登录失败，请检查授权码和 IMAP 设置。",
                 })
                 self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": "imap_login_failed"})
-                self._fail_run("邮箱登录失败", "IMAP_LOGIN_FAILED", fetcher=fetcher)
+                self._fail_run(
+                    "邮箱登录失败",
+                    "IMAP_LOGIN_FAILED",
+                    fetcher=fetcher,
+                    reason_code="IMAP_LOGIN_FAILED",
+                    user_message="邮箱登录失败，请检查授权码和 IMAP 设置。",
+                )
                 return
 
             self._set_run_state("running", status_text="正在扫描邮件...", progress=20)
@@ -2137,7 +2230,13 @@ class InvoiceAppAPI:
 
             if self.quota_exhausted:
                 self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": self.quota_message or "QUOTA_EXHAUSTED"})
-                self._fail_run("GLM API 额度不足", self.quota_message or "GLM API 额度已耗尽，请充值或更换可用的 API Key。", fetcher=fetcher)
+                self._fail_run(
+                    "GLM API 额度不足",
+                    self.quota_message or "QUOTA_EXHAUSTED",
+                    fetcher=fetcher,
+                    reason_code="QUOTA_EXHAUSTED",
+                    user_message="GLM API 额度已耗尽，请充值或更换可用的 API Key。",
+                )
                 return
 
             if self._stop_requested:
@@ -2169,7 +2268,14 @@ class InvoiceAppAPI:
         except Exception as exc:
             self._packaged_diag_write("worker_exception", "_processing_worker", "exception", exc=exc)
             self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": str(exc) or "UNKNOWN_ERROR"})
-            self._fail_run("处理失败", str(exc) or "UNKNOWN_ERROR", fetcher=fetcher, include_traceback=True)
+            self._fail_run(
+                "处理失败",
+                str(exc) or "UNKNOWN_ERROR",
+                fetcher=fetcher,
+                include_traceback=True,
+                reason_code="PROCESSING_FAILED",
+                user_message="处理过程中发生异常，请重试；如持续失败请查看诊断报告。",
+            )
 
     def _run_processing_loop(self, attachments_info, api_key, save_path, since_date=None, before_date=None, rules_text=""):
         self._packaged_diag_write(
@@ -2238,6 +2344,7 @@ class InvoiceAppAPI:
         phase2_completed = False
         phase2_had_error = False
         loop_result = "completed"
+        processing_error = None
         browser_first_recorded = False
 
         def _build_normalized_fields(fields):
@@ -4344,6 +4451,7 @@ class InvoiceAppAPI:
 
         except Exception as main_loop_err:
             loop_result = "failed"
+            processing_error = main_loop_err
             print(
                 f">>> [错误] 核心处理循环发生异常: "
                 f"{type(main_loop_err).__name__} [{stable_hash(str(main_loop_err))[:12]}]"
@@ -4357,7 +4465,16 @@ class InvoiceAppAPI:
                     f"[{stable_hash(str(main_loop_err))[:12]}]"
                 ),
             })
-            self._safe_emit_stage_event("_run_processing_loop", "exit", {"result": "failed", "reason": str(main_loop_err)})
+            self._safe_emit_stage_event(
+                "_run_processing_loop",
+                "exit",
+                {
+                    "result": "failed",
+                    "reason": "PROCESSING_LOOP_FAILED",
+                    "error_type": type(main_loop_err).__name__,
+                    "error_hash": stable_hash(str(main_loop_err))[:12],
+                },
+            )
         finally:
             _finalize_trace_defaults()
             try:
@@ -4392,6 +4509,8 @@ class InvoiceAppAPI:
                         "attachments": total_attachments,
                     },
                 )
+        if processing_error is not None:
+            raise ProcessingLoopFailure("PROCESSING_LOOP_FAILED") from processing_error
 
     def _retain_artifact(self, save_path, source_path, bucket, reason, metadata=None):
         """在 staging 清理前保留一份可追踪的原件副本。"""
@@ -4811,7 +4930,15 @@ class InvoiceAppAPI:
         finalizing_progress = self.progress if self.progress >= 95 else 99
         self._set_run_state("finalizing", status_text="正在收尾...", progress=finalizing_progress)
 
-    def _fail_run(self, status_text, error_message, fetcher=None, include_traceback=False):
+    def _fail_run(
+        self,
+        status_text,
+        error_message,
+        fetcher=None,
+        include_traceback=False,
+        reason_code="",
+        user_message="",
+    ):
         active_exc = sys.exc_info()[1]
         self._packaged_diag_write(
             "fail_run",
@@ -4821,7 +4948,15 @@ class InvoiceAppAPI:
             exc=active_exc,
         )
         handle = self._prepare_run_lifecycle()
-        handle.fail(active_exc or RuntimeError(error_message or "RUN_FAILED"))
+        if not reason_code or not user_message:
+            inferred_code, inferred_message = self._safe_failure_contract(status_text, error_message)
+            reason_code = reason_code or inferred_code
+            user_message = user_message or inferred_message
+        handle.fail(
+            active_exc or RuntimeError(error_message or reason_code),
+            reason_code=reason_code,
+            user_message=user_message,
+        )
         self._mark_finalizing()
         self._start_async_finalizers(fetcher)
 
@@ -4965,6 +5100,8 @@ class InvoiceAppAPI:
         return list(grouped.values())
 
     def stop_processing(self):
+        if self.run_state == "finalizing":
+            return {"success": False, "message": "任务正在收尾，请稍候"}
         if not self._is_running or not (self._worker_thread and self._worker_thread.is_alive()):
             return {"success": False, "message": "当前没有正在运行的任务"}
         self._request_safe_stop()
@@ -5202,7 +5339,12 @@ class InvoiceAppAPI:
         try:
             thread.start()
         except Exception as exc:
-            self._fail_run("启动失败", str(exc) or "WORKER_START_FAILED")
+            self._fail_run(
+                "启动失败",
+                str(exc) or "WORKER_START_FAILED",
+                reason_code="WORKER_START_FAILED",
+                user_message="后台任务启动失败，请重试。",
+            )
             return {"success": False, "message": "后台任务启动失败"}
         self._packaged_diag_write(
             "worker_thread_started",
