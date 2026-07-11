@@ -1,6 +1,8 @@
+import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import fitz  # PyMuPDF
@@ -49,6 +51,24 @@ from url_security import PublicUrlPolicy, PublicUrlPolicyError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+@dataclass(frozen=True)
+class BufferedPublicResponse:
+    url: str
+    content: bytes
+    headers: dict
+    status_code: int
+
+    @property
+    def text(self):
+        return self.content.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+    def close(self):
+        return None
+
+
 class PDFConverter:
     BAIWANG_CLICK_TARGETS = {
         "pdf": [
@@ -84,7 +104,10 @@ class PDFConverter:
         self.generic_timeout_ms = max(8000, min(int(timeout_ms or 0) or 30000, 12000))
         self.provider_settle_timeout_ms = max(1500, min(int(timeout_ms or 0) or 30000, 4000))
         self.url_policy = url_policy or PublicUrlPolicy()
-        self._browser_validated_urls = {}
+        self._browser_request_contexts = {}
+        self._browser_page_compromises = {}
+        self._browser_pages = {}
+        self._browser_global_compromise = None
         self._browser_policy_rejections = []
 
     @staticmethod
@@ -226,6 +249,60 @@ class PDFConverter:
             "source": source,
         }
 
+    @staticmethod
+    def _origin(validated):
+        parsed = urlparse(validated.url)
+        return parsed.scheme.lower(), validated.host, validated.port
+
+    @staticmethod
+    def _url_origin(url):
+        try:
+            parsed = urlparse(str(url or ""))
+            if parsed.username is not None or parsed.password is not None:
+                return None
+            scheme = parsed.scheme.lower()
+            host = (parsed.hostname or "").lower()
+            default_port = {"http": 80, "https": 443}.get(scheme)
+            port = parsed.port or default_port
+            if not host or port is None:
+                return None
+            return scheme, host, port
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _redirect_headers(headers, cross_origin, method_changed_to_get):
+        credential_headers = {"authorization", "cookie", "proxy-authorization"}
+        entity_headers = {
+            "content-encoding",
+            "content-language",
+            "content-length",
+            "content-location",
+            "content-type",
+            "transfer-encoding",
+        }
+        blocked = set()
+        if cross_origin:
+            blocked.update(credential_headers)
+            blocked.update(entity_headers)
+        if method_changed_to_get:
+            blocked.update(entity_headers)
+        return {
+            key: value
+            for key, value in dict(headers or {}).items()
+            if str(key).lower() not in blocked
+        }
+
+    @staticmethod
+    def _redirect_method(method, status):
+        if status == 303 and method != "HEAD":
+            return "GET"
+        if status == 302 and method != "HEAD":
+            return "GET"
+        if status == 301 and method == "POST":
+            return "GET"
+        return method
+
     def _request_public(self, session, method, url, max_redirects=10, **kwargs):
         current = self.url_policy.validate(url)
         request_method = str(method or "GET").upper()
@@ -240,38 +317,79 @@ class PDFConverter:
             )
             try:
                 response_url = str(getattr(response, "url", "") or current.url)
-                connected_target = (
-                    current
-                    if response_url == current.url
-                    else self.url_policy.validate(response_url)
-                )
-                self.url_policy.verify_response_peer(response, connected_target)
+                if self._url_origin(response_url) != self._origin(current):
+                    raise PublicUrlPolicyError(
+                        response_url, "response origin changed without a validated redirect"
+                    )
+                self.url_policy.verify_response_peer(response, current)
 
                 status = int(getattr(response, "status_code", 0) or 0)
-                location = self._header_value(getattr(response, "headers", {}), "location")
+                response_headers = dict(getattr(response, "headers", {}) or {})
+                location = self._header_value(response_headers, "location")
                 if status not in {301, 302, 303, 307, 308} or not location:
-                    return response
+                    content = response.content
+                    return BufferedPublicResponse(
+                        response_url,
+                        bytes(content or b""),
+                        response_headers,
+                        status,
+                    )
                 if redirect_count >= max_redirects:
                     raise PublicUrlPolicyError(current.url, "too many redirects")
-                next_target = self.url_policy.resolve_redirect(connected_target, location)
-            except Exception:
+                next_target = self.url_policy.resolve_redirect(current, location)
+                next_method = self._redirect_method(request_method, status)
+                changed_to_get = request_method != next_method and next_method == "GET"
+                headers = self._redirect_headers(
+                    request_kwargs.get("headers", {}),
+                    cross_origin=self._origin(current) != self._origin(next_target),
+                    method_changed_to_get=changed_to_get,
+                )
+            finally:
                 response.close()
-                raise
 
-            response.close()
-            if status in {301, 302, 303} and request_method != "HEAD":
-                request_method = "GET"
+            request_kwargs["headers"] = headers
+            if changed_to_get:
                 request_kwargs.pop("data", None)
                 request_kwargs.pop("json", None)
+                request_kwargs.pop("files", None)
+            request_method = next_method
             current = next_target
 
         raise PublicUrlPolicyError(current.url, "too many redirects")
 
+    @staticmethod
+    def _page_from_request(request):
+        try:
+            frame = request.frame
+            return frame.page if frame is not None else None
+        except Exception:
+            return None
+
+    def _mark_browser_page_compromised(self, page, exc):
+        if page is None:
+            self._browser_global_compromise = exc
+            return
+        self._browser_pages[id(page)] = page
+        self._browser_page_compromises[id(page)] = exc
+
+    def _ensure_browser_page_secure(self, page):
+        if self._browser_global_compromise is not None:
+            raise self._browser_global_compromise
+        compromise = self._browser_page_compromises.get(id(page))
+        if compromise is not None:
+            raise compromise
+
+    def _prepare_browser_page(self, page):
+        self._browser_pages[id(page)] = page
+        self._browser_page_compromises.pop(id(page), None)
+
     def _guard_browser_request(self, route, request):
+        page = self._page_from_request(request)
         try:
             validated = self.url_policy.validate(request.url)
-            self._browser_validated_urls[request.url] = validated
+            self._browser_request_contexts[id(request)] = validated
         except PublicUrlPolicyError as exc:
+            self._mark_browser_page_compromised(page, exc)
             self._browser_policy_rejections.append(
                 self._policy_rejection_log(exc, "browser_request")
             )
@@ -280,37 +398,77 @@ class PDFConverter:
             return
         route.continue_()
 
+    def _block_browser_websocket(self, web_socket):
+        exc = PublicUrlPolicyError(
+            getattr(web_socket, "url", ""), "browser WebSockets are blocked"
+        )
+        self._browser_global_compromise = exc
+        self._browser_policy_rejections.append(
+            self._policy_rejection_log(exc, "browser_websocket")
+        )
+        web_socket.close(code=1008, reason="blocked by URL policy")
+
+    def _attach_browser_response_guard(self, page):
+        def _guard(response):
+            try:
+                self._validate_browser_response(response)
+            except PublicUrlPolicyError as exc:
+                self._browser_policy_rejections.append(
+                    self._policy_rejection_log(exc, "browser_response")
+                )
+
+        page.on("response", _guard)
+
+    def _discard_browser_artifacts(self, artifacts, start_index):
+        discarded = list(artifacts[start_index:])
+        del artifacts[start_index:]
+        staging_root = os.path.realpath(self.staging_dir)
+        for artifact in discarded:
+            path = os.path.realpath(str(artifact.get("path") or ""))
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                inside_staging = os.path.commonpath([staging_root, path]) == staging_root
+            except ValueError:
+                inside_staging = False
+            if inside_staging:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
     def _validate_browser_response(self, response):
         response_url = str(getattr(response, "url", "") or "")
         request = getattr(response, "request", None)
-        request_url = str(getattr(request, "url", "") or response_url)
-        validated = self._browser_validated_urls.get(request_url)
-        response_target = self.url_policy.validate(response_url)
-        if validated is None:
-            validated = response_target
-        elif (validated.host, validated.port) != (
-            response_target.host,
-            response_target.port,
-        ):
-            raise PublicUrlPolicyError(
-                response_url, "browser response target changed unexpectedly"
-            )
+        page = self._page_from_request(request)
         try:
-            server_address = response.server_addr()
-            peer_address = (server_address or {}).get("ipAddress", "")
-        except Exception as exc:
-            raise PublicUrlPolicyError(
-                response_url, "browser connected peer could not be verified"
-            ) from exc
-        return self.url_policy.verify_peer_address(peer_address, validated)
+            validated = self._browser_request_contexts.get(id(request))
+            if validated is None:
+                validated = self.url_policy.validate(response_url)
+            elif self._origin(validated) != self._url_origin(response_url):
+                raise PublicUrlPolicyError(
+                    response_url, "browser response target changed unexpectedly"
+                )
+            try:
+                server_address = response.server_addr()
+            except Exception as exc:
+                raise PublicUrlPolicyError(
+                    response_url, "browser connected peer could not be verified"
+                ) from exc
+            return self.url_policy.verify_browser_peer(server_address, validated)
+        except PublicUrlPolicyError as exc:
+            self._mark_browser_page_compromised(page, exc)
+            raise
 
     def _goto_public_page(self, page, url, timeout_ms):
+        self._prepare_browser_page(page)
         validated = self.url_policy.validate(url)
         response = page.goto(
             validated.url, timeout=timeout_ms, wait_until="domcontentloaded"
         )
         if response:
             self._validate_browser_response(response)
+        self._ensure_browser_page_secure(page)
         return response
 
     def _goto_provider_page(self, page, url):
@@ -319,6 +477,7 @@ class PDFConverter:
             page.wait_for_load_state("networkidle", timeout=self.provider_settle_timeout_ms)
         except Exception:
             pass
+        self._ensure_browser_page_secure(page)
         return response
 
     def _read_pdf_text(self, pdf_path, max_pages=2):
@@ -385,12 +544,17 @@ class PDFConverter:
             raise RuntimeError(message) from exc
 
     def _new_browser_context(self, browser):
+        self._browser_request_contexts.clear()
+        self._browser_page_compromises.clear()
+        self._browser_pages.clear()
+        self._browser_global_compromise = None
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             accept_downloads=True,
             service_workers="block",
         )
         context.route("**/*", self._guard_browser_request)
+        context.route_web_socket("**/*", self._block_browser_websocket)
         return context
 
     def _build_candidate_urls(self, text_content, subject, candidate_info):
@@ -525,6 +689,7 @@ class PDFConverter:
         return unique_urls
 
     def _validated_dom_urls(self, page, base_url, logs):
+        self._ensure_browser_page_secure(page)
         public_urls = []
         for dom_url in self._collect_dom_urls(page):
             candidate = urljoin(base_url, dom_url)
@@ -532,7 +697,18 @@ class PDFConverter:
                 public_urls.append(self.url_policy.validate(candidate).url)
             except PublicUrlPolicyError as exc:
                 logs.append(self._policy_rejection_log(exc, "dom_url"))
+        self._ensure_browser_page_secure(page)
         return public_urls
+
+    def _append_process_log(self, level, reason_code, url, subject=None):
+        del subject
+        safe_url = self.url_policy.sanitize(url)
+        with open(
+            os.path.join(self.staging_dir, "process_log.txt"),
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(f"[{level}] {reason_code}: {safe_url}\n")
 
     def _describe_baiwang_artifact(self, path, kind, source_url, mode, fields):
         artifact = {
@@ -983,6 +1159,7 @@ class PDFConverter:
                         if selected_artifact:
                             break
 
+                        browser_artifact_start = len(artifacts)
                         page = context.new_page()
                         captured_responses = []
 
@@ -1064,10 +1241,14 @@ class PDFConverter:
                                             "content_type": response_item["content_type"],
                                         }
                                     )
+                            self._ensure_browser_page_secure(page)
                             selected_artifact, _ = self._select_baiwang_recovery_result(artifacts, expected_fields)
                             if selected_artifact:
                                 break
                         except PublicUrlPolicyError as exc:
+                            self._discard_browser_artifacts(
+                                artifacts, browser_artifact_start
+                            )
                             network_logs.append(
                                 self._policy_rejection_log(exc, "browser_navigation")
                             )
@@ -1253,6 +1434,7 @@ class PDFConverter:
                         if provider_family != "bwjf_signed_invoice":
                             continue
 
+                        browser_artifact_start = len(artifacts)
                         page = context.new_page()
                         captured_responses = []
 
@@ -1337,10 +1519,14 @@ class PDFConverter:
                                             "content_type": response_item["content_type"],
                                         }
                                     )
+                            self._ensure_browser_page_secure(page)
                             selected_artifact, _ = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
                             if selected_artifact:
                                 break
                         except PublicUrlPolicyError as exc:
+                            self._discard_browser_artifacts(
+                                artifacts, browser_artifact_start
+                            )
                             network_logs.append(
                                 self._policy_rejection_log(exc, "browser_navigation")
                             )
@@ -1444,6 +1630,7 @@ class PDFConverter:
                 safe_log_url = self.url_policy.sanitize(url)
                 logging.info("Visiting URL: %s", safe_log_url)
                 page = context.new_page()
+                self._attach_browser_response_guard(page)
                 link_started_at = __import__("time").perf_counter()
                 pdf_path = os.path.join(email_staging_path, f"web_invoice_{index + 1}.pdf")
                 link_meta = {
@@ -1484,6 +1671,7 @@ class PDFConverter:
                     link_meta["resolved_url"] = page.url
                     link_meta["body_excerpt"] = body_text[:800]
                     link_meta["page_title"] = self._safe_page_title(page)
+                    self._ensure_browser_page_secure(page)
 
                     reason_code, reason_message = self._classify_generic_page(
                         page.url,
@@ -1494,8 +1682,7 @@ class PDFConverter:
                     if reason_code:
                         log_level = logging.error if reason_code == "URL_AUTH_WALL_DETECTED" else logging.info
                         log_level("%s at %s", reason_code, safe_log_url)
-                        with open(os.path.join(self.staging_dir, "process_log.txt"), "a", encoding="utf-8") as handle:
-                            handle.write(f"[INFO] {reason_code}: {safe_log_url} (Email: {subject})\n")
+                        self._append_process_log("INFO", reason_code, url)
                         link_meta.update(
                             {
                                 "status": "skipped" if reason_code == "URL_NON_INVOICE_PAGE_SKIPPED" else "failed",
@@ -1508,7 +1695,9 @@ class PDFConverter:
                         continue
 
                     logging.info("Generating PDF from webpage...")
+                    self._ensure_browser_page_secure(page)
                     page.pdf(path=pdf_path, format="A4", print_background=True)
+                    self._ensure_browser_page_secure(page)
                     if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1024:
                         link_meta.update({"status": "downloaded", "download_mode": "page_pdf"})
                         _append_link_result()
@@ -1524,6 +1713,11 @@ class PDFConverter:
                         if return_metadata:
                             _append_link_result()
                 except PublicUrlPolicyError as exc:
+                    if os.path.isfile(pdf_path):
+                        try:
+                            os.remove(pdf_path)
+                        except OSError:
+                            pass
                     logging.error("%s", exc)
                     link_meta.update(
                         {
@@ -1538,8 +1732,7 @@ class PDFConverter:
                         _append_link_result()
                 except PlaywrightTimeoutError:
                     logging.error("Timeout (%sms) while loading %s", self.generic_timeout_ms, safe_log_url)
-                    with open(os.path.join(self.staging_dir, "process_log.txt"), "a", encoding="utf-8") as handle:
-                        handle.write(f"[ERROR] Timeout loading URL: {safe_log_url} (Email: {subject})\n")
+                    self._append_process_log("ERROR", "URL_PAGE_TIMEOUT", url)
                     link_meta.update(
                         {
                             "status": "failed",
@@ -1550,12 +1743,16 @@ class PDFConverter:
                     if return_metadata:
                         _append_link_result()
                 except Exception as exc:
-                    logging.error("Error processing URL %s: %s", safe_log_url, exc)
+                    logging.error(
+                        "Error processing URL %s (%s)",
+                        safe_log_url,
+                        type(exc).__name__,
+                    )
                     link_meta.update(
                         {
                             "status": "failed",
                             "reason_code": "URL_DOWNLOAD_FAILED",
-                            "message": str(exc),
+                            "message": "URL processing failed before a usable invoice PDF was available.",
                         }
                     )
                     if return_metadata:

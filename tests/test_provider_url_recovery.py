@@ -16,20 +16,38 @@ PUBLIC_ADDRESS = "93.184.216.34"
 
 
 def public_test_policy(peer_address=PUBLIC_ADDRESS):
+    peer = peer_address if isinstance(peer_address, tuple) else (peer_address, 443)
     return PublicUrlPolicy(
         resolver=lambda host, port: [PUBLIC_ADDRESS],
-        peer_getter=lambda response: peer_address,
+        peer_getter=lambda response: peer,
+        proxy_endpoint=None,
+    )
+
+
+def fake_ip_proxy_policy(peer=("127.0.0.1", 7897)):
+    return PublicUrlPolicy(
+        resolver=lambda host, port: ["198.18.0.42"],
+        public_resolver=lambda host, port: [PUBLIC_ADDRESS],
+        peer_getter=lambda response: peer,
+        proxy_endpoint=("127.0.0.1", 7897),
     )
 
 
 class FakeResponse:
     def __init__(self, url, content=b"", headers=None, status_code=200, json_data=None):
         self.url = url
-        self.content = content
+        self._content = content
         self.headers = headers or {}
         self.status_code = status_code
         self._json_data = json_data
+        self.content_reads = 0
+        self.close_calls = 0
         self.text = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else str(content)
+
+    @property
+    def content(self):
+        self.content_reads += 1
+        return self._content
 
     def json(self):
         if self._json_data is not None:
@@ -37,7 +55,7 @@ class FakeResponse:
         return json.loads(self.text)
 
     def close(self):
-        return None
+        self.close_calls += 1
 
 
 class FakeSession:
@@ -51,7 +69,13 @@ class FakeSession:
         parsed = urlparse(url)
         if "sdapi.fpyun.com.cn" in parsed.netloc:
             return FakeResponse(
-                "https://fp.baiwang.com/format/d",
+                url,
+                headers={"Location": "https://fp.baiwang.com/format/d"},
+                status_code=302,
+            )
+        if "fp.baiwang.com" in parsed.netloc:
+            return FakeResponse(
+                url,
                 b"%PDF-1.5\nfpyun pdf",
                 {"Content-Type": "application/pdf;charset=utf-8"},
             )
@@ -124,6 +148,10 @@ class RecordingSession:
         self.calls.append(("GET", url, kwargs))
         return self.responses.pop(0)
 
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.responses.pop(0)
+
 
 class FakeRoute:
     def __init__(self):
@@ -137,8 +165,53 @@ class FakeRoute:
 
 
 class FakeBrowserRequest:
-    def __init__(self, url):
+    def __init__(self, url, page=None):
         self.url = url
+        self.frame = FakeFrame(page) if page is not None else None
+
+
+class FakeFrame:
+    def __init__(self, page):
+        self.page = page
+
+
+class FakeBrowserPage:
+    def __init__(self):
+        self.closed = False
+
+    def is_closed(self):
+        return self.closed
+
+
+class FakeNavigationPage(FakeBrowserPage):
+    def __init__(self, response):
+        super().__init__()
+        self.response = response
+
+    def goto(self, url, **kwargs):
+        self.response.request = FakeBrowserRequest(url, self)
+        return self.response
+
+
+class FakeEventPage(FakeBrowserPage):
+    def __init__(self):
+        super().__init__()
+        self.handlers = {}
+
+    def on(self, event, callback):
+        self.handlers[event] = callback
+
+    def emit(self, event, value):
+        self.handlers[event](value)
+
+
+class FakeWebSocketRoute:
+    def __init__(self, url="wss://public.example/socket"):
+        self.url = url
+        self.closed = None
+
+    def close(self, **kwargs):
+        self.closed = kwargs
 
 
 class FakeDomPage:
@@ -156,15 +229,31 @@ class FakeDomPage:
 
 
 class FakeBrowserResponse(FakeResponse):
-    def __init__(self, url, peer_address, **kwargs):
+    def __init__(self, url, peer_address, peer_port=443, request=None, **kwargs):
         super().__init__(url, **kwargs)
         self._peer_address = peer_address
+        self._peer_port = peer_port
+        self.request = request
 
     def server_addr(self):
-        return {"ipAddress": self._peer_address, "port": 443}
+        if self._peer_address is None:
+            return None
+        return {"ipAddress": self._peer_address, "port": self._peer_port}
 
     def body(self):
         return self.content
+
+
+class ExplodingBodyResponse(FakeResponse):
+    @property
+    def content(self):
+        self.content_reads += 1
+        raise RuntimeError("body read failed")
+
+
+class ExplodingServerAddressResponse(FakeBrowserResponse):
+    def server_addr(self):
+        raise RuntimeError("server address unavailable")
 
 
 NUONUO_XML = """<?xml version="1.0" encoding="utf-8"?>
@@ -200,15 +289,12 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
         )
-        session = RecordingSession(
-            [
-                FakeResponse(
-                    "https://public.example/start",
-                    status_code=302,
-                    headers={"Location": "http://127.0.0.1/admin?token=private-secret"},
-                )
-            ]
+        redirect_response = FakeResponse(
+            "https://public.example/start",
+            status_code=302,
+            headers={"Location": "http://127.0.0.1/admin?value=private-secret"},
         )
+        session = RecordingSession([redirect_response])
 
         with self.assertRaises(PublicUrlPolicyError) as caught:
             converter._request_public(session, "GET", "https://public.example/start")
@@ -216,20 +302,195 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertEqual(len(session.calls), 1)
         self.assertFalse(session.calls[0][2]["allow_redirects"])
         self.assertNotIn("private-secret", str(caught.exception))
+        self.assertEqual(session.responses, [])
+        self.assertEqual(session.calls[0][0], "GET")
+        self.assertEqual(redirect_response.close_calls, 1)
+        self.assertEqual(redirect_response.content_reads, 0)
 
     def test_public_request_rejects_connected_private_peer(self):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(),
             url_policy=public_test_policy(peer_address="10.0.0.9"),
         )
-        session = RecordingSession(
-            [FakeResponse("https://public.example/invoice.pdf")]
-        )
+        source_response = FakeResponse("https://public.example/invoice.pdf")
+        session = RecordingSession([source_response])
 
         with self.assertRaises(PublicUrlPolicyError):
             converter._request_public(
                 session, "GET", "https://public.example/invoice.pdf"
             )
+        self.assertEqual(source_response.close_calls, 1)
+        self.assertEqual(source_response.content_reads, 0)
+
+    def test_public_request_buffers_body_then_closes_source_response(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        source_response = FakeResponse(
+            "https://public.example/document",
+            content=b"public body",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+        buffered = converter._request_public(
+            RecordingSession([source_response]),
+            "GET",
+            "https://public.example/document",
+        )
+
+        self.assertEqual(buffered.content, b"public body")
+        self.assertEqual(source_response.content_reads, 1)
+        self.assertEqual(source_response.close_calls, 1)
+
+    def test_public_request_closes_response_when_body_read_fails(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        source_response = ExplodingBodyResponse("https://public.example/document")
+
+        with self.assertRaisesRegex(RuntimeError, "body read failed"):
+            converter._request_public(
+                RecordingSession([source_response]),
+                "GET",
+                "https://public.example/document",
+            )
+
+        self.assertEqual(source_response.close_calls, 1)
+
+    def test_redirect_matrix_preserves_requests_method_semantics_and_closes_hops(self):
+        for method in ("GET", "POST"):
+            for status in (301, 302, 303, 307, 308):
+                with self.subTest(method=method, status=status):
+                    first = FakeResponse(
+                        "https://public.example/start",
+                        status_code=status,
+                        headers={"Location": "https://cdn.example/final"},
+                    )
+                    second = FakeResponse(
+                        "https://cdn.example/final", content=b"finished"
+                    )
+                    session = RecordingSession([first, second])
+                    converter = PDFConverter(
+                        staging_dir=tempfile.mkdtemp(),
+                        url_policy=public_test_policy(
+                            peer_address=("142.250.72.14", 443)
+                        ),
+                    )
+                    kwargs = {
+                        "headers": {
+                            "Authorization": "Bearer synthetic-secret",
+                            "Cookie": "session=synthetic-secret",
+                            "Content-Type": "application/json",
+                            "Content-Length": "2",
+                            "X-Keep": "yes",
+                        }
+                    }
+                    if method == "POST":
+                        kwargs["data"] = b"{}"
+
+                    result = converter._request_public(
+                        session, method, "https://public.example/start", **kwargs
+                    )
+
+                    expected_second_method = (
+                        "GET"
+                        if method == "POST" and status in {301, 302, 303}
+                        else method
+                    )
+                    self.assertEqual(
+                        [call[0] for call in session.calls],
+                        [method, expected_second_method],
+                    )
+                    redirected_headers = session.calls[1][2]["headers"]
+                    self.assertEqual(redirected_headers, {"X-Keep": "yes"})
+                    if expected_second_method == "GET":
+                        self.assertNotIn("data", session.calls[1][2])
+                    else:
+                        self.assertEqual(session.calls[1][2].get("data"), kwargs.get("data"))
+                    self.assertEqual(result.content, b"finished")
+                    self.assertEqual(first.close_calls, 1)
+                    self.assertEqual(second.close_calls, 1)
+
+    def test_same_origin_post_to_get_redirect_strips_only_entity_headers(self):
+        first = FakeResponse(
+            "https://public.example/start",
+            status_code=302,
+            headers={"Location": "/final"},
+        )
+        second = FakeResponse("https://public.example/final", content=b"finished")
+        session = RecordingSession([first, second])
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+
+        converter._request_public(
+            session,
+            "POST",
+            "https://public.example/start",
+            data=b"{}",
+            headers={
+                "Authorization": "Bearer synthetic-secret",
+                "Cookie": "session=synthetic-secret",
+                "Content-Type": "application/json",
+                "Content-Length": "2",
+            },
+        )
+
+        self.assertEqual(
+            session.calls[1][2]["headers"],
+            {
+                "Authorization": "Bearer synthetic-secret",
+                "Cookie": "session=synthetic-secret",
+            },
+        )
+
+    def test_redirect_uses_fresh_validation_context_for_each_hop(self):
+        resolved_hosts = []
+
+        def resolver(host, port):
+            resolved_hosts.append(host)
+            return [PUBLIC_ADDRESS]
+
+        policy = PublicUrlPolicy(
+            resolver=resolver,
+            peer_getter=lambda response: ("142.250.72.14", 443),
+            proxy_endpoint=None,
+        )
+        converter = PDFConverter(staging_dir=tempfile.mkdtemp(), url_policy=policy)
+        session = RecordingSession(
+            [
+                FakeResponse(
+                    "https://public.example/start",
+                    status_code=307,
+                    headers={"Location": "https://cdn.example/final"},
+                ),
+                FakeResponse("https://cdn.example/final", content=b"finished"),
+            ]
+        )
+
+        converter._request_public(session, "GET", "https://public.example/start")
+
+        self.assertEqual(resolved_hosts, ["public.example", "cdn.example"])
+
+    def test_fake_ip_provider_request_succeeds_through_attested_explicit_proxy(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=fake_ip_proxy_policy()
+        )
+        response = FakeResponse(
+            "https://pis.baiwang.com/document",
+            content=b"%PDF-1.5\npublic",
+            headers={"Content-Type": "application/pdf"},
+        )
+
+        artifacts, logs = converter._probe_direct_artifact(
+            RecordingSession([response]),
+            "https://pis.baiwang.com/document",
+            str(Path(converter.staging_dir) / "proxy"),
+        )
+
+        self.assertEqual(logs, [])
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(response.close_calls, 1)
 
     def test_browser_route_aborts_private_document_or_resource_requests(self):
         converter = PDFConverter(
@@ -249,6 +510,140 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
             route, FakeBrowserRequest("https://public.example/invoice")
         )
         self.assertEqual(route.action, "continue")
+
+    def test_browser_peer_violation_marks_page_compromised_before_body_read(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        page = FakeBrowserPage()
+        request = FakeBrowserRequest("https://public.example/document", page)
+        route = FakeRoute()
+        converter._guard_browser_request(route, request)
+        response = FakeBrowserResponse(
+            "https://public.example/document",
+            "127.0.0.1",
+            peer_port=7897,
+            request=request,
+            content=b"private response",
+        )
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._validate_browser_response(response)
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._ensure_browser_page_secure(page)
+        self.assertEqual(response.content_reads, 0)
+
+    def test_generic_browser_navigation_discards_compromised_page(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        response = FakeBrowserResponse(
+            "https://public.example/document", "10.0.0.8"
+        )
+        page = FakeNavigationPage(response)
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._goto_public_page(page, "https://public.example/document", 1000)
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._ensure_browser_page_secure(page)
+
+    def test_generic_response_guard_marks_private_subresource_peer_compromised(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        page = FakeEventPage()
+        request = FakeBrowserRequest("https://cdn.example/resource.js", page)
+        converter._guard_browser_request(FakeRoute(), request)
+        converter._attach_browser_response_guard(page)
+
+        page.emit(
+            "response",
+            FakeBrowserResponse(
+                "https://cdn.example/resource.js",
+                "127.0.0.1",
+                peer_port=7897,
+                request=request,
+            ),
+        )
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._ensure_browser_page_secure(page)
+
+    def test_compromised_browser_artifacts_are_removed_from_disk_and_candidates(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        retained = {"path": str(Path(converter.staging_dir) / "direct.pdf")}
+        discarded_path = Path(converter.staging_dir) / "dom.pdf"
+        discarded_path.write_bytes(b"%PDF-1.5\nsynthetic")
+        artifacts = [retained, {"path": str(discarded_path)}]
+
+        converter._discard_browser_artifacts(artifacts, 1)
+
+        self.assertEqual(artifacts, [retained])
+        self.assertFalse(discarded_path.exists())
+
+    def test_browser_server_addr_none_rules_follow_explicit_proxy_mode(self):
+        proxy_converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=fake_ip_proxy_policy()
+        )
+        proxy_page = FakeBrowserPage()
+        proxy_request = FakeBrowserRequest(
+            "https://pis.baiwang.com/document", proxy_page
+        )
+        proxy_converter._guard_browser_request(FakeRoute(), proxy_request)
+        proxy_response = FakeBrowserResponse(
+            "https://pis.baiwang.com/document",
+            None,
+            request=proxy_request,
+        )
+        self.assertIsNone(proxy_converter._validate_browser_response(proxy_response))
+        proxy_converter._ensure_browser_page_secure(proxy_page)
+
+        direct_converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        direct_page = FakeBrowserPage()
+        direct_request = FakeBrowserRequest(
+            "https://public.example/document", direct_page
+        )
+        direct_converter._guard_browser_request(FakeRoute(), direct_request)
+        direct_response = FakeBrowserResponse(
+            "https://public.example/document",
+            None,
+            request=direct_request,
+        )
+        with self.assertRaises(PublicUrlPolicyError):
+            direct_converter._validate_browser_response(direct_response)
+
+    def test_browser_server_addr_exception_fails_closed_even_in_proxy_mode(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=fake_ip_proxy_policy()
+        )
+        page = FakeBrowserPage()
+        request = FakeBrowserRequest("https://pis.baiwang.com/document", page)
+        converter._guard_browser_request(FakeRoute(), request)
+        response = ExplodingServerAddressResponse(
+            "https://pis.baiwang.com/document",
+            None,
+            request=request,
+        )
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._validate_browser_response(response)
+
+    def test_browser_websockets_are_blocked(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        route = FakeWebSocketRoute()
+
+        converter._block_browser_websocket(route)
+
+        self.assertIsNotNone(route.closed)
+        self.assertEqual(route.closed.get("code"), 1008)
 
     def test_dom_private_urls_are_removed_before_provider_probe(self):
         converter = PDFConverter(
@@ -284,6 +679,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
                 1,
                 "https://public.example/start",
             )
+        self.assertEqual(response.content_reads, 0)
 
     def test_browser_response_rejects_peer_not_in_validated_dns_set(self):
         converter = PDFConverter(
@@ -295,6 +691,33 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
 
         with self.assertRaises(PublicUrlPolicyError):
             converter._validate_browser_response(response)
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._ensure_browser_page_secure(FakeBrowserPage())
+
+    def test_policy_and_process_logs_redact_path_query_and_subject(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        rejected_url = "http://127.0.0.1/private-capability?value=synthetic-secret"
+        with self.assertRaises(PublicUrlPolicyError) as caught:
+            converter.url_policy.validate(rejected_url)
+        trace = json.dumps(converter._policy_rejection_log(caught.exception, "test"))
+        self.assertNotIn("private-capability", trace)
+        self.assertNotIn("synthetic-secret", trace)
+
+        converter._append_process_log(
+            "INFO",
+            "URL_POLICY_REJECTED",
+            rejected_url,
+            subject="SYNTHETIC_MAILBOX_SUBJECT",
+        )
+        process_log = (Path(converter.staging_dir) / "process_log.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("http://127.0.0.1/<redacted>", process_log)
+        self.assertNotIn("private-capability", process_log)
+        self.assertNotIn("synthetic-secret", process_log)
+        self.assertNotIn("SYNTHETIC_MAILBOX_SUBJECT", process_log)
 
     def test_direct_invoice_acceptance_normalizes_seller_parentheses(self):
         api = InvoiceAppAPI()

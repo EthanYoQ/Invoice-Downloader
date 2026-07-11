@@ -14,6 +14,10 @@ def resolver_for(mapping):
     return _resolve
 
 
+def direct_policy(**kwargs):
+    return PublicUrlPolicy(proxy_endpoint=None, **kwargs)
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -38,7 +42,7 @@ def resolver_for(mapping):
 )
 def test_rejects_non_public_literal_addresses(url):
     with pytest.raises(PublicUrlPolicyError):
-        PublicUrlPolicy().validate(url)
+        direct_policy().validate(url)
 
 
 @pytest.mark.parametrize(
@@ -53,14 +57,14 @@ def test_rejects_non_public_literal_addresses(url):
     ],
 )
 def test_rejects_non_http_credentials_and_disallowed_ports(url):
-    policy = PublicUrlPolicy(resolver=resolver_for({}))
+    policy = direct_policy(resolver=resolver_for({}))
 
     with pytest.raises(PublicUrlPolicyError):
         policy.validate(url)
 
 
 def test_rejects_hostname_when_any_dns_result_is_non_public():
-    policy = PublicUrlPolicy(
+    policy = direct_policy(
         resolver=resolver_for({"mixed.example": [PUBLIC_V4, "10.0.0.8"]})
     )
 
@@ -69,7 +73,7 @@ def test_rejects_hostname_when_any_dns_result_is_non_public():
 
 
 def test_accepts_public_https_hostname_and_freezes_all_addresses():
-    policy = PublicUrlPolicy(
+    policy = direct_policy(
         resolver=resolver_for({"invoice.example": [PUBLIC_V4, PUBLIC_V6]})
     )
 
@@ -82,17 +86,17 @@ def test_accepts_public_https_hostname_and_freezes_all_addresses():
 
 
 def test_rejects_private_redirect_destination():
-    policy = PublicUrlPolicy(resolver=resolver_for({"invoice.example": [PUBLIC_V4]}))
+    policy = direct_policy(resolver=resolver_for({"invoice.example": [PUBLIC_V4]}))
     current = policy.validate("https://invoice.example/start")
 
     with pytest.raises(PublicUrlPolicyError):
         policy.resolve_redirect(current, "http://127.0.0.1/admin?token=secret")
 
 
-def test_rejects_connected_peer_outside_validated_dns_results():
-    policy = PublicUrlPolicy(
+def test_direct_mode_rejects_private_connected_peer():
+    policy = direct_policy(
         resolver=resolver_for({"invoice.example": [PUBLIC_V4]}),
-        peer_getter=lambda response: "10.0.0.9",
+        peer_getter=lambda response: ("10.0.0.9", 443),
     )
     validated = policy.validate("https://invoice.example/invoice.pdf")
 
@@ -100,16 +104,119 @@ def test_rejects_connected_peer_outside_validated_dns_results():
         policy.verify_response_peer(object(), validated)
 
 
+def test_direct_mode_accepts_public_cdn_peer_outside_dns_snapshot():
+    policy = direct_policy(
+        resolver=resolver_for({"invoice.example": [PUBLIC_V4]}),
+        peer_getter=lambda response: ("142.250.72.14", 443),
+    )
+    validated = policy.validate("https://invoice.example/invoice.pdf")
+
+    assert policy.verify_response_peer(object(), validated) == "142.250.72.14"
+
+
+def test_fake_ip_succeeds_only_with_explicit_proxy_and_public_attestation():
+    policy = PublicUrlPolicy(
+        resolver=resolver_for({"invoice.example": ["198.18.0.42"]}),
+        public_resolver=resolver_for({"invoice.example": [PUBLIC_V4, PUBLIC_V6]}),
+        proxy_endpoint=("127.0.0.1", 7897),
+        peer_getter=lambda response: ("127.0.0.1", 7897),
+    )
+
+    validated = policy.validate("https://invoice.example/invoice.pdf")
+
+    assert validated.transport_mode == "proxy"
+    assert validated.public_addresses == (PUBLIC_V4, PUBLIC_V6)
+    assert policy.verify_response_peer(object(), validated) == "127.0.0.1"
+
+
+def test_fake_ip_without_explicit_proxy_is_rejected():
+    policy = direct_policy(
+        resolver=resolver_for({"invoice.example": ["198.18.0.42"]}),
+        public_resolver=resolver_for({"invoice.example": [PUBLIC_V4]}),
+    )
+
+    with pytest.raises(PublicUrlPolicyError):
+        policy.validate("https://invoice.example/invoice.pdf")
+
+
+def test_proxy_mode_fails_closed_when_public_attestation_is_unavailable():
+    def unavailable(host, port):
+        raise TimeoutError("attestation unavailable")
+
+    policy = PublicUrlPolicy(
+        resolver=resolver_for({"invoice.example": ["198.18.0.42"]}),
+        public_resolver=unavailable,
+        proxy_endpoint=("127.0.0.1", 7897),
+    )
+
+    with pytest.raises(PublicUrlPolicyError, match="attestation"):
+        policy.validate("https://invoice.example/invoice.pdf")
+
+
+def test_proxy_bypass_target_uses_direct_rules_and_rejects_fake_ip():
+    policy = PublicUrlPolicy(
+        resolver=resolver_for({"invoice.example": ["198.18.0.42"]}),
+        public_resolver=resolver_for({"invoice.example": [PUBLIC_V4]}),
+        proxy_endpoint=("127.0.0.1", 7897),
+        proxy_bypass_checker=lambda host: True,
+    )
+
+    with pytest.raises(PublicUrlPolicyError):
+        policy.validate("https://invoice.example/invoice.pdf")
+
+
+def test_proxy_mode_rejects_wrong_transport_peer_even_when_loopback():
+    policy = PublicUrlPolicy(
+        resolver=resolver_for({"invoice.example": ["198.18.0.42"]}),
+        public_resolver=resolver_for({"invoice.example": [PUBLIC_V4]}),
+        proxy_endpoint=("127.0.0.1", 7897),
+        peer_getter=lambda response: ("127.0.0.1", 7898),
+    )
+    validated = policy.validate("https://invoice.example/invoice.pdf")
+
+    with pytest.raises(PublicUrlPolicyError, match="configured proxy"):
+        policy.verify_response_peer(object(), validated)
+
+
+def test_browser_missing_peer_is_allowed_only_for_attested_proxy_target():
+    proxy_policy = PublicUrlPolicy(
+        resolver=resolver_for({"invoice.example": ["198.18.0.42"]}),
+        public_resolver=resolver_for({"invoice.example": [PUBLIC_V4]}),
+        proxy_endpoint=("127.0.0.1", 7897),
+    )
+    proxy_target = proxy_policy.validate("https://invoice.example/invoice.pdf")
+    assert proxy_policy.verify_browser_peer(None, proxy_target) is None
+
+    direct = direct_policy(
+        resolver=resolver_for({"invoice.example": [PUBLIC_V4]})
+    )
+    direct_target = direct.validate("https://invoice.example/invoice.pdf")
+    with pytest.raises(PublicUrlPolicyError):
+        direct.verify_browser_peer(None, direct_target)
+
+
 def test_policy_error_safe_url_removes_credentials_query_and_fragment():
-    policy = PublicUrlPolicy(resolver=resolver_for({}))
+    policy = direct_policy(resolver=resolver_for({}))
 
     with pytest.raises(PublicUrlPolicyError) as caught:
         policy.validate("https://user:password@public.example/path/invoice.pdf?token=secret#frag")
 
     rendered = str(caught.value)
     assert "URL_POLICY_REJECTED" in rendered
-    assert "https://public.example/path/invoice.pdf" in rendered
+    assert "https://public.example/<redacted>" in rendered
     assert "user" not in rendered
     assert "password" not in rendered
     assert "token" not in rendered
     assert "secret" not in rendered
+
+
+def test_sanitized_url_never_emits_capability_path_query_or_fragment():
+    sanitized = direct_policy().sanitize(
+        "https://public.example/private-capability/opaque-value?key=query-value#fragment-value"
+    )
+
+    assert sanitized == "https://public.example/<redacted>"
+    assert "capability" not in sanitized
+    assert "opaque" not in sanitized
+    assert "query-value" not in sanitized
+    assert "fragment-value" not in sanitized
