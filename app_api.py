@@ -2467,22 +2467,144 @@ class InvoiceAppAPI:
         before_date=None,
         rules_text="",
         _extractor=None,
+        _worker_extractor_factory=None,
     ):
+        import copy
+        import time as _time
+
         from archive_service import ArchiveService
         from candidate_pipeline import CandidatePipeline
         from extraction_pipeline import ExtractionPipeline
+        from invoice_extractor import InvoiceExtractor
 
         candidates = CandidatePipeline().collect(attachments_info)
+        prepared_inputs = {}
+        prepared_extractions = {}
+        prepared_lock = threading.Lock()
+
+        def _verified_worker_ceiling():
+            runtime = getattr(_extractor, "glm_runtime", None)
+            profiles = getattr(runtime, "profiles", {}) or {}
+            ceilings = [
+                int(getattr(profile, "max_concurrency", 1) or 1)
+                for profile in profiles.values()
+            ]
+            return max(1, min(2, max(ceilings, default=1)))
+
+        def _prepare_local(candidate):
+            legacy = candidate.to_legacy()
+            if (
+                not candidate.parallel_safe
+                or legacy.get("candidate_action")
+                or _extractor is None
+                or not callable(getattr(_extractor, "pdf_to_base64_image", None))
+            ):
+                return legacy
+            try:
+                base64_img = _extractor.pdf_to_base64_image(candidate.source_path)
+            except Exception as exc:
+                with prepared_lock:
+                    prepared_extractions[candidate.identity.document_id] = {
+                        "base64_img": None,
+                        "preprocess_error_type": type(exc).__name__,
+                    }
+                return legacy
+            if not base64_img:
+                return legacy
+            prepared_inputs[candidate.identity.document_id] = (legacy, base64_img)
+            return None
+
+        def _extract_remote(candidate):
+            legacy, base64_img = prepared_inputs[candidate.identity.document_id]
+            worker_factory = _worker_extractor_factory
+            if worker_factory is None:
+                def worker_factory(runtime):
+                    return InvoiceExtractor(
+                        api_key=api_key,
+                        output_dir=save_path,
+                        glm_runtime=runtime,
+                        close_glm_runtime=False,
+                    )
+            started_at = _time.perf_counter()
+            worker = None
+            prepared = None
+            worker_close_error_type = ""
+            try:
+                try:
+                    worker = worker_factory(getattr(_extractor, "glm_runtime", None))
+                    info_json = worker.extract_info_via_llm(
+                        base64_img,
+                        custom_rules=rules_text,
+                        pdf_path=candidate.source_path,
+                        document_context={
+                            **legacy,
+                            "search_since_date": since_date or "",
+                            "search_before_date": before_date or "",
+                        },
+                    )
+                except Exception as exc:
+                    quota_message = self._resolve_quota_message(exc)
+                    prepared = {
+                        "base64_img": base64_img,
+                        "error_reason": "PIPELINE_REMOTE_QUOTA_EXHAUSTED"
+                        if quota_message
+                        else "PIPELINE_REMOTE_EXTRACTION_FAILED",
+                        "quota_message": quota_message or "",
+                        "exception_type": type(exc).__name__,
+                    }
+                else:
+                    prepared = {
+                        "base64_img": base64_img,
+                        "info_json": info_json,
+                        "extraction_trace": copy.deepcopy(
+                            getattr(worker, "last_extraction_trace", {}) or {}
+                        ),
+                        "extraction_timing": copy.deepcopy(
+                            getattr(worker, "last_timing_trace", {}) or {}
+                        ),
+                        "elapsed_seconds": _time.perf_counter() - started_at,
+                    }
+            finally:
+                close_worker = getattr(worker, "close", None)
+                if callable(close_worker):
+                    try:
+                        close_worker()
+                    except Exception as close_exc:
+                        worker_close_error_type = type(close_exc).__name__
+            if prepared is None:
+                prepared = {
+                    "base64_img": base64_img,
+                    "error_reason": "PIPELINE_REMOTE_EXTRACTION_FAILED",
+                    "quota_message": "",
+                    "exception_type": "UnknownWorkerFailure",
+                }
+            if worker_close_error_type:
+                prepared["worker_close_error_type"] = worker_close_error_type
+            with prepared_lock:
+                prepared_extractions[candidate.identity.document_id] = prepared
+            return legacy
+
         outcomes = ExtractionPipeline(
-            local_parser=lambda candidate: candidate.to_legacy(),
-            remote_extractor=lambda _candidate: None,
-            max_workers=1,
-            stop_requested=lambda: False,
+            local_parser=_prepare_local,
+            remote_extractor=_extract_remote,
+            max_workers=2,
+            verified_ceiling=_verified_worker_ceiling,
+            stop_requested=lambda: bool(getattr(self, "_stop_requested", False)),
         ).extract(candidates)
+        if getattr(self, "_stop_requested", False):
+            return self._run_processing_loop_legacy_with_extractor(
+                attachments_info,
+                api_key,
+                save_path,
+                since_date,
+                before_date,
+                rules_text,
+                _extractor=_extractor,
+            )
         archive_service = ArchiveService(
             writer=lambda _outcome, _root: "",
         )
-        return archive_service.delegate_batch(
+        result = archive_service.delegate_batch(
             outcomes,
             save_path,
             lambda ordered_attachments: self._run_processing_loop_legacy_with_extractor(
@@ -2493,8 +2615,16 @@ class InvoiceAppAPI:
                 before_date,
                 rules_text,
                 _extractor=_extractor,
+                _prepared_extractions=prepared_extractions,
             ),
         )
+        has_remote_failure = any(
+            bool(prepared.get("error_reason"))
+            for prepared in prepared_extractions.values()
+        )
+        if has_remote_failure and not getattr(self, "quota_exhausted", False):
+            raise ProcessingLoopFailure("PROCESSING_PIPELINE_UNRESOLVED")
+        return result
 
     def _run_processing_loop_legacy_with_extractor(
         self,
@@ -2505,6 +2635,7 @@ class InvoiceAppAPI:
         before_date=None,
         rules_text="",
         _extractor=None,
+        _prepared_extractions=None,
     ):
         self._packaged_diag_write(
             "run_loop_enter",
@@ -2573,6 +2704,7 @@ class InvoiceAppAPI:
         loop_result = "completed"
         processing_error = None
         browser_first_recorded = False
+        prepared_extractions = dict(_prepared_extractions or {})
 
         def _build_normalized_fields(fields):
             if not fields or not isinstance(fields, dict):
@@ -3323,7 +3455,11 @@ class InvoiceAppAPI:
                         continue
                     
                     # Step A: 转图片
-                    base64_img = extractor.pdf_to_base64_image(pdf_path)
+                    prepared_extraction = prepared_extractions.pop(document_id, {})
+                    if prepared_extraction:
+                        base64_img = copy.deepcopy(prepared_extraction.get("base64_img"))
+                    else:
+                        base64_img = extractor.pdf_to_base64_image(pdf_path)
                     pdf_health = self._apply_render_health(pdf_health, base64_img)
                     if pdf_health:
                         trace_store.set_fields(document_id, pdf_health=pdf_health)
@@ -3409,27 +3545,53 @@ class InvoiceAppAPI:
                         pass
                         
                     # Step C: LLM 信息提取
-                    extraction_started_at = time.perf_counter()
-                    try:
-                        info_json = extractor.extract_info_via_llm(
-                            base64_img,
-                            custom_rules=rules_text,
-                            pdf_path=pdf_path,
-                            document_context={
-                                **(info or {}),
-                                "search_since_date": since_date or "",
-                                "search_before_date": before_date or "",
-                            },
+                    if prepared_extraction:
+                        prepared_error = str(prepared_extraction.get("error_reason") or "")
+                        if prepared_error == "PIPELINE_REMOTE_QUOTA_EXHAUSTED":
+                            raise QuotaExceededError(
+                                prepared_extraction.get("quota_message") or "GLM API 额度不足"
+                            )
+                        if prepared_error:
+                            raise RuntimeError(prepared_error)
+                        info_json = copy.deepcopy(prepared_extraction.get("info_json"))
+                        extraction_trace = copy.deepcopy(
+                            prepared_extraction.get("extraction_trace") or {}
                         )
-                    except Exception as extraction_error:
-                        quota_message = self._resolve_quota_message(extraction_error)
-                        if quota_message:
-                            raise QuotaExceededError(quota_message) from extraction_error
-                        raise
-                    finally:
-                        self._record_timing_metric("extract_total", time.perf_counter() - extraction_started_at)
-                    extraction_trace = copy.deepcopy(getattr(extractor, "last_extraction_trace", {}) or {})
-                    extraction_timing = copy.deepcopy(getattr(extractor, "last_timing_trace", {}) or {})
+                        extraction_timing = copy.deepcopy(
+                            prepared_extraction.get("extraction_timing") or {}
+                        )
+                        elapsed_seconds = float(
+                            prepared_extraction.get("elapsed_seconds") or 0.0
+                        )
+                        self._record_timing_metric("extract_total", elapsed_seconds)
+                    else:
+                        extraction_started_at = time.perf_counter()
+                        try:
+                            info_json = extractor.extract_info_via_llm(
+                                base64_img,
+                                custom_rules=rules_text,
+                                pdf_path=pdf_path,
+                                document_context={
+                                    **(info or {}),
+                                    "search_since_date": since_date or "",
+                                    "search_before_date": before_date or "",
+                                },
+                            )
+                        except Exception as extraction_error:
+                            quota_message = self._resolve_quota_message(extraction_error)
+                            if quota_message:
+                                raise QuotaExceededError(quota_message) from extraction_error
+                            raise
+                        finally:
+                            self._record_timing_metric(
+                                "extract_total", time.perf_counter() - extraction_started_at
+                            )
+                        extraction_trace = copy.deepcopy(
+                            getattr(extractor, "last_extraction_trace", {}) or {}
+                        )
+                        extraction_timing = copy.deepcopy(
+                            getattr(extractor, "last_timing_trace", {}) or {}
+                        )
                     trace_store.set_fields(
                         document_id,
                         extractor_raw_result=extraction_trace or None,

@@ -484,7 +484,9 @@ def test_app_api_pipeline_bridge_preserves_rows_extractor_and_call_shape():
         before_date,
         rules_text,
         _extractor,
+        _prepared_extractions=None,
     ):
+        assert _prepared_extractions == {}
         calls.append(
             (rows, api_key, save_path, since_date, before_date, rules_text, _extractor)
         )
@@ -522,3 +524,302 @@ def test_app_api_pipeline_bridge_preserves_rows_extractor_and_call_shape():
             extractor,
         )
     ]
+
+
+def test_app_api_safe_local_documents_use_shared_runtime_with_actual_overlap_max_two():
+    from types import MethodType, SimpleNamespace
+
+    from app_api import InvoiceAppAPI
+
+    api = object.__new__(InvoiceAppAPI)
+    api._stop_requested = False
+    received = []
+    prepared_results = {}
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    active = maximum = closed = 0
+
+    class OwnerExtractor:
+        glm_runtime = SimpleNamespace(
+            profiles={
+                "ocr": SimpleNamespace(max_concurrency=2),
+                "text": SimpleNamespace(max_concurrency=2),
+                "vision_quality": SimpleNamespace(max_concurrency=2),
+            }
+        )
+
+        @staticmethod
+        def pdf_to_base64_image(path):
+            return [f"image:{Path(path).name}"]
+
+    class WorkerExtractor:
+        last_extraction_trace = {}
+        last_timing_trace = {}
+
+        def extract_info_via_llm(self, _images, **context):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                if Path(context["pdf_path"]).stem in {"0", "1"}:
+                    barrier.wait(timeout=2)
+                else:
+                    time.sleep(0.02)
+                return {"Seller": Path(context["pdf_path"]).name}
+            finally:
+                with lock:
+                    active -= 1
+
+        def close(self):
+            nonlocal closed
+            closed += 1
+
+    def legacy(_self, rows, *_args, **kwargs):
+        received.extend(rows)
+        prepared_results.update(kwargs.get("_prepared_extractions") or {})
+        return "done"
+
+    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
+    rows = [{"filepath": f"C:/staging/{index}.pdf"} for index in range(4)]
+
+    result = api._run_processing_loop_with_extractor(
+        rows,
+        "key",
+        "C:/output",
+        "2026-01-01",
+        "2026-01-02",
+        "rules",
+        _extractor=OwnerExtractor(),
+        _worker_extractor_factory=lambda _runtime: WorkerExtractor(),
+    )
+
+    assert result == "done"
+    assert maximum == 2
+    assert closed == 4
+    assert [row["filepath"] for row in received] == [row["filepath"] for row in rows]
+    assert sorted(
+        prepared["info_json"]["Seller"] for prepared in prepared_results.values()
+    ) == [
+        "0.pdf",
+        "1.pdf",
+        "2.pdf",
+        "3.pdf",
+    ]
+    assert all("_pipeline_prepared" not in row for row in received)
+
+
+def test_app_api_retain_only_and_url_candidates_bypass_parallel_model_workers():
+    from types import MethodType, SimpleNamespace
+
+    from app_api import InvoiceAppAPI
+
+    api = object.__new__(InvoiceAppAPI)
+    api._stop_requested = False
+    received = []
+    prepared_results = {}
+    factories = 0
+
+    class OwnerExtractor:
+        glm_runtime = SimpleNamespace(profiles={})
+
+        @staticmethod
+        def pdf_to_base64_image(_path):
+            pytest.fail("retained and URL candidates stay on the legacy path")
+
+    def factory(_runtime):
+        nonlocal factories
+        factories += 1
+        pytest.fail("worker must not be created")
+
+    def legacy(_self, rows, *_args, **kwargs):
+        received.extend(rows)
+        prepared_results.update(kwargs.get("_prepared_extractions") or {})
+        return "done"
+
+    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
+    rows = [
+        {"filepath": "C:/staging/retain.pdf", "candidate_action": "retain_only"},
+        {"filepath": "https://example.com/invoice", "is_url": True},
+    ]
+
+    result = api._run_processing_loop_with_extractor(
+        rows,
+        "key",
+        "C:/output",
+        _extractor=OwnerExtractor(),
+        _worker_extractor_factory=factory,
+    )
+
+    assert result == "done"
+    assert factories == 0
+    assert received == rows
+
+
+def test_app_api_local_conversion_exception_is_retained_for_legacy_handling():
+    from types import MethodType, SimpleNamespace
+
+    from app_api import InvoiceAppAPI
+
+    api = object.__new__(InvoiceAppAPI)
+    api._stop_requested = False
+    received = []
+    prepared_results = {}
+
+    class OwnerExtractor:
+        glm_runtime = SimpleNamespace(profiles={})
+
+        @staticmethod
+        def pdf_to_base64_image(_path):
+            raise ValueError("private local path")
+
+    def legacy(_self, rows, *_args, **kwargs):
+        received.extend(rows)
+        prepared_results.update(kwargs.get("_prepared_extractions") or {})
+        return "done"
+
+    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
+
+    result = api._run_processing_loop_with_extractor(
+        [{"filepath": "C:/staging/broken.pdf"}],
+        "key",
+        "C:/output",
+        _extractor=OwnerExtractor(),
+        _worker_extractor_factory=lambda _runtime: pytest.fail("remote must not run"),
+    )
+
+    assert result == "done"
+    assert list(prepared_results.values()) == [
+        {
+            "base64_img": None,
+            "preprocess_error_type": "ValueError",
+        }
+    ]
+    assert "_pipeline_prepared" not in received[0]
+
+
+def test_worker_local_extractor_close_does_not_close_shared_run_runtime(tmp_path: Path):
+    from invoice_extractor import InvoiceExtractor
+
+    closes = 0
+
+    class SharedRuntime:
+        def close(self):
+            nonlocal closes
+            closes += 1
+
+    extractor = InvoiceExtractor(
+        output_dir=tmp_path,
+        glm_runtime=SharedRuntime(),
+        close_glm_runtime=False,
+    )
+
+    extractor.close()
+    extractor.close()
+
+    assert closes == 0
+
+
+def test_app_api_worker_factory_failure_reaches_legacy_retention_then_fails_closed():
+    from types import MethodType, SimpleNamespace
+
+    from app_api import InvoiceAppAPI, ProcessingLoopFailure
+
+    api = object.__new__(InvoiceAppAPI)
+    api._stop_requested = False
+    api.quota_exhausted = False
+    received = []
+    prepared_results = {}
+
+    class OwnerExtractor:
+        glm_runtime = SimpleNamespace(profiles={})
+
+        @staticmethod
+        def pdf_to_base64_image(_path):
+            return ["image"]
+
+    def legacy(_self, rows, *_args, **kwargs):
+        received.extend(rows)
+        prepared_results.update(kwargs.get("_prepared_extractions") or {})
+        return "done"
+
+    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
+
+    with pytest.raises(ProcessingLoopFailure, match="PROCESSING_PIPELINE_UNRESOLVED"):
+        api._run_processing_loop_with_extractor(
+            [{"filepath": "C:/staging/a.pdf"}],
+            "key",
+            "C:/output",
+            _extractor=OwnerExtractor(),
+            _worker_extractor_factory=lambda _runtime: (_ for _ in ()).throw(
+                RuntimeError("secret factory detail")
+            ),
+        )
+
+    assert len(received) == 1
+    prepared = next(iter(prepared_results.values()))
+    assert prepared["error_reason"] == "PIPELINE_REMOTE_EXTRACTION_FAILED"
+    assert prepared["exception_type"] == "RuntimeError"
+    assert "secret" not in repr(prepared)
+
+
+def test_app_api_worker_close_failure_does_not_override_success_or_leak_text():
+    from types import MethodType, SimpleNamespace
+
+    from app_api import InvoiceAppAPI
+
+    api = object.__new__(InvoiceAppAPI)
+    api._stop_requested = False
+    api.quota_exhausted = False
+    prepared_results = {}
+
+    class OwnerExtractor:
+        glm_runtime = SimpleNamespace(profiles={})
+
+        @staticmethod
+        def pdf_to_base64_image(_path):
+            return ["image"]
+
+    class Worker:
+        last_extraction_trace = {}
+        last_timing_trace = {}
+
+        @staticmethod
+        def extract_info_via_llm(_images, **_context):
+            return {"Seller": "safe"}
+
+        @staticmethod
+        def close():
+            raise RuntimeError("close secret")
+
+    def legacy(_self, _rows, *_args, **kwargs):
+        prepared_results.update(kwargs.get("_prepared_extractions") or {})
+        return "done"
+
+    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
+
+    result = api._run_processing_loop_with_extractor(
+        [{"filepath": "C:/staging/a.pdf"}],
+        "key",
+        "C:/output",
+        _extractor=OwnerExtractor(),
+        _worker_extractor_factory=lambda _runtime: Worker(),
+    )
+
+    assert result == "done"
+    prepared = next(iter(prepared_results.values()))
+    assert prepared["info_json"] == {"Seller": "safe"}
+    assert prepared["worker_close_error_type"] == "RuntimeError"
+    assert "secret" not in repr(prepared)
+
+
+def test_legacy_archive_path_consumes_prepared_images_results_and_failures():
+    import inspect
+
+    from app_api import InvoiceAppAPI
+
+    source = inspect.getsource(InvoiceAppAPI._run_processing_loop_legacy_with_extractor)
+    assert "prepared_extractions.pop(document_id" in source
+    assert 'prepared_extraction.get("base64_img")' in source
+    assert 'prepared_extraction.get("info_json")' in source
+    assert 'prepared_extraction.get("error_reason")' in source

@@ -36,6 +36,7 @@ class InvoiceExtractor:
         *,
         glm_runtime=None,
         glm_settings=None,
+        close_glm_runtime=True,
     ):
         """
         初始化大模型提取器, 使用 GLM-4.5V 解决图文识别发票信息并结构化
@@ -43,6 +44,7 @@ class InvoiceExtractor:
         self.api_key = api_key or ""
         self.model = "glm-4.5v"
         self.glm_runtime = glm_runtime or GlmRuntime(self.api_key, settings=glm_settings)
+        self._close_glm_runtime = bool(close_glm_runtime)
         self._close_lock = threading.Lock()
         self._closed = False
         self.output_dir = os.path.abspath(output_dir)
@@ -57,9 +59,10 @@ class InvoiceExtractor:
             if self._closed:
                 return
             self._closed = True
-        close_runtime = getattr(self.glm_runtime, "close", None)
-        if callable(close_runtime):
-            close_runtime()
+        if self._close_glm_runtime:
+            close_runtime = getattr(self.glm_runtime, "close", None)
+            if callable(close_runtime):
+                close_runtime()
 
     def __enter__(self):
         return self
