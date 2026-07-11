@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -467,6 +468,82 @@ def test_truth_audit_deadline_does_not_wait_for_blocked_publication(tmp_path, mo
 
     assert not audit_thread.is_alive()
     assert not (shared_root / "monitoring" / "email_truth_audit.json").exists()
+    assert (api.run_state, api.status_text, api.logs) == state_before
+
+
+def test_normal_path_promotion_stall_fails_closed_without_late_visibility(tmp_path, monkeypatch):
+    import audit_email_truth
+
+    api = InvoiceAppAPI(truth_audit_timeout_seconds=0.02)
+    shared_root = tmp_path / "promotion-stall"
+    api._run_context = _controlled_context(shared_root, "old")
+    api._current_run_id = "old"
+    monkeypatch.setattr(api, "_refresh_run_context", lambda: api._run_context)
+    monkeypatch.setattr(audit_email_truth, "collect_truth_table", lambda *args: {"run": "old"})
+    normal_path = (shared_root / "monitoring" / "email_truth_audit.json").resolve()
+    promotion_entered = threading.Event()
+    release_promotion = threading.Event()
+    terminal_events = []
+    original_replace = os.replace
+
+    def blocked_normal_replace(source, destination):
+        if Path(destination).resolve() == normal_path:
+            promotion_entered.set()
+            assert release_promotion.wait(2)
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", blocked_normal_replace)
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: None)
+    monkeypatch.setattr(
+        api,
+        "_safe_emit_run_state_event",
+        lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
+    )
+    api._begin_run("running")
+    old_handle = api._active_run_handle
+    audit_thread = api._start_truth_audit_async("old@qq.com", "AUTH-SECRET")
+    assert old_handle.run_id
+    assert api._truth_audit_job.ready.wait(1)
+
+    def finalize():
+        api._mark_finalizing()
+        api._start_async_finalizers()
+        api._finish_run(True, "done")
+
+    worker = threading.Thread(target=finalize, name="promotion-stall-finalizer")
+    api._worker_thread = worker
+    worker.start()
+    worker.join(0.20)
+    bounded = not worker.is_alive()
+    if not bounded:
+        release_promotion.set()
+        worker.join(1)
+    assert bounded, "lifecycle waited for blocked normal-path promotion"
+    assert promotion_entered.is_set() is False
+
+    assert api.run_state == "failed"
+    assert terminal_events == ["failed"]
+    assert api._worker_thread is None
+    assert api._run_lifecycle.can_begin is True
+    assert api._run_lifecycle.owned_staging_count == 0
+    assert old_handle.snapshot.finalizer_failures[0].reason_code == "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED"
+    immutable_artifact = (
+        shared_root
+        / "monitoring"
+        / "quarantined"
+        / old_handle.run_id
+        / "email_truth_audit.json"
+    )
+    assert immutable_artifact.exists()
+
+    api._run_context = _controlled_context(shared_root, "new")
+    api._current_run_id = "new"
+    api._begin_run("new running")
+    state_before = (api.run_state, api.status_text, list(api.logs))
+    release_promotion.set()
+    audit_thread.join(1)
+
+    assert not normal_path.exists()
     assert (api.run_state, api.status_text, api.logs) == state_before
 
 

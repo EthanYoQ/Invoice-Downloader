@@ -57,6 +57,11 @@ class ProcessingLoopFailure(RuntimeError):
     user_message = "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
 
 
+class TruthAuditCompatibilityPathDisabled(RuntimeError):
+    reason_code = "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED"
+    user_message = "真值审计证据已保留到本次运行目录，但兼容路径无法在时限内安全发布。"
+
+
 @dataclass(frozen=True)
 class TruthAuditJob:
     run_id: str
@@ -976,12 +981,28 @@ class InvoiceAppAPI:
     def _safe_write_run_config(self, email_address, auth_code="", api_key=""):
         if not self._run_context.get("enabled"):
             return
+        lifecycle_run_id = str(
+            self._active_run_handle.run_id if self._active_run_handle is not None else ""
+        )
+        safe_lifecycle_run_id = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "-",
+            lifecycle_run_id,
+        ).strip("-.")
+        truth_audit_artifact_dir = ""
+        if safe_lifecycle_run_id and self._run_context.get("monitoring_dir"):
+            truth_audit_artifact_dir = str(
+                Path(self._run_context["monitoring_dir"])
+                / "quarantined"
+                / safe_lifecycle_run_id
+            )
         self._diag_write_json(
             self._monitoring_path("run_config.json"),
             {
                 **serialize_run_context(self._run_context),
                 "run_id": self._current_run_id,
                 "staging_dir": self._active_staging_path(),
+                "truth_audit_artifact_dir": truth_audit_artifact_dir,
                 "email_domain": self._packaged_diag_email_domain(email_address),
                 "has_auth_code": bool(auth_code),
                 "has_api_key": bool(api_key),
@@ -1021,8 +1042,6 @@ class InvoiceAppAPI:
         except ValueError:
             monitoring_dir = run_root / "monitoring"
         safe_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", run_id).strip("-.") or "run"
-        report_path = monitoring_dir / "email_truth_audit.json"
-        error_path = monitoring_dir / "email_truth_audit_error.json"
         quarantine_dir = monitoring_dir / "quarantined" / safe_run_id
         ready = threading.Event()
         abandoned = threading.Event()
@@ -1030,11 +1049,10 @@ class InvoiceAppAPI:
         date_from = self._effective_date_from
         date_to = self._effective_date_to
 
-        def _write_quarantined(filename, target_path, payload):
+        def _write_quarantined(filename, payload):
             source_path = quarantine_dir / filename
             self._diag_write_json(str(source_path), payload)
             result["source_path"] = source_path
-            result["target_path"] = target_path
 
         def _runner():
             try:
@@ -1047,11 +1065,10 @@ class InvoiceAppAPI:
                     date_from,
                     date_to,
                 )
-                _write_quarantined(report_path.name, report_path, report)
+                _write_quarantined("email_truth_audit.json", report)
             except ModuleNotFoundError as exc:
                 _write_quarantined(
-                    error_path.name,
-                    error_path,
+                    "email_truth_audit_error.json",
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "skipped",
@@ -1062,8 +1079,7 @@ class InvoiceAppAPI:
                 )
             except Exception as exc:
                 _write_quarantined(
-                    error_path.name,
-                    error_path,
+                    "email_truth_audit_error.json",
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "reason": "TRUTH_AUDIT_FAILED",
@@ -1129,8 +1145,7 @@ class InvoiceAppAPI:
             raise RuntimeError("TRUTH_AUDIT_RUN_NOT_AUTHORIZED")
 
         source_path = job.result.get("source_path")
-        target_path = job.result.get("target_path")
-        if not source_path or not target_path or not Path(source_path).exists():
+        if not source_path or not Path(source_path).exists():
             self._truth_audit_thread = None
             if self._truth_audit_job is job:
                 self._truth_audit_job = None
@@ -1138,11 +1153,12 @@ class InvoiceAppAPI:
 
         if time.monotonic() > deadline:
             _expire_job()
-        os.makedirs(Path(target_path).parent, exist_ok=True)
-        os.replace(source_path, target_path)
         self._truth_audit_thread = None
         if self._truth_audit_job is job:
             self._truth_audit_job = None
+        raise TruthAuditCompatibilityPathDisabled(
+            "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED"
+        )
 
     def _inspect_pdf_health(self, pdf_path):
         if not pdf_path or not str(pdf_path).lower().endswith(".pdf"):
