@@ -465,3 +465,138 @@ def test_url_artifact_event_hashes_top_level_path_but_attachment_path_is_unchang
 
     assert attachment_event["path"] == attachment_path
     assert attachment_event["document_id"] == "attachment-document"
+
+
+def test_live_purchaser_mismatch_log_redacts_url_candidate_but_preserves_attachment_text(tmp_path):
+    purchaser = "PURCHASER-IDENTITY-SECRET"
+    recovered_pdf = tmp_path / "CAPABILITY-TOKEN_INVOICE-NUMBER-SECRET.pdf"
+    recovered_pdf.write_bytes(b"%PDF-1.4\nsynthetic")
+    attachment_pdf = tmp_path / "Original-Business-Name.PDF"
+    attachment_pdf.write_bytes(b"%PDF-1.4\nsynthetic")
+
+    class PauseAfterClassification(RuntimeError):
+        pass
+
+    class FakeExtractor:
+        last_extraction_trace = {}
+        last_timing_trace = {}
+
+        def __init__(self, api_key, output_dir):
+            del api_key, output_dir
+            self.processed_records_file = ""
+
+        def load_processed_records(self):
+            return {}
+
+        def pdf_to_base64_image(self, pdf_path):
+            del pdf_path
+            return "c3ludGhldGlj"
+
+        def extract_info_via_llm(self, *args, **kwargs):
+            del args, kwargs
+            return {
+                "Date": "20260701",
+                "Amount": "10.00",
+                "Purchaser": purchaser,
+                "Seller": "Synthetic Seller",
+                "Type": "餐饮发票",
+                "InvoiceCode": "",
+                "InvoiceNumber": "INVOICE-NUMBER-SECRET",
+                "is_invoice": True,
+            }
+
+    def run_candidate(info, case_dir):
+        api = InvoiceAppAPI()
+        api._is_running = True
+        api.progress = 50
+        api._run_context = {
+            "enabled": False,
+            "staging_dir": str(case_dir / "staging"),
+        }
+        api._output_state_dir = lambda save_path: str(case_dir / "state")
+        api._create_document_trace_store = lambda output_path=None: _FallbackDocumentTraceStore(
+            output_path=str(case_dir / "debug_trace.jsonl")
+        )
+        api._inspect_pdf_health = lambda path: {
+            "size_bytes": 4096,
+            "starts_with_pdf_magic": True,
+            "page_count": 1,
+        }
+        api._evaluate_document_acceptance = lambda *args, **kwargs: {"accepted": True}
+        captured = {}
+
+        class PausingLogList(list):
+            def append(self, entry):
+                super().append(entry)
+                if "购买方与目标公司不匹配" in str(entry.get("msg", "")):
+                    captured["progress"] = copy.deepcopy(api.get_progress())
+                    raise PauseAfterClassification()
+
+        api.logs = PausingLogList()
+
+        def recovered_result(converter, *args, **kwargs):
+            del converter, args, kwargs
+            return [
+                {
+                    "status": "downloaded",
+                    "pdf_path": str(recovered_pdf),
+                    "resolved_url": CAPABILITY_URL,
+                    "selected_fields": {"invoice_number": "INVOICE-NUMBER-SECRET"},
+                    "download_mode": "provider_pdf",
+                }
+            ]
+
+        with (
+            patch("invoice_extractor.InvoiceExtractor", FakeExtractor),
+            patch("pdf_converter.PDFConverter.process_invoice_links", recovered_result),
+            patch("app_api.classify_purchaser_relation", return_value="non_target"),
+            patch("app_api.is_exempt_type", return_value=False),
+            patch("app_api.time.sleep", return_value=None),
+        ):
+            api._run_processing_loop(
+                [info],
+                api_key="synthetic",
+                save_path=str(case_dir / "output"),
+            )
+        return captured["progress"]
+
+    url_info = {
+        **_sensitive_info(),
+        "is_url": True,
+        "source_kind": "url",
+        "filepath": CAPABILITY_URL,
+        "file_name": "CAPABILITY-TOKEN_INVOICE-NUMBER-SECRET.url",
+        "email_id": "MAILBOX-UID-SECRET",
+        "candidate_action": "main_chain",
+        "tier": 2,
+    }
+    attachment_info = {
+        "is_url": False,
+        "source_kind": "attachment",
+        "filepath": str(attachment_pdf),
+        "file_name": attachment_pdf.name,
+        "email_id": "attachment-email",
+        "subject": "ordinary attachment",
+        "candidate_action": "main_chain",
+        "tier": 2,
+    }
+
+    url_progress = run_candidate(url_info, tmp_path / "url-case")
+    attachment_progress = run_candidate(attachment_info, tmp_path / "attachment-case")
+    rendered_url = json.dumps(url_progress, ensure_ascii=False, default=str)
+    rendered_attachment = json.dumps(attachment_progress, ensure_ascii=False, default=str)
+
+    assert "CLASSIFIED_AS_NON_TARGET_COMPANY" in rendered_url
+    assert "URL-candidate-" in rendered_url
+    for secret in (
+        purchaser,
+        CAPABILITY_URL,
+        "CAPABILITY-TOKEN",
+        "MAILBOX-UID-SECRET",
+        "INVOICE-NUMBER-SECRET",
+        url_info["file_name"],
+    ):
+        assert secret not in rendered_url
+
+    assert purchaser in rendered_attachment
+    assert f"购买方与目标公司不匹配 ({purchaser})" in rendered_attachment

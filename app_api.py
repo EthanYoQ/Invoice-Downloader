@@ -3364,7 +3364,14 @@ class InvoiceAppAPI:
                         active_company = self._resolve_active_company()
                         purchaser_relation = classify_purchaser_relation(purchaser, active_company)
                         if purchaser_relation == "non_target":
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "拦截:", "color": "text-yellow-400", "msg": f"购买方与目标公司不匹配 ({purchaser})，已分流到非目标公司发票"})
+                            if is_url_candidate:
+                                mismatch_message = (
+                                    "购买方与目标公司不匹配，已分流到非目标公司发票: "
+                                    f"{console_source_name} [CLASSIFIED_AS_NON_TARGET_COMPANY]"
+                                )
+                            else:
+                                mismatch_message = f"购买方与目标公司不匹配 ({purchaser})，已分流到非目标公司发票"
+                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "拦截:", "color": "text-yellow-400", "msg": mismatch_message})
                             info_json["Type"] = "非目标公司发票"
                             classification_reason_codes.append("CLASSIFIED_AS_NON_TARGET_COMPANY")
                         elif purchaser_relation == "unknown":
