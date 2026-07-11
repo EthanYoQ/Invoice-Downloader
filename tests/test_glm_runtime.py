@@ -215,6 +215,22 @@ def test_nonretryable_http_status_wins_even_when_response_is_not_json(status):
     assert runtime.limiters["ocr"].current_limit == 2
 
 
+@pytest.mark.parametrize("profile_name", ["text", "vision_quality"])
+@pytest.mark.parametrize("status", [400, 404])
+def test_text_and_vision_keep_legacy_retry_count_before_pipeline_fallback(profile_name, status):
+    symbols = _runtime_symbols()
+    session = FakeSession([FakeResponse(status_code=status) for _ in range(3)])
+    runtime = symbols["GlmRuntime"](
+        "test-key", session=session, max_attempts=3, sleep=lambda _: None
+    )
+
+    with pytest.raises(symbols["GlmRequestError"]):
+        runtime.request(profile_name, {}, lambda body: body)
+
+    assert len(session.calls) == 3
+    assert runtime.limiters[profile_name].current_limit == 2
+
+
 def test_transient_transport_parser_and_5xx_failures_never_leak_permits():
     symbols = _runtime_symbols()
     session = FakeSession(

@@ -273,7 +273,7 @@ class GlmRuntime:
                     profile_name,
                     http_status=http_status,
                     reason="http_error",
-                    retryable=http_status is None or http_status >= 500,
+                    retryable=_is_retryable_http(profile_name, http_status),
                 )
             try:
                 body = response.json()
@@ -413,3 +413,13 @@ def _extract_business_code(body):
         if normalized is not None:
             return normalized
     return None
+
+
+def _is_retryable_http(profile_name, http_status):
+    if http_status is None:
+        return True
+    if http_status in {401, 402, 403}:
+        return False
+    if profile_name == "ocr" and http_status in {400, 404}:
+        return False
+    return http_status >= 400

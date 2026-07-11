@@ -42,9 +42,31 @@ class CalibrationVerdict:
         return asdict(self)
 
 
+def _invalid_verdict():
+    return CalibrationVerdict(
+        approved=False,
+        accepted_identities_match=False,
+        truth_finalized=False,
+        schema_rate=0.0,
+        p0=0,
+        p1=0,
+        p2=0,
+        manual=0,
+        entitlement_success=False,
+        reference_p50_ms=0.0,
+        reference_p95_ms=0.0,
+        candidate_p50_ms=0.0,
+        candidate_p95_ms=0.0,
+        reasons=("invalid_evidence",),
+    )
+
+
 def compare_calibration(reference_path: Path, candidate_path: Path) -> CalibrationVerdict:
-    reference = _load_jsonl(Path(reference_path))
-    candidate = _load_jsonl(Path(candidate_path))
+    try:
+        reference = _load_jsonl(Path(reference_path))
+        candidate = _load_jsonl(Path(candidate_path))
+    except (OSError, ValueError, TypeError):
+        return _invalid_verdict()
     reasons = []
     _validate_rows(reference, reasons)
     _validate_rows(candidate, reasons)

@@ -187,6 +187,18 @@ def test_malformed_jsonl_produces_deterministic_rejection(tmp_path):
     assert json.loads(output_a.read_text(encoding="utf-8"))["reasons"] == ["invalid_evidence"]
 
 
+@pytest.mark.parametrize("content", ["", "not-json\n", "[]\n"])
+def test_compare_calibration_returns_rejected_verdict_for_malformed_evidence(tmp_path, content):
+    reference = _write_jsonl(tmp_path / "reference.jsonl", _rows())
+    candidate = tmp_path / "candidate.jsonl"
+    candidate.write_text(content, encoding="utf-8")
+
+    verdict = _compare(reference, candidate)
+
+    assert verdict.approved is False
+    assert verdict.reasons == ("invalid_evidence",)
+
+
 def test_cli_emits_deterministic_json_and_has_no_api_key_argument(tmp_path, capsys):
     from model_calibration import main
 
