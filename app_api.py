@@ -20,7 +20,10 @@ from document_types import (
 from email_channel import resolve_channel
 from frontend_run_context import ensure_run_context_dirs, load_run_context, make_run_staging_dir, serialize_run_context
 from glm_runtime import GlmRequestError, GlmRuntime
+from report_service import ReportService
+from run_coordinator import RunCoordinator, RunDependencies, RunRequest
 from run_lifecycle import RunLifecycle, RunState
+from run_state_store import RunStateStore
 from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
 from url_trace_sanitizer import (
     build_url_evidence,
@@ -53,6 +56,21 @@ class ProcessingLoopFailure(RuntimeError):
     user_message = "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
 
 
+class ImapLoginError(RuntimeError):
+    reason_code = "IMAP_LOGIN_FAILED"
+    user_message = "邮箱登录失败，请检查授权码和 IMAP 设置。"
+
+
+class RemoteAuthError(RuntimeError):
+    reason_code = "REMOTE_AUTH_FAILED"
+    user_message = "GLM API 身份验证失败，请检查 API Key。"
+
+
+class QuotaExhaustedError(RuntimeError):
+    reason_code = "QUOTA_EXHAUSTED"
+    user_message = "GLM API 额度已耗尽，请充值或更换可用的 API Key。"
+
+
 class TruthAuditEvidenceError(RuntimeError):
     def __init__(self, reason_code, user_message):
         super().__init__(reason_code)
@@ -79,6 +97,70 @@ class TruthAuditJob:
     ready: threading.Event
     abandoned: threading.Event
     result: dict
+
+
+class _ProcessingPipelineSession:
+    def __init__(
+        self,
+        *,
+        api,
+        candidates,
+        pipeline,
+        archive_service,
+        save_path,
+        output_state_dir,
+        working_history,
+        business_records,
+        sidecar,
+        trace_store,
+        owned_extractor=None,
+    ):
+        self._api = api
+        self.candidates = candidates
+        self._pipeline = pipeline
+        self._archive_service = archive_service
+        self._save_path = save_path
+        self._output_state_dir = output_state_dir
+        self._working_history = working_history
+        self._business_records = business_records
+        self._sidecar = sidecar
+        self._trace_store = trace_store
+        self._owned_extractor = owned_extractor
+        self._closed = False
+
+    def extract(self):
+        return self._pipeline.extract(self.candidates)
+
+    def archive(self, outcomes):
+        report = self._archive_service.archive(outcomes, self._save_path)
+        if not report.can_complete:
+            self._api._mark_output_run_state(
+                self._output_state_dir,
+                "failed",
+                failure_reason="processing_pipeline_incomplete",
+            )
+            raise ProcessingLoopFailure("PROCESSING_PIPELINE_INCOMPLETE")
+        self._api._commit_output_state(
+            self._output_state_dir,
+            self._working_history,
+            self._business_records,
+        )
+        return report
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._sidecar.clear()
+        if getattr(self._api, "_pipeline_sidecar", None) is self._sidecar:
+            delattr(self._api, "_pipeline_sidecar")
+        try:
+            self._trace_store.flush()
+        except Exception:
+            pass
+        close_extractor = getattr(self._owned_extractor, "close", None)
+        if callable(close_extractor):
+            close_extractor()
 
 
 def build_processing_history_key(info, file_name, pdf_path):
@@ -346,6 +428,7 @@ class InvoiceAppAPI:
             truth_audit_timeout_seconds = DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS
         self._truth_audit_timeout_seconds = max(0.001, float(truth_audit_timeout_seconds))
         self._run_lifecycle = RunLifecycle()
+        self._run_state_store = RunStateStore()
         self._active_run_handle = None
         self._active_temp_dir = None
         self._terminal_frontend_run_id = ""
@@ -939,9 +1022,10 @@ class InvoiceAppAPI:
                 "controlled_run": True,
                 "stage_map": {
                     "start_processing": "active",
-                    "frontend_processing_worker": "active",
-                    "_run_processing_loop": "active",
-                    "_simulate_processing": "legacy_inactive_not_invoked",
+                    "run_coordinator": "active",
+                    "candidate_pipeline": "active",
+                    "extraction_pipeline": "active",
+                    "archive_service": "active",
                     "cleanup_finalize": "active",
                 },
             },
@@ -1438,6 +1522,22 @@ class InvoiceAppAPI:
             self.last_error = last_error
         self._safe_emit_run_state_event(previous_state, run_state)
 
+    def _sync_run_state_store_from_legacy(self):
+        self._run_state_store.update(
+            progress=self.progress,
+            status_text=self.status_text,
+            run_state=self.run_state,
+            last_error=self.last_error,
+            stop_requested=self._stop_requested,
+            quota_exhausted=self.quota_exhausted,
+            quota_message=self.quota_message,
+            statistics=self.stats,
+            processed_invoices=self.processed_invoices,
+            error_invoices=self.error_invoices,
+            categories=self.discovered_categories,
+            logs=self.logs,
+        )
+
     def _begin_run(self, status_text):
         self._prepare_run_lifecycle()
         if self._active_run_handle.state is RunState.CREATED:
@@ -1588,28 +1688,6 @@ class InvoiceAppAPI:
             self._set_run_state("failed", status_text=failed_status, progress=failed_progress, last_error=lifecycle_error)
         self._worker_thread = None
 
-    def _legacy_start_async_finalizers_pre_release_prep(self, fetcher=None):
-        return self._start_async_finalizers(fetcher)
-
-    def _legacy_mark_finalizing_pre_release_prep(self):
-        finalizing_progress = self.progress if self.progress >= 95 else 99
-        self._set_run_state("finalizing", status_text="正在完成收尾...", progress=finalizing_progress)
-
-    def _legacy_fail_run_pre_release_prep(self, status_text, error_message, fetcher=None, include_traceback=False):
-        if fetcher is not None:
-            self._start_async_finalizers(fetcher)
-
-        if include_traceback:
-            self._fail_run("澶勭悊寮傚父", error_msg, fetcher=fetcher, include_traceback=True)
-            error_message = f"{error_message} | {traceback.format_exc()}"
-
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "ERROR",
-            "color": "text-error",
-            "msg": f"系统发生异常: {error_message}",
-        })
-        self._finish_run(False, status_text, last_error=error_message)
 
     def _auto_start_local_scan(self):
         self.logs.append({
@@ -1852,279 +1930,93 @@ class InvoiceAppAPI:
         except Exception as e:
             return {"success": False, "message": f"验证失败，错误详情: {str(e)}"}
 
-    def _simulate_processing(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        """后台线程: 连接邮箱抓取发票，执行 AI 处理与归档分类"""
-        import os
-        from email_fetcher import EmailFetcher
-        from invoice_extractor import InvoiceExtractor
-        
-        fetcher = None
-        self._begin_run("鍒濆鍖栧鐞嗗紩鎿?..")
-        
-        self.status_text = "初始化处理引擎..."
-        range_msg = f"扫描时间: {date_from} 到 {date_to}" if date_from and date_to else "扫描时间: 默认近 30 天"
-        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "信息:", "color": "text-blue-400", "msg": f"后端收到配置，正在初始化连接... ({range_msg})"})
-        
-        if not email_address or not auth_code or not api_key:
-            self.status_text = "启动失败"
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": "未提供完整凭证(邮箱、授权码、或 API Key)，请返回设置。"})
-            self._finish_run(False, "鍚姩澶辫触", last_error="MISSING_REQUIRED_CREDENTIALS")
-            return
-            
-        try:
-            # 1. 连接邮箱
-            self.status_text = "正在连接邮箱服务..."
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": f"正在登录邮箱 {email_address}..."})
-            
-            # 通过邮箱通道注册表选择 IMAP 服务器
-            channel = resolve_channel(email_address)
-            fetcher = EmailFetcher(email_address, auth_code, imap_server=channel["imap_host"], staging_dir="staging")
-            if not fetcher.connect():
-                self.status_text = "登录失败"
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": "邮箱 IMAP 登录失败，请检查授权码或网络。"})
-                self._finish_run(False, "鐧诲綍澶辫触", last_error="IMAP_LOGIN_FAILED")
-                return
-                
-            # 2. 搜索邮件
-            self.progress = 10
-            self.status_text = "正在扫描邮件..."
-            
-            from datetime import datetime, timedelta
-            # 处理时间范围
-            since_date = date_from if date_from else (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            
-            # IMAP 的 BEFORE 是非包含边界的。为了包含 date_to 当天，必须加一天 (exclusive boundary)
-            if date_to:
-                dt_to = datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
-                before_date = dt_to.strftime("%Y-%m-%d")
-            else:
-                before_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-            
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": f"开始检索 {since_date} 至 {before_date} 的邮件..."})
-            
-            email_fetch_started_at = time.perf_counter()
-            email_ids = fetcher.fetch_emails_by_date(since_date=since_date, before_date=before_date)
-            self._record_timing_metric("email_fetch", time.perf_counter() - email_fetch_started_at)
-            total_emails = len(email_ids)
-            self.stats["emails"] = total_emails
-            
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "成功:", "color": "text-emerald-400", "msg": f"共找到 {total_emails} 封邮件符合时间范围。"})
-            
-            if total_emails == 0:
-                self._mark_finalizing()
-                self.status_text = "扫描完成，无邮件"
-                fetcher.disconnect()
-                self._finish_run(True, "鎵弿瀹屾垚锛屾棤閭欢")
-                self._is_running = False
-                return
-            
-            # 3. 提取附件并保存到 staging
-            self.progress = 30
-            self.status_text = "正在下载发票附件..."
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": "开始提取邮件附件及正文发票链接..."})
-            
-            attachment_extract_started_at = time.perf_counter()
-            attachments_info = fetcher.extract_attachments(email_ids)
-            self._record_timing_metric("attachment_extract", time.perf_counter() - attachment_extract_started_at)
-            total_attachments = len(attachments_info)
-            
-            # 4. 初始化核心处理逻辑并执行
-            self._run_processing_loop(attachments_info, api_key, save_path, since_date, before_date)
-            
-            # 在处理结束前执行清理
-            self._cleanup_temp_folders()
-            self._start_async_finalizers(fetcher)
-            self._finish_run(True, "鎵瑰鐞嗗凡瀹屾垚")
-            self.status_text = "批处理已完成"
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "完成:", "color": "text-emerald-400", "msg": f"扫描完成。总处理附件: {total_attachments}。"})
-            self._is_running = False
 
-        except Exception as e:
-            error_msg = str(e) or "未知错误"
-            import traceback
-            full_traceback = traceback.format_exc()
-            self.status_text = "处理异常"
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "ERROR", "color": "text-error", "msg": f"系统发生异常: {error_msg} | {full_traceback}"})
-            traceback.print_exc()
-            self.progress = 99
-            self._is_running = False
-
-    def _legacy_processing_worker_pre_release_prep(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        '''
-        from email_fetcher import EmailFetcher
-
-        fetcher = None
-        self._begin_run("鍒濆鍖栧鐞嗗紩鎿?..")
-        range_msg = f"鎵弿鏃堕棿: {date_from} 鍒?{date_to}" if date_from and date_to else "鎵弿鏃堕棿: 榛樿杩?30 澶?
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "淇℃伅:",
-            "color": "text-blue-400",
-            "msg": f"鍚庣鏀跺埌閰嶇疆锛屾鍦ㄥ垵濮嬪寲杩炴帴... ({range_msg})",
-        })
-
-        if not email_address or not auth_code or not api_key:
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "閿欒:",
-                "color": "text-red-400",
-                "msg": "鏈彁渚涘畬鏁村嚟璇?閭銆佹巿鏉冪爜銆佹垨 API Key)锛岃杩斿洖璁剧疆銆?",
-            })
-            self._finish_run(False, "鍚姩澶辫触", last_error="MISSING_REQUIRED_CREDENTIALS")
-            return
-
-        try:
-            self._set_run_state("running", status_text="姝ｅ湪杩炴帴閭鏈嶅姟...")
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "杩愯:",
-                "color": "text-blue-400",
-                "msg": f"姝ｅ湪鐧诲綍閭 {email_address}...",
-            })
-
-            channel = resolve_channel(email_address)
-            fetcher = EmailFetcher(email_address, auth_code, imap_server=channel["imap_host"], staging_dir="staging")
-            if not fetcher.connect():
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "閿欒:",
-                    "color": "text-red-400",
-                    "msg": "閭 IMAP 鐧诲綍澶辫触锛岃妫€鏌ユ巿鏉冪爜鎴栫綉缁溿€?",
-                })
-                self._finish_run(False, "鐧诲綍澶辫触", last_error="IMAP_LOGIN_FAILED")
-                return
-
-            self.progress = 10
-            self.status_text = "姝ｅ湪鎵弿閭欢..."
-
-            from datetime import datetime, timedelta
-            since_date = date_from if date_from else (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            if date_to:
-                dt_to = datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
-                before_date = dt_to.strftime("%Y-%m-%d")
-            else:
-                before_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "杩愯:",
-                "color": "text-blue-400",
-                "msg": f"寮€濮嬫绱?{since_date} 鑷?{before_date} 鐨勯偖浠?..",
-            })
-
-            email_ids = fetcher.fetch_emails_by_date(since_date=since_date, before_date=before_date)
-            total_emails = len(email_ids)
-            self.stats["emails"] = total_emails
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "鎴愬姛:",
-                "color": "text-emerald-400",
-                "msg": f"鍏辨壘鍒?{total_emails} 灏侀偖浠剁鍚堟椂闂磋寖鍥淬€?",
-            })
-
-            if total_emails == 0:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self._finish_run(True, "鎵弿瀹屾垚锛屾棤閭欢")
-                return
-
-            self.progress = 30
-            self.status_text = "姝ｅ湪涓嬭浇鍙戠エ闄勪欢..."
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "杩愯:",
-                "color": "text-blue-400",
-                "msg": "寮€濮嬫彁鍙栭偖浠堕檮浠跺強姝ｆ枃鍙戠エ閾炬帴...",
-            })
-
-            attachments_info = fetcher.extract_attachments(email_ids)
-            total_attachments = len(attachments_info)
-            self._run_processing_loop(attachments_info, api_key, save_path, since_date, before_date)
-
-            self._mark_finalizing()
-            self._start_async_finalizers(fetcher)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "瀹屾垚:",
-                "color": "text-emerald-400",
-                "msg": f"鎵弿瀹屾垚銆傛€诲鐞嗛檮浠? {total_attachments}銆?",
-            })
-            self._finish_run(True, "鎵瑰鐞嗗凡瀹屾垚")
-
-        except Exception as e:
-            error_msg = str(e) or "鏈煡閿欒"
-            self._fail_run("澶勭悊寮傚父", error_msg, fetcher=fetcher, include_traceback=True)
-
-        '''
 
     def _processing_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        self._packaged_diag_write(
-            "worker_enter",
-            "_processing_worker",
-            "success",
-            summary={
-                "effective_save_path": save_path,
-                "date_from": date_from,
-                "date_to": date_to,
-                "email_domain": self._packaged_diag_email_domain(email_address),
-                "has_auth_code": bool(auth_code),
-                "has_api_key": bool(api_key),
-            },
-        )
-        from datetime import datetime, timedelta
-        from email_fetcher import EmailFetcher
-        from mailbox_scanner import MailboxScanError, UnresolvedMailboxInputError
-        self._packaged_diag_write("worker_imports_ready", "_processing_worker", "success")
-
-        fetcher = None
-        self._begin_run("正在初始化任务...")
-        self._packaged_diag_write("worker_begin_run_done", "_processing_worker", "success")
-        self._safe_emit_stage_event(
-            "frontend_processing_worker",
-            "enter",
-            {
-                "requested_save_path": self._requested_save_path,
-                "effective_save_path": save_path,
-                "date_from": date_from,
-                "date_to": date_to,
-                **self._sensitive_summary(email_address, auth_code, api_key),
-            },
-        )
-        range_msg = f"扫描范围: {date_from} -> {date_to}" if date_from and date_to else "扫描范围: 默认最近 30 天"
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "信息",
-            "color": "text-blue-400",
-            "msg": f"后端已接收请求，正在准备邮箱会话（{range_msg}）。",
-        })
-
-        if not email_address or not auth_code or not api_key:
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "错误",
-                "color": "text-red-400",
-                "msg": "缺少必要凭证：邮箱、授权码或 API Key。",
-            })
-            self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": "missing_credentials"})
-            self._finish_run(False, "启动失败", last_error="MISSING_REQUIRED_CREDENTIALS")
-            return
-
         try:
-            self._packaged_diag_write(
-                "before_progress_gt_5",
-                "_processing_worker",
-                "success",
-                summary={"target_progress": 10},
+            return self._run_coordinator_worker(
+                rules_text,
+                save_path,
+                date_from,
+                date_to,
+                email_address,
+                auth_code,
+                api_key,
             )
-            self._set_run_state("running", status_text="正在连接邮箱...", progress=10)
-            self._packaged_diag_write("after_progress_10", "_processing_worker", "success")
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": f"正在连接邮箱 {email_address}...",
-            })
+        except Exception as exc:
+            self._packaged_diag_write(
+                "coordinator_worker_exception",
+                "_processing_worker",
+                "exception",
+                exc=exc,
+            )
+            handle = self._active_run_handle
+            if handle is not None and handle.state in {RunState.COMPLETED, RunState.FAILED}:
+                return None
+            self._fail_run(
+                "处理失败",
+                str(exc) or "COORDINATOR_START_FAILED",
+                reason_code="COORDINATOR_START_FAILED",
+                user_message="后台任务启动失败，请重试。",
+            )
+            return None
 
+    def _run_coordinator_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
+        self._begin_run("正在初始化任务...")
+        request = RunRequest(
+            run_id=self._active_run_handle.run_id,
+            date_from=str(date_from or ""),
+            date_to=str(date_to or ""),
+            save_path=str(save_path or ""),
+            rules_text=str(rules_text or ""),
+            account_id=stable_hash(str(email_address or ""))[:12],
+            channel_id=str(email_address or "").rsplit("@", 1)[-1].split(".", 1)[0].lower(),
+        )
+        dependencies = self._build_run_dependencies(
+            request,
+            email_address=email_address,
+            auth_code=auth_code,
+            api_key=api_key,
+        )
+        coordinator = RunCoordinator(
+            self._run_lifecycle,
+            self._run_state_store,
+            dependencies,
+        )
+        result = coordinator.run(request, handle=self._active_run_handle)
+        self._sync_run_state_store_from_legacy()
+        if result.state is RunState.COMPLETED:
+            self._append_log(
+                "完成",
+                "已完成安全停止。" if result.cancelled else "处理循环已完成。",
+                "text-amber-600" if result.cancelled else "text-emerald-400",
+            )
+            self._finish_run(True, "已安全停止" if result.cancelled else "处理完成")
+        else:
+            self._append_log("ERROR", f"System exception: {result.error}", "text-error")
+            failed_status = {
+                "IMAP_LOGIN_FAILED": "邮箱登录失败",
+                "QUOTA_EXHAUSTED": "GLM API 额度不足",
+            }.get(result.reason_code, "处理失败")
+            self._finish_run(False, failed_status, last_error=result.error)
+
+    def _build_run_dependencies(
+        self,
+        request,
+        *,
+        email_address,
+        auth_code,
+        api_key,
+    ):
+        from datetime import datetime, timedelta
+        import inspect
+
+        from email_fetcher import EmailFetcher
+        from invoice_extractor import InvoiceExtractor
+
+        resources = {"fetcher": None, "pipeline": None}
+
+        def connect(_request):
             channel = resolve_channel(email_address)
             fetcher = EmailFetcher(
                 email_address,
@@ -2134,229 +2026,151 @@ class InvoiceAppAPI:
                 monitoring_dir=self._run_context.get("monitoring_dir"),
                 progress_callback=self._on_email_fetcher_progress,
             )
-            self._packaged_diag_write("network_connect_before", "_processing_worker", "success")
-            connect_result = fetcher.connect()
-            self._packaged_diag_write(
-                "network_connect_after",
-                "_processing_worker",
-                "success" if connect_result else "failure",
-                summary={"connect_result": bool(connect_result)},
-            )
-            if not connect_result:
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "错误",
-                    "color": "text-red-400",
-                    "msg": "邮箱登录失败，请检查授权码和 IMAP 设置。",
-                })
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": "imap_login_failed"})
-                self._fail_run(
-                    "邮箱登录失败",
-                    "IMAP_LOGIN_FAILED",
-                    fetcher=fetcher,
-                    reason_code="IMAP_LOGIN_FAILED",
-                    user_message="邮箱登录失败，请检查授权码和 IMAP 设置。",
-                )
-                return
+            resources["fetcher"] = fetcher
+            self._append_log("运行", f"正在连接邮箱 {email_address}...", "text-blue-400")
+            if not fetcher.connect():
+                raise ImapLoginError("IMAP_LOGIN_FAILED")
+            return fetcher
 
-            self._set_run_state("running", status_text="正在扫描邮件...", progress=20)
-            since_date = date_from if date_from else (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            if date_to:
-                before_date = (datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            else:
-                before_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-            self._raw_date_range_display = f"{since_date} -> {date_to or since_date}"
+        def scan(fetcher, _request):
+            since_date = request.date_from or (
+                datetime.now() - timedelta(days=30)
+            ).strftime("%Y-%m-%d")
+            before_date = (
+                datetime.strptime(request.date_to, "%Y-%m-%d") + timedelta(days=1)
+            ).strftime("%Y-%m-%d") if request.date_to else (
+                datetime.now() + timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+            self._raw_date_range_display = f"{since_date} -> {request.date_to or since_date}"
             self._imap_query_range_display = f"SINCE {since_date} / BEFORE {before_date}"
-
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": f"原始用户范围：{self._raw_date_range_display}",
-            })
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": f"实际 IMAP 查询：{self._imap_query_range_display}",
-            })
-
-            self._packaged_diag_write("network_scan_before", "_processing_worker", "success")
-            email_ids = fetcher.fetch_emails_by_date(since_date=since_date, before_date=before_date)
-            self._packaged_diag_write(
-                "network_scan_after",
-                "_processing_worker",
-                "success",
-                summary={"scan_result_count": len(email_ids)},
+            self._coordinator_since_date = since_date
+            self._coordinator_before_date = before_date
+            self._append_log("运行", f"原始用户范围：{self._raw_date_range_display}", "text-blue-400")
+            self._append_log("运行", f"实际 IMAP 查询：{self._imap_query_range_display}", "text-blue-400")
+            email_ids = fetcher.fetch_emails_by_date(
+                since_date=since_date,
+                before_date=before_date,
             )
-            total_emails = len(email_ids)
-            self.stats["emails"] = total_emails
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "信息",
-                "color": "text-emerald-400",
-                "msg": f"共匹配到 {total_emails} 封邮件。",
-            })
+            self.stats["emails"] = len(email_ids)
+            self._append_log("信息", f"共匹配到 {len(email_ids)} 封邮件。", "text-emerald-400")
+            return email_ids
 
-            if self._stop_requested:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "stopped_before_extract", "emails": total_emails})
-                self._finish_run(True, "已安全停止")
-                return
+        def candidate(fetcher_email_ids, _request):
+            fetcher = resources["fetcher"]
+            self._append_log("运行", "正在下载并提取附件...", "text-blue-400")
+            attachments = fetcher.extract_attachments(fetcher_email_ids)
+            self._append_log("信息", f"共提取到 {len(attachments)} 个附件。", "text-emerald-400")
+            return attachments
 
-            if total_emails == 0:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "完成",
-                    "color": "text-emerald-400",
-                    "msg": "未找到符合条件的邮件，任务已结束。",
-                })
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "completed", "emails": total_emails, "attachments": 0})
-                self._finish_run(True, "处理完成")
-                return
-
-            self._set_run_state("running", status_text="正在提取附件...", progress=30)
-            self._active_run_handle.advance(RunState.EXTRACTING)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": "正在下载并提取附件...",
-            })
-
-            self._packaged_diag_write("extract_attachments_before", "_processing_worker", "success")
-            attachments_info = fetcher.extract_attachments(email_ids)
-            self._packaged_diag_write(
-                "extract_attachments_after",
-                "_processing_worker",
-                "success",
-                summary={"extract_result_count": len(attachments_info)},
-            )
-            total_attachments = len(attachments_info)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "信息",
-                "color": "text-emerald-400",
-                "msg": f"共提取到 {total_attachments} 个附件。",
-            })
-
-            if self._stop_requested:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "stopped_after_extract", "emails": total_emails, "attachments": total_attachments})
-                self._finish_run(True, "已安全停止")
-                return
-
-            self._active_run_handle.advance(RunState.ARCHIVING)
-            self._run_processing_loop(attachments_info, api_key, save_path, since_date, before_date, rules_text)
-
-            if self.quota_exhausted:
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": self.quota_message or "QUOTA_EXHAUSTED"})
-                self._fail_run(
-                    "GLM API 额度不足",
-                    self.quota_message or "QUOTA_EXHAUSTED",
-                    fetcher=fetcher,
-                    reason_code="QUOTA_EXHAUSTED",
-                    user_message="GLM API 额度已耗尽，请充值或更换可用的 API Key。",
+        def extract(attachments, _request):
+            compatibility_hook = self.__dict__.get("_run_processing_loop")
+            if callable(compatibility_hook):
+                resources["compatibility_report"] = compatibility_hook(
+                    attachments,
+                    api_key,
+                    request.save_path,
+                    getattr(self, "_coordinator_since_date", request.date_from),
+                    getattr(self, "_coordinator_before_date", request.date_to),
+                    request.rules_text,
                 )
-                return
+                return [resources["compatibility_report"]]
+            extractor_parameters = inspect.signature(InvoiceExtractor).parameters.values()
+            supports_glm_settings = any(
+                parameter.name == "glm_settings"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in extractor_parameters
+            )
+            extractor_kwargs = {"api_key": api_key, "output_dir": request.save_path}
+            if supports_glm_settings:
+                extractor_kwargs["glm_settings"] = self._settings_store.load() or {}
+            extractor = InvoiceExtractor(**extractor_kwargs)
+            pipeline = self._create_processing_pipeline_session(
+                attachments,
+                api_key,
+                request.save_path,
+                getattr(self, "_coordinator_since_date", request.date_from),
+                getattr(self, "_coordinator_before_date", request.date_to),
+                request.rules_text,
+                _extractor=extractor,
+                _owned_extractor=extractor,
+            )
+            resources["pipeline"] = pipeline
+            return pipeline.extract()
 
-            if self._stop_requested:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "完成",
-                    "color": "text-amber-600",
-                    "msg": "已完成安全停止，已处理结果已保留。",
-                })
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "stopped", "emails": total_emails, "attachments": total_attachments})
-                self._finish_run(True, "已安全停止")
-                return
+        def archive(outcomes, _request):
+            if "compatibility_report" in resources:
+                if self.quota_exhausted:
+                    raise QuotaExhaustedError(self.quota_message or "QUOTA_EXHAUSTED")
+                report = resources["compatibility_report"]
+                if report is None:
+                    report = type(
+                        "CompatibilityArchiveReport",
+                        (),
+                        {"can_complete": True, "archived_count": 0},
+                    )()
+                return report
+            pipeline = resources["pipeline"]
+            try:
+                report = pipeline.archive(outcomes)
+            except ProcessingLoopFailure:
+                statuses = {str(getattr(outcome, "status", "")) for outcome in outcomes}
+                if "quota_exhausted" in statuses or self.quota_exhausted:
+                    raise QuotaExhaustedError("QUOTA_EXHAUSTED") from None
+                if "auth_failed" in statuses:
+                    raise RemoteAuthError("REMOTE_AUTH_FAILED") from None
+                raise
+            if self.quota_exhausted:
+                raise QuotaExhaustedError(self.quota_message or "QUOTA_EXHAUSTED")
+            self._cwt_cancellation_matching(request.save_path)
+            self._sync_run_state_store_from_legacy()
+            return report
 
-            # CWT 取消撮合后处理: 找到匹配的预订确认单，移入 Manual_Check
-            self._cwt_cancellation_matching(save_path)
+        def report_callback(_context, _result):
+            try:
+                self._await_truth_audit()
+            finally:
+                pipeline = resources.get("pipeline")
+                if pipeline is not None:
+                    pipeline.close()
+                self._sync_run_state_store_from_legacy()
 
-            self._mark_finalizing()
-            self._start_async_finalizers(fetcher)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "完成",
-                "color": "text-emerald-400",
-                "msg": f"处理循环已完成，共处理 {total_attachments} 个附件。",
-            })
-            self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "completed", "emails": total_emails, "attachments": total_attachments})
-            self._finish_run(True, "处理完成")
-        except UnresolvedMailboxInputError as exc:
-            self._packaged_diag_write(
-                "worker_unresolved_mailbox_input",
-                "_processing_worker",
-                "failure",
-                summary=exc.diagnostic_payload(),
+        def disconnect_callback(_context, fetcher):
+            fetcher.disconnect()
+
+        def cleanup_callback(context):
+            self._cleanup_temp_folders(
+                staging_dir=context.staging_dir,
+                temp_dir=self._active_temp_dir,
             )
-            self._safe_emit_stage_event(
-                "frontend_processing_worker",
-                "exit",
-                {
-                    "result": "failed",
-                    "reason": exc.reason_code,
-                    "unresolved_count": exc.unresolved_count,
-                    "uid_hashes": list(exc.uid_hashes),
-                },
-            )
-            self._fail_run(
-                "邮件读取不完整",
-                str(exc),
-                fetcher=fetcher,
-                reason_code=exc.reason_code,
-                user_message=exc.user_message,
-            )
-        except MailboxScanError as exc:
-            exception_fingerprint = stable_hash(
-                {"exception_type": type(exc).__name__, "message": str(exc)}
-            )[:12]
-            self._packaged_diag_write(
-                "worker_mailbox_scan_failed",
-                "_processing_worker",
-                "failure",
-                summary={
-                    "reason_code": exc.reason_code,
-                    "exception_type": type(exc).__name__,
-                    "exception_fingerprint": exception_fingerprint,
-                },
-            )
-            self._safe_emit_stage_event(
-                "frontend_processing_worker",
-                "exit",
-                {
-                    "result": "failed",
-                    "reason": exc.reason_code,
-                    "exception_type": type(exc).__name__,
-                    "exception_fingerprint": exception_fingerprint,
-                },
-            )
-            self._fail_run(
-                "邮箱扫描失败",
-                exc.reason_code,
-                fetcher=fetcher,
-                reason_code=exc.reason_code,
-                user_message=exc.user_message,
-            )
-        except Exception as exc:
-            self._packaged_diag_write("worker_exception", "_processing_worker", "exception", exc=exc)
-            self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": str(exc) or "UNKNOWN_ERROR"})
-            self._fail_run(
-                "处理失败",
-                str(exc) or "UNKNOWN_ERROR",
-                fetcher=fetcher,
-                include_traceback=True,
-                reason_code="PROCESSING_FAILED",
-                user_message="处理过程中发生异常，请重试；如持续失败请查看诊断报告。",
-            )
+
+        def stage_callback(state, _payload):
+            status = {
+                RunState.SCANNING: (10, "正在扫描邮件..."),
+                RunState.RECOVERING: (30, "正在提取附件..."),
+                RunState.EXTRACTING: (45, "正在识别发票..."),
+                RunState.ARCHIVING: (90, "正在归档发票..."),
+                RunState.REPORTING: (95, "正在生成运行报告..."),
+            }[state]
+            self._set_run_state("running", status_text=status[1], progress=status[0])
+
+        return RunDependencies(
+            connect=connect,
+            scan=scan,
+            candidate=candidate,
+            extract=extract,
+            archive=archive,
+            report_service=ReportService(
+                report_callback=report_callback,
+                disconnect_callback=disconnect_callback,
+                cleanup_callback=cleanup_callback,
+                timeout_seconds=self._truth_audit_timeout_seconds + 1.0,
+            ),
+            cancel_requested=lambda: bool(self._stop_requested),
+            secrets={"auth_code": auth_code, "api_key": api_key},
+            stage_callback=stage_callback,
+            finalizer_session=lambda: resources.get("fetcher"),
+        )
+
 
     def _run_processing_loop(
         self,
@@ -2417,6 +2231,46 @@ class InvoiceAppAPI:
         _worker_extractor_factory=None,
         _archive_operation=None,
         _pairing_finalizer=None,
+    ):
+        from app_archive_adapter import AppArchiveAdapter
+        from archive_service import ArchiveService
+        from candidate_pipeline import CandidatePipeline, CandidatePreflight
+        from extraction_pipeline import ExtractionPipeline, SharedRuntimeRemoteExtractor
+
+        del AppArchiveAdapter, ArchiveService, CandidatePipeline, CandidatePreflight
+        del ExtractionPipeline, SharedRuntimeRemoteExtractor
+        session = self._create_processing_pipeline_session(
+            attachments_info,
+            api_key,
+            save_path,
+            since_date,
+            before_date,
+            rules_text,
+            _extractor=_extractor,
+            _worker_extractor_factory=_worker_extractor_factory,
+            _archive_operation=_archive_operation,
+            _pairing_finalizer=_pairing_finalizer,
+        )
+        try:
+            outcomes = session.extract()
+            return session.archive(outcomes)
+        finally:
+            session.close()
+
+    def _create_processing_pipeline_session(
+        self,
+        attachments_info,
+        api_key,
+        save_path,
+        since_date=None,
+        before_date=None,
+        rules_text="",
+        *,
+        _extractor=None,
+        _worker_extractor_factory=None,
+        _archive_operation=None,
+        _pairing_finalizer=None,
+        _owned_extractor=None,
     ):
         from app_archive_adapter import AppArchiveAdapter
         from archive_service import ArchiveService
@@ -2507,34 +2361,28 @@ class InvoiceAppAPI:
             ),
         )
 
-        try:
-            outcomes = ExtractionPipeline(
-                local_parser=preflight,
-                remote_extractor=remote,
-                max_workers=2,
-                verified_ceiling=remote.verified_ceiling,
-                stop_requested=lambda: bool(getattr(self, "_stop_requested", False)),
-                progress_callback=_progress,
-                trace_sink=_trace,
-            ).extract(candidates)
-            report = archive_service.archive(outcomes, save_path)
-            if not report.can_complete:
-                self._mark_output_run_state(
-                    output_state_dir,
-                    "failed",
-                    failure_reason="processing_pipeline_incomplete",
-                )
-                raise ProcessingLoopFailure("PROCESSING_PIPELINE_INCOMPLETE")
-            self._commit_output_state(output_state_dir, working_history, business_records)
-            return report
-        finally:
-            sidecar.clear()
-            if hasattr(self, "_pipeline_sidecar"):
-                delattr(self, "_pipeline_sidecar")
-            try:
-                trace_store.flush()
-            except Exception:
-                pass
+        pipeline = ExtractionPipeline(
+            local_parser=preflight,
+            remote_extractor=remote,
+            max_workers=2,
+            verified_ceiling=remote.verified_ceiling,
+            stop_requested=lambda: bool(getattr(self, "_stop_requested", False)),
+            progress_callback=_progress,
+            trace_sink=_trace,
+        )
+        return _ProcessingPipelineSession(
+            api=self,
+            candidates=candidates,
+            pipeline=pipeline,
+            archive_service=archive_service,
+            save_path=save_path,
+            output_state_dir=output_state_dir,
+            working_history=working_history,
+            business_records=business_records,
+            sidecar=sidecar,
+            trace_store=trace_store,
+            owned_extractor=_owned_extractor,
+        )
 
     def _retain_artifact(self, save_path, source_path, bucket, reason, metadata=None):
         """在 staging 清理前保留一份可追踪的原件副本。"""
@@ -3395,61 +3243,33 @@ class InvoiceAppAPI:
 
     def get_processed_records(self):
         """前端数据分析页面调用，获取已处理的账单或发票记录"""
-        return self.processed_invoices
+        self._sync_run_state_store_from_legacy()
+        return self._run_state_store.snapshot()["processed_invoices"]
 
     def get_progress(self):
         """前端轮询进度条和日志调用"""
-        if not self._is_running and self.progress == 0:
-            payload = {
-                "progress": 0,
-                "status_text": "等待任务开始...",
-                "logs": [],
-                "new_categories": [],
-                "stats": {"emails": 0, "invoices": 0, "errors": 0},
-                "is_running": False,
-                "run_state": self.run_state,
-                "last_error": self.last_error,
-                "stop_requested": self._stop_requested,
-                "can_stop": False,
-                "quota_exhausted": self.quota_exhausted,
-                "quota_message": self.quota_message,
-                "build_identity": self.build_identity,
-                "raw_date_range": self._raw_date_range_display,
-                "imap_query_range": self._imap_query_range_display,
-            }
-        else:
-            payload = {
-                "progress": self.progress,
-                "status_text": self.status_text,
-                "logs": self.logs[-20:], # 返回最新的日志
-                "new_categories": list(self.discovered_categories), # 传回后端发现的所有分类
-                "stats": getattr(self, "stats", {"emails": 0, "invoices": 0, "errors": 0}),
-                "is_running": self._is_running,
-                "run_state": self.run_state,
-                "last_error": self.last_error,
-                "stop_requested": self._stop_requested,
-                "can_stop": bool(
-                    self.run_state == "running"
-                    and self._is_running
-                    and not self._stop_requested
-                ),
-                "quota_exhausted": self.quota_exhausted,
-                "quota_message": self.quota_message,
-                "build_identity": self.build_identity,
-                "raw_date_range": self._raw_date_range_display,
-                "imap_query_range": self._imap_query_range_display,
-            }
+        self._sync_run_state_store_from_legacy()
+        payload = self._run_state_store.frontend_snapshot(
+            build_identity=self.build_identity,
+            raw_date_range=self._raw_date_range_display,
+            imap_query_range=self._imap_query_range_display,
+        )
         self._packaged_diag_log_progress_poll(payload)
         return payload
 
     def get_results(self):
         """前端分析页调用，获取最终的统计数据"""
+        self._sync_run_state_store_from_legacy()
+        state_snapshot = self._run_state_store.snapshot()
+        processed_invoices = state_snapshot["processed_invoices"]
+        error_invoices = state_snapshot["error_invoices"]
+        categories = state_snapshot["new_categories"]
         grouped_errors = self._group_error_invoices()
         summary = self._summarize_stats()
         return {
-            "categories": list(self.discovered_categories),
-            "successInvoices": self.processed_invoices,
-            "errorInvoices": self.error_invoices,
+            "categories": categories,
+            "successInvoices": processed_invoices,
+            "errorInvoices": error_invoices,
             "groupedErrorInvoices": grouped_errors,
             "manual_check_path": self._manual_check_path(),
             "output_path": self._effective_save_path or self._requested_save_path or self.get_default_save_path(),
@@ -3462,7 +3282,7 @@ class InvoiceAppAPI:
             "quota_exhausted": self.quota_exhausted,
             "quota_message": self.quota_message,
             "last_export_path": self._last_export_path,
-            "invoices": self.processed_invoices # 兼容旧的数据结构
+            "invoices": processed_invoices # 兼容旧的数据结构
         }
 
     def choose_directory(self):
