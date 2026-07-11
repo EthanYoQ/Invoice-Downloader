@@ -328,3 +328,140 @@ def test_url_trace_history_packaged_stage_and_ui_persistence_are_secret_free(tmp
         assert secret not in rendered_logs
         assert secret not in history_key
     assert info == runtime_before
+
+
+def test_live_progress_poll_before_url_finally_never_exposes_candidate_identity(tmp_path):
+    api = InvoiceAppAPI()
+    api._is_running = True
+    api.progress = 50
+    api._run_context = {
+        "enabled": False,
+        "staging_dir": str(tmp_path / "staging"),
+    }
+    api._output_state_dir = lambda save_path: str(tmp_path / "state")
+    api._create_document_trace_store = lambda output_path=None: _FallbackDocumentTraceStore(
+        output_path=str(tmp_path / "debug_trace.jsonl")
+    )
+    captured = {}
+
+    class FakeExtractor:
+        def __init__(self, api_key, output_dir):
+            del api_key, output_dir
+            self.processed_records_file = ""
+
+        def load_processed_records(self):
+            return {}
+
+    def pause_after_pre_browser_log(converter, *args, **kwargs):
+        del converter, args, kwargs
+        captured["progress"] = copy.deepcopy(api.get_progress())
+        return []
+
+    candidate = {
+        **_sensitive_info(),
+        "is_url": True,
+        "source_kind": "url",
+        "filepath": CAPABILITY_URL,
+        "file_name": "CAPABILITY-TOKEN-INVOICE-NUMBER-SECRET.url",
+        "email_id": "MAILBOX-UID-SECRET",
+        "candidate_action": "main_chain",
+        "tier": 2,
+    }
+    with (
+        patch("invoice_extractor.InvoiceExtractor", FakeExtractor),
+        patch("pdf_converter.PDFConverter.process_invoice_links", pause_after_pre_browser_log),
+        patch("app_api.time.sleep", return_value=None),
+    ):
+        api._run_processing_loop(
+            [candidate],
+            api_key="synthetic",
+            save_path=str(tmp_path / "output"),
+        )
+
+    rendered = json.dumps(captured["progress"], ensure_ascii=False, default=str)
+    assert "URL-candidate-" in rendered
+    for secret in (
+        CAPABILITY_URL,
+        "capability-segment",
+        "CAPABILITY-TOKEN",
+        "INVOICE-NUMBER-SECRET",
+        "MAILBOX-UID-SECRET",
+        candidate["file_name"],
+    ):
+        assert secret not in rendered
+
+
+def test_url_artifact_event_hashes_top_level_path_but_attachment_path_is_unchanged(tmp_path):
+    api = InvoiceAppAPI()
+    events_path = tmp_path / "artifact_events.jsonl"
+    api._run_context = {"enabled": True}
+    api._monitoring_path = lambda filename: str(events_path)
+    url_path = str(tmp_path / "SELLER-SECRET_INVOICE-NUMBER-SECRET.pdf")
+    manual_url_path = str(tmp_path / "Manual-SELLER-SECRET-INVOICE-NUMBER-SECRET.pdf")
+    attachment_path = str(tmp_path / "Original-Business-Name.PDF")
+
+    api._safe_emit_artifact_event(
+        "archive",
+        url_path,
+        document_id="MAILBOX-UID-SECRET",
+        source_kind="url",
+        reason_code="ARCHIVED",
+        category="invoice",
+        extra={
+            "status": "success",
+            "type": "invoice",
+            "seller": "SELLER-SECRET",
+            "invoice_number": "INVOICE-NUMBER-SECRET",
+            "file_name": "SELLER-SECRET_INVOICE-NUMBER-SECRET.pdf",
+        },
+    )
+    api._safe_emit_artifact_event(
+        "manual_check",
+        manual_url_path,
+        document_id="MAILBOX-UID-SECRET",
+        source_kind="url",
+        reason_code="MANUAL_REVIEW",
+        category="manual",
+        extra={
+            "status": "pending_review",
+            "type": "manual",
+            "seller": "SELLER-SECRET",
+            "invoice_number": "INVOICE-NUMBER-SECRET",
+        },
+    )
+    api._safe_emit_artifact_event(
+        "archive",
+        attachment_path,
+        document_id="attachment-document",
+        source_kind="attachment",
+        reason_code="ARCHIVED",
+        category="invoice",
+        extra={"status": "success"},
+    )
+
+    url_event, manual_url_event, attachment_event = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    for event in (url_event, manual_url_event):
+        rendered_url_event = json.dumps(event, ensure_ascii=False)
+        assert "path" not in event
+        assert re.fullmatch(r"[0-9a-f]{64}", event["path_hash"])
+        assert re.fullmatch(r"[0-9a-f]{64}", event["artifact_id"])
+        for secret in (
+            url_path,
+            manual_url_path,
+            "SELLER-SECRET",
+            "INVOICE-NUMBER-SECRET",
+            "SELLER-SECRET_INVOICE-NUMBER-SECRET.pdf",
+            "MAILBOX-UID-SECRET",
+        ):
+            assert secret not in rendered_url_event
+
+    assert url_event["status"] == "success"
+    assert url_event["type"] == "invoice"
+    assert manual_url_event["status"] == "pending_review"
+    assert manual_url_event["type"] == "manual"
+
+    assert attachment_event["path"] == attachment_path
+    assert attachment_event["document_id"] == "attachment-document"

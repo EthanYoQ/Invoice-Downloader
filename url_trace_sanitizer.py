@@ -11,6 +11,7 @@ _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{0,160}$")
 _SAFE_TOKEN_FIELDS = frozenset(
     {
         "kind",
+        "type",
         "source_kind",
         "status",
         "status_code",

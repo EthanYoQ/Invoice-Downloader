@@ -732,6 +732,48 @@ class InvoiceAppAPI:
     def _safe_emit_artifact_event(self, kind, path, document_id=None, source_kind=None, reason_code=None, category=None, extra=None):
         if not self._run_context.get("enabled"):
             return
+        if source_kind == "url":
+            payload = {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "artifact_id": stable_hash(
+                    {"kind": kind, "path": path, "document_id": document_id}
+                ),
+                "path_hash": stable_hash(path),
+                **self._snapshot_counts(),
+            }
+            payload.update(
+                sanitize_persistence_payload(
+                    {
+                        "kind": kind,
+                        "source_kind": source_kind,
+                        "reason_code": reason_code,
+                        "category": category,
+                    }
+                )
+            )
+            if document_id:
+                payload["document_hash"] = stable_hash(document_id)
+            if extra:
+                safe_extra = sanitize_persistence_payload(dict(extra))
+                payload.update(
+                    {
+                        key: value
+                        for key, value in safe_extra.items()
+                        if key in {
+                            "status",
+                            "type",
+                            "category",
+                            "provider",
+                            "provider_family",
+                            "reason_code",
+                        }
+                        or key.endswith(("_count", "_ms", "_seconds"))
+                    }
+                )
+            self._diag_append_jsonl(
+                self._monitoring_path("artifact_events.jsonl"), payload
+            )
+            return
         payload = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "kind": kind,
@@ -2273,6 +2315,17 @@ class InvoiceAppAPI:
                     if is_url_candidate
                     else file_name
                 )
+
+                def _log_reference(runtime_path=None, preserve_full_path=False):
+                    if is_url_candidate:
+                        return console_source_name
+                    if runtime_path:
+                        return (
+                            str(runtime_path)
+                            if preserve_full_path
+                            else os.path.basename(str(runtime_path))
+                        )
+                    return file_name
                 
                 try:
                     time.sleep(0.2) # 确保磁盘 IO 已完成
@@ -2348,7 +2401,7 @@ class InvoiceAppAPI:
                             "time": time.strftime("[%H:%M:%S]"),
                             "type": "保全:",
                             "color": "text-blue-400",
-                            "msg": f"前置过滤 B 层候选已保全: {os.path.basename(retained_path)}",
+                            "msg": f"前置过滤 B 层候选已保全: {_log_reference(retained_path)}",
                         })
                         self.error_invoices.append({
                             "id": f"inv_prefilter_{time.time()}_{i}",
@@ -2396,7 +2449,7 @@ class InvoiceAppAPI:
                             "time": time.strftime("[%H:%M:%S]"),
                             "type": "复核:",
                             "color": "text-yellow-400",
-                            "msg": f"前置过滤 C 层候选已进入待人工复核: {os.path.basename(review_path)}",
+                            "msg": f"前置过滤 C 层候选已进入待人工复核: {_log_reference(review_path)}",
                         })
                         self.error_invoices.append({
                             "id": f"inv_prefilter_{time.time()}_{i}",
@@ -2436,7 +2489,7 @@ class InvoiceAppAPI:
                     history_key = _build_history_key(info, file_name, pdf_path)
 
                     if history_key in working_history:
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-blue-400", "msg": f"本轮内重复已跳过: {file_name}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-blue-400", "msg": f"本轮内重复已跳过: {console_source_name}"})
                         self.progress = 50 + int(((i + 1) / total_attachments) * 45)
                         trace_store.set_fields(
                             document_id,
@@ -2460,7 +2513,7 @@ class InvoiceAppAPI:
                         
                     self.progress = 50 + int(((i + 1) / total_attachments) * 45)  # 50% -> 95%
                     self.status_text = f"正在解析发票 (第 {i+1} 个，共 {total_attachments} 个)..."
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "解析:", "color": "text-purple-400", "msg": f"AI 正在识别: {file_name}"})
+                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "解析:", "color": "text-purple-400", "msg": f"AI 正在识别: {console_source_name}"})
                     
                     # --- 网页链接发票无头下载支持 (Link Download) ---
                     if info.get('is_url', False):
@@ -2528,7 +2581,7 @@ class InvoiceAppAPI:
                                     "time": time.strftime("[%H:%M:%S]"),
                                     "type": "淇濆叏:",
                                     "color": "text-blue-400",
-                                    "msg": f"鍙楁帶璺戞壒宸蹭繚鍏ㄩ潪 provider URL锛?{os.path.basename(retained_path)}",
+                                    "msg": f"鍙楁帶璺戞壒宸蹭繚鍏ㄩ潪 provider URL锛?{_log_reference(retained_path)}",
                                 }
                             )
                             self.error_invoices.append(
@@ -2578,7 +2631,7 @@ class InvoiceAppAPI:
                             staging_dir=self._run_context.get("staging_dir") or "staging",
                             timeout_ms=30000,
                         )
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "抓取:", "color": "text-blue-400", "msg": f"正在启动无头浏览器抓取网页: {file_name[:30]}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "抓取:", "color": "text-blue-400", "msg": f"正在启动无头浏览器抓取网页: {console_source_name}"})
                         try:
                             url_recovery_started_at = time.perf_counter()
                             link_results = converter.process_invoice_links(
@@ -2614,7 +2667,7 @@ class InvoiceAppAPI:
                             raise
                         if not link_results:
                             self.stats["errors"] += 1
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"抓取发票链接失败或遇反爬验证码: {file_name}"})
+                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"抓取发票链接失败或遇反爬验证码: {console_source_name}"})
                             trace_store.set_fields(
                                 document_id,
                                 naming_result={"status": "skipped", "reason_code": "URL_DOWNLOAD_FAILED"},
@@ -2672,7 +2725,7 @@ class InvoiceAppAPI:
                                         "time": time.strftime("[%H:%M:%S]"),
                                         "type": "保全:",
                                         "color": "text-blue-400",
-                                        "msg": f"运行时过滤了非票据页面，已保留证据: {os.path.basename(retained_path)}",
+                                        "msg": f"运行时过滤了非票据页面，已保留证据: {_log_reference(retained_path)}",
                                     }
                                 )
                                 self.error_invoices.append(
@@ -2697,7 +2750,7 @@ class InvoiceAppAPI:
                                         "time": time.strftime("[%H:%M:%S]"),
                                         "type": "错误:",
                                         "color": "text-red-400",
-                                        "msg": f"链接抓取失败，已保留证据: {os.path.basename(retained_path)}",
+                                        "msg": f"链接抓取失败，已保留证据: {_log_reference(retained_path)}",
                                     }
                                 )
                                 self.error_invoices.append(
@@ -2767,7 +2820,7 @@ class InvoiceAppAPI:
                                 "time": time.strftime("[%H:%M:%S]"),
                                 "type": "淇濆叏:",
                                 "color": "text-red-400",
-                                "msg": f"百望恢复失败，已保全审计对象: {os.path.basename(retained_path)}",
+                                "msg": f"百望恢复失败，已保全审计对象: {_log_reference(retained_path)}",
                             })
                             trace_store.set_fields(
                                 document_id,
@@ -2845,7 +2898,7 @@ class InvoiceAppAPI:
                             "time": time.strftime("[%H:%M:%S]"),
                             "type": "错误:",
                             "color": "text-red-400",
-                            "msg": f"链接生成的 PDF 壳无效，已保留证据: {os.path.basename(retained_path)}",
+                            "msg": f"链接生成的 PDF 壳无效，已保留证据: {_log_reference(retained_path)}",
                         })
                         self.error_invoices.append({
                             "id": f"inv_url_shell_{time.time()}_{i}",
@@ -2888,7 +2941,7 @@ class InvoiceAppAPI:
                         trace_store.set_fields(document_id, pdf_health=pdf_health)
                     if not base64_img:
                         self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"无法读取附件图像: {file_name}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"无法读取附件图像: {_log_reference()}"})
                         self._record_error_log(
                             save_path,
                             info.get('subject', file_name),
@@ -3014,7 +3067,7 @@ class InvoiceAppAPI:
                         )
                     if not info_json:
                         self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"大模型全部引擎提取失败，移入人工区: {file_name}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"大模型全部引擎提取失败，移入人工区: {_log_reference()}"})
                         self._record_error_log(
                             save_path,
                             info.get('subject', file_name),
@@ -3126,7 +3179,7 @@ class InvoiceAppAPI:
                             "time": time.strftime("[%H:%M:%S]"),
                             "type": "保全:",
                             "color": "text-yellow-400",
-                            "msg": f"下载结果被文档验收闸门拦截: {os.path.basename(retained_path)}",
+                            "msg": f"下载结果被文档验收闸门拦截: {_log_reference(retained_path)}",
                         })
                         trace_store.set_fields(
                             document_id,
@@ -3174,7 +3227,7 @@ class InvoiceAppAPI:
                             }
                         )
                         self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "保全:", "color": "text-yellow-400", "msg": f"模型拒绝文件已转人工复核保全: {os.path.basename(retained_path)}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "保全:", "color": "text-yellow-400", "msg": f"模型拒绝文件已转人工复核保全: {_log_reference(retained_path)}"})
                         self.error_invoices.append({
                             "id": f"inv_{time.time()}_{i}",
                             "date": info_json.get("Date", "---"),
@@ -3334,7 +3387,7 @@ class InvoiceAppAPI:
                                 is_url=info.get("is_url", False),
                             )
                             self.stats["errors"] += 1
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "复核:", "color": "text-yellow-400", "msg": f"购买方字段缺失或低置信度，已移入待人工复核: {os.path.basename(review_path)}"})
+                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "复核:", "color": "text-yellow-400", "msg": f"购买方字段缺失或低置信度，已移入待人工复核: {_log_reference(review_path)}"})
                             trace_store.set_fields(
                                 document_id,
                                 normalized_fields=normalized_snapshot,
@@ -3398,7 +3451,7 @@ class InvoiceAppAPI:
                             file_name,
                         ):
                             self.stats["errors"] += 1
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-yellow-400", "msg": f"已触发发票去重机制 (发票代码/号码相同): {file_name}"})
+                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-yellow-400", "msg": f"已触发发票去重机制 (发票代码/号码相同): {_log_reference()}"})
                             processed_filepaths.add(pdf_path)
                             duplicate_path = self._retain_artifact(
                                 save_path,
@@ -3445,7 +3498,7 @@ class InvoiceAppAPI:
                                 f"发票代码/号码重复: {invoice_code}/{invoice_number}",
                                 severity="skipped",
                             )
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "保全:", "color": "text-gray-400", "msg": f"重复票据已保留原件副本: {file_name}"})
+                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "保全:", "color": "text-gray-400", "msg": f"重复票据已保留原件副本: {_log_reference()}"})
                             continue
                     
                     # Step D: 分发与降级逻辑 (Tier 3 阻断)
@@ -3457,7 +3510,7 @@ class InvoiceAppAPI:
                     )
                     if tier_info == 3 and not _cwt_classified:
                         self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "异常:", "color": "text-yellow-400", "msg": f"边缘触发需人工复核: {file_name}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "异常:", "color": "text-yellow-400", "msg": f"边缘触发需人工复核: {_log_reference()}"})
                         retained_path = self._send_to_manual_check(
                             save_path,
                             pdf_path,
@@ -3515,7 +3568,7 @@ class InvoiceAppAPI:
                             save_path, pdf_path, "CWT_HOTEL_CANCELLATION",
                             metadata={"subject": info.get("subject", ""), "file_name": file_name},
                         )
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-amber-400", "msg": f"CWT取消知会已送人工复核: {file_name}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-amber-400", "msg": f"CWT取消知会已送人工复核: {_log_reference()}"})
                         if not hasattr(self, '_cwt_cancellation_registry'):
                             self._cwt_cancellation_registry = []
                         self._cwt_cancellation_registry.append({
@@ -3549,7 +3602,7 @@ class InvoiceAppAPI:
                             "time": time.strftime("[%H:%M:%S]"),
                             "type": "复核:",
                             "color": "text-yellow-400",
-                            "msg": f"低置信度结果已移入人工复核: {os.path.basename(result_path)}",
+                            "msg": f"低置信度结果已移入人工复核: {_log_reference(result_path)}",
                         })
                         trace_store.set_fields(
                             document_id,
@@ -3599,7 +3652,7 @@ class InvoiceAppAPI:
                         category_name = final_category
                         success_count += 1
                         self.stats["invoices"] = success_count
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "成功:", "color": "text-emerald-400", "msg": f"[{category_name}] 归档至: {os.path.basename(result_path)}"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "成功:", "color": "text-emerald-400", "msg": f"[{category_name}] 归档至: {_log_reference(result_path)}"})
                         trace_store.set_fields(
                             document_id,
                             naming_result=naming_trace or {"status": "archived", "reason_code": None},
@@ -3648,7 +3701,7 @@ class InvoiceAppAPI:
                             )
                     else:
                         self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "跳过:", "color": "text-yellow-400", "msg": f"未归档或放入人工分类: {file_name} ({result_path})"})
+                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "跳过:", "color": "text-yellow-400", "msg": f"未归档或放入人工分类: {_log_reference()} ({_log_reference(result_path, preserve_full_path=True)})"})
                         self._record_error_log(
                             save_path,
                             info.get('subject', file_name),
@@ -3778,7 +3831,8 @@ class InvoiceAppAPI:
 
                     self.stats["errors"] += 1
                     err_msg = str(loop_err)
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"处理单张发票失败: {file_name} - {err_msg}"})
+                    log_error_detail = type(loop_err).__name__ if is_url_candidate else err_msg
+                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"处理单张发票失败: {_log_reference()} - {log_error_detail}"})
                     retained_path = self._retain_artifact(
                         save_path,
                         pdf_path,
