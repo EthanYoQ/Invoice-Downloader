@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from archive_pairing import (
@@ -54,6 +55,18 @@ class TruthAuditTimeout(RuntimeError):
 class ProcessingLoopFailure(RuntimeError):
     reason_code = "PROCESSING_FAILED"
     user_message = "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
+
+
+@dataclass(frozen=True)
+class TruthAuditJob:
+    run_id: str
+    run_root: Path
+    monitoring_dir: Path
+    quarantine_dir: Path
+    thread: threading.Thread
+    ready: threading.Event
+    abandoned: threading.Event
+    result: dict
 
 
 def build_processing_history_key(info, file_name, pdf_path):
@@ -419,8 +432,7 @@ class InvoiceAppAPI:
         self.quota_message = ""
         self._worker_thread = None
         self._truth_audit_thread = None
-        self._truth_audit_quarantine = None
-        self._truth_audit_publish_lock = None
+        self._truth_audit_job = None
         if truth_audit_timeout_seconds is None:
             truth_audit_timeout_seconds = DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS
         self._truth_audit_timeout_seconds = max(0.001, float(truth_audit_timeout_seconds))
@@ -992,8 +1004,7 @@ class InvoiceAppAPI:
     def _start_truth_audit_async(self, email_address, auth_code):
         if not self._run_context.get("enabled") or not email_address or not auth_code:
             self._truth_audit_thread = None
-            self._truth_audit_quarantine = None
-            self._truth_audit_publish_lock = None
+            self._truth_audit_job = None
             return
 
         context = dict(self._run_context)
@@ -1013,15 +1024,17 @@ class InvoiceAppAPI:
         report_path = monitoring_dir / "email_truth_audit.json"
         error_path = monitoring_dir / "email_truth_audit_error.json"
         quarantine_dir = monitoring_dir / "quarantined" / safe_run_id
-        quarantine = threading.Event()
-        publish_lock = threading.Lock()
+        ready = threading.Event()
+        abandoned = threading.Event()
+        result = {}
         date_from = self._effective_date_from
         date_to = self._effective_date_to
 
-        def _publish(filename, payload):
-            with publish_lock:
-                target_dir = quarantine_dir if quarantine.is_set() else monitoring_dir
-                self._diag_write_json(str(target_dir / filename), payload)
+        def _write_quarantined(filename, target_path, payload):
+            source_path = quarantine_dir / filename
+            self._diag_write_json(str(source_path), payload)
+            result["source_path"] = source_path
+            result["target_path"] = target_path
 
         def _runner():
             try:
@@ -1034,10 +1047,11 @@ class InvoiceAppAPI:
                     date_from,
                     date_to,
                 )
-                _publish(report_path.name, report)
+                _write_quarantined(report_path.name, report_path, report)
             except ModuleNotFoundError as exc:
-                _publish(
+                _write_quarantined(
                     error_path.name,
+                    error_path,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "skipped",
@@ -1047,8 +1061,9 @@ class InvoiceAppAPI:
                     },
                 )
             except Exception as exc:
-                _publish(
+                _write_quarantined(
                     error_path.name,
+                    error_path,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "reason": "TRUTH_AUDIT_FAILED",
@@ -1056,36 +1071,78 @@ class InvoiceAppAPI:
                         "error_hash": stable_hash(str(exc))[:12],
                     },
                 )
+            finally:
+                ready.set()
 
         thread = threading.Thread(target=_runner, name="InvoiceFlowTruthAudit", daemon=True)
+        job = TruthAuditJob(
+            run_id=run_id,
+            run_root=run_root,
+            monitoring_dir=monitoring_dir,
+            quarantine_dir=quarantine_dir,
+            thread=thread,
+            ready=ready,
+            abandoned=abandoned,
+            result=result,
+        )
         self._truth_audit_thread = thread
-        self._truth_audit_quarantine = quarantine
-        self._truth_audit_publish_lock = publish_lock
-        thread.start()
+        self._truth_audit_job = job
+        try:
+            thread.start()
+        except Exception:
+            abandoned.set()
+            self._truth_audit_thread = None
+            self._truth_audit_job = None
+            raise
         return thread
 
     def _await_truth_audit(self):
-        thread = self._truth_audit_thread
-        if thread is None:
+        job = self._truth_audit_job
+        if job is None:
             return
-        if thread is threading.current_thread():
+        if job.thread is threading.current_thread():
             raise RuntimeError("truth audit cannot join its own thread")
         # The accepted strict audit takes about 5-12 seconds locally; 120 seconds
         # leaves a conservative production margin while still bounding finalization.
-        thread.join(self._truth_audit_timeout_seconds)
-        if thread.is_alive():
-            publish_lock = self._truth_audit_publish_lock
-            if publish_lock is not None:
-                with publish_lock:
-                    if self._truth_audit_quarantine is not None:
-                        self._truth_audit_quarantine.set()
+        deadline = time.monotonic() + self._truth_audit_timeout_seconds
+
+        def _expire_job():
+            job.abandoned.set()
             self._truth_audit_thread = None
-            self._truth_audit_quarantine = None
-            self._truth_audit_publish_lock = None
+            if self._truth_audit_job is job:
+                self._truth_audit_job = None
             raise TruthAuditTimeout("TRUTH_AUDIT_TIMEOUT")
+
+        if not job.ready.wait(self._truth_audit_timeout_seconds):
+            _expire_job()
+
+        active_handle = self._active_run_handle
+        if (
+            job.abandoned.is_set()
+            or active_handle is None
+            or active_handle.run_id != job.run_id
+        ):
+            job.abandoned.set()
+            self._truth_audit_thread = None
+            if self._truth_audit_job is job:
+                self._truth_audit_job = None
+            raise RuntimeError("TRUTH_AUDIT_RUN_NOT_AUTHORIZED")
+
+        source_path = job.result.get("source_path")
+        target_path = job.result.get("target_path")
+        if not source_path or not target_path or not Path(source_path).exists():
+            self._truth_audit_thread = None
+            if self._truth_audit_job is job:
+                self._truth_audit_job = None
+            raise RuntimeError("TRUTH_AUDIT_PUBLICATION_MISSING")
+
+        if time.monotonic() > deadline:
+            _expire_job()
+        os.makedirs(Path(target_path).parent, exist_ok=True)
+        os.replace(source_path, target_path)
         self._truth_audit_thread = None
-        self._truth_audit_quarantine = None
-        self._truth_audit_publish_lock = None
+        if self._truth_audit_job is job:
+            self._truth_audit_job = None
 
     def _inspect_pdf_health(self, pdf_path):
         if not pdf_path or not str(pdf_path).lower().endswith(".pdf"):
@@ -5326,7 +5383,21 @@ class InvoiceAppAPI:
             "msg": "前端请求已接收，后台任务正在启动。",
         })
         self._safe_write_run_config(email_address, auth_code=auth_code, api_key=api_key)
-        self._start_truth_audit_async(email_address, auth_code)
+        try:
+            self._start_truth_audit_async(email_address, auth_code)
+        except Exception as exc:
+            self._safe_emit_stage_event(
+                "start_processing",
+                "exit",
+                {"result": "failed", "reason": "WORKER_START_FAILED"},
+            )
+            self._fail_run(
+                "启动失败",
+                str(exc) or "WORKER_START_FAILED",
+                reason_code="WORKER_START_FAILED",
+                user_message="后台任务启动失败，请重试。",
+            )
+            return {"success": False, "message": "后台任务启动失败"}
 
         thread = threading.Thread(
             target=self._processing_worker,
@@ -5390,7 +5461,11 @@ class InvoiceAppAPI:
                 "run_state": self.run_state,
                 "last_error": self.last_error,
                 "stop_requested": self._stop_requested,
-                "can_stop": bool(self._is_running and not self._stop_requested),
+                "can_stop": bool(
+                    self.run_state == "running"
+                    and self._is_running
+                    and not self._stop_requested
+                ),
                 "quota_exhausted": self.quota_exhausted,
                 "quota_message": self.quota_message,
                 "build_identity": self.build_identity,

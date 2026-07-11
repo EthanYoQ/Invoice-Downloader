@@ -403,6 +403,122 @@ def test_truth_audit_timeout_is_bounded_and_late_worker_is_quarantined(tmp_path,
     assert (api.run_state, api.status_text, api.logs) == state_before
 
 
+def test_truth_audit_deadline_does_not_wait_for_blocked_publication(tmp_path, monkeypatch):
+    import audit_email_truth
+
+    api = InvoiceAppAPI(truth_audit_timeout_seconds=0.02)
+    shared_root = tmp_path / "shared-run-root"
+    api._run_context = _controlled_context(shared_root, "old")
+    api._current_run_id = "old"
+    monkeypatch.setattr(api, "_refresh_run_context", lambda: api._run_context)
+    monkeypatch.setattr(audit_email_truth, "collect_truth_table", lambda *args: {"run": "old"})
+    publication_entered = threading.Event()
+    release_publication = threading.Event()
+    callbacks = []
+    terminal_events = []
+    original_write = api._diag_write_json
+
+    def blocked_write(path, payload):
+        publication_entered.set()
+        assert release_publication.wait(2)
+        original_write(path, payload)
+
+    monkeypatch.setattr(api, "_diag_write_json", blocked_write)
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: callbacks.append("cleanup"))
+    monkeypatch.setattr(
+        api,
+        "_safe_emit_run_state_event",
+        lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
+    )
+    api._begin_run("running")
+    old_handle = api._active_run_handle
+    audit_thread = api._start_truth_audit_async("old@qq.com", "AUTH-SECRET")
+    assert publication_entered.wait(1)
+
+    def finalize():
+        api._mark_finalizing()
+        api._start_async_finalizers()
+        api._finish_run(True, "done")
+
+    worker = threading.Thread(target=finalize, name="hard-deadline-finalizer")
+    api._worker_thread = worker
+    worker.start()
+    worker.join(0.20)
+    bounded = not worker.is_alive()
+    if not bounded:
+        release_publication.set()
+        worker.join(1)
+    assert bounded, "timeout path waited on audit publication"
+
+    assert api.run_state == "failed"
+    assert terminal_events == ["failed"]
+    assert api._worker_thread is None
+    assert api._run_lifecycle.can_begin is True
+    assert api._run_lifecycle.owned_staging_count == 0
+    assert callbacks == ["cleanup"]
+    assert old_handle.snapshot.finalizer_failures[0].reason_code == "TRUTH_AUDIT_TIMEOUT"
+
+    api._run_context = _controlled_context(shared_root, "new")
+    api._current_run_id = "new"
+    api._begin_run("new running")
+    state_before = (api.run_state, api.status_text, list(api.logs))
+    release_publication.set()
+    audit_thread.join(1)
+
+    assert not audit_thread.is_alive()
+    assert not (shared_root / "monitoring" / "email_truth_audit.json").exists()
+    assert (api.run_state, api.status_text, api.logs) == state_before
+
+
+def test_start_processing_thread_start_failure_releases_lifecycle_once(tmp_path, monkeypatch):
+    api = InvoiceAppAPI(truth_audit_timeout_seconds=0.01)
+    run_root = tmp_path / "start-failure"
+    api._run_context = _controlled_context(run_root, "start-failure")
+    api._current_run_id = "start-failure"
+    monkeypatch.setattr(api, "_refresh_run_context", lambda: api._run_context)
+    monkeypatch.setattr(api, "save_user_settings", lambda settings: {"success": True})
+    monkeypatch.setattr(api, "_safe_write_run_config", lambda *args, **kwargs: None)
+    cleanup_calls = []
+    terminal_events = []
+    original_cleanup = api._cleanup_temp_folders
+
+    def cleanup(**kwargs):
+        cleanup_calls.append("cleanup")
+        return original_cleanup(**kwargs)
+
+    def failed_start(thread):
+        raise RuntimeError("https://secret.example/?api_key=THREAD-START-SECRET")
+
+    monkeypatch.setattr(api, "_cleanup_temp_folders", cleanup)
+    monkeypatch.setattr(threading.Thread, "start", failed_start)
+    monkeypatch.setattr(
+        api,
+        "_safe_emit_run_state_event",
+        lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
+    )
+
+    result = api.start_processing(
+        "",
+        str(run_root / "output"),
+        email_address="test@qq.com",
+        auth_code="AUTH-SECRET",
+        api_key="API-SECRET",
+    )
+
+    assert result["success"] is False
+    assert "THREAD-START-SECRET" not in str(result)
+    assert api.run_state == "failed"
+    assert terminal_events == ["failed"]
+    assert cleanup_calls == ["cleanup"]
+    assert api._worker_thread is None
+    assert api._run_lifecycle.can_begin is True
+    assert api._run_lifecycle.owned_staging_count == 0
+    assert api._active_run_handle.state.name == "FAILED"
+    assert not api._active_run_handle.staging_dir.exists()
+    assert "WORKER_START_FAILED" in api.last_error
+    assert "THREAD-START-SECRET" not in api.last_error
+
+
 def test_stop_during_finalizing_does_not_claim_success_or_change_status(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     api = InvoiceAppAPI()
@@ -433,6 +549,9 @@ def test_stop_during_finalizing_does_not_claim_success_or_change_status(tmp_path
     assert api.run_state == "finalizing"
     assert api.status_text == status_before
     assert api._stop_requested is False
+    progress = api.get_progress()
+    assert progress["can_stop"] is False
+    assert progress["run_state"] == "finalizing"
     release.set()
     worker.join(1)
 
