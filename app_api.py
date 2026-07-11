@@ -31,6 +31,7 @@ from document_types import (
 )
 from email_channel import resolve_channel
 from frontend_run_context import ensure_run_context_dirs, load_run_context, make_run_staging_dir, serialize_run_context
+from glm_runtime import GlmRequestError, GlmRuntime
 from run_lifecycle import RunLifecycle, RunState
 from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
 from url_trace_sanitizer import (
@@ -41,6 +42,8 @@ from url_trace_sanitizer import (
     stable_hash,
 )
 from user_settings import (
+    DEFAULT_GLM_MODEL_CANDIDATES,
+    DEFAULT_GLM_PROFILE_LIMITS,
     UserSettingsStore,
     ensure_directory,
     get_default_save_path as resolve_default_save_path,
@@ -1783,6 +1786,8 @@ class InvoiceAppAPI:
             "date_to": "",
             "quick_range": "last_30_days",
             "company": "",
+            "glm_profile_limits": copy.deepcopy(DEFAULT_GLM_PROFILE_LIMITS),
+            "glm_model_candidates": copy.deepcopy(DEFAULT_GLM_MODEL_CANDIDATES),
             "remember_settings": True,
         }
 
@@ -1835,11 +1840,6 @@ class InvoiceAppAPI:
             },
         )
         
-        try:
-            import requests
-        except ImportError:
-            return {"success": False, "message": "连接失败 - 后端缺少 requests 依赖库"}
-            
         # 邮箱连接测试（仅在填写授权码时执行）
         if auth_code:
             try:
@@ -1854,47 +1854,36 @@ class InvoiceAppAPI:
         
         if len(api_key) <= 5:
             return {"success": False, "message": "连接失败 - API Key 格式不正确"}
-            
+
         try:
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            # 构造一个最低成本的试探性请求（智谱 GLM API）
             payload = {
-                "model": "glm-4-flash",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "max_tokens": 5
             }
-            response = requests.post(
-                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=15
+            runtime = GlmRuntime(api_key, settings=self._settings_store.load() or {})
+            runtime.request(
+                "text",
+                payload,
+                lambda body: body["choices"][0]["message"]["content"],
+                attempts=1,
             )
-            
-            if response.status_code == 200:
-                return {"success": True, "message": "连接成功 - 智谱 GLM 服务已就绪"}
-            elif response.status_code == 401:
+            return {"success": True, "message": "连接成功 - 智谱 GLM 服务已就绪"}
+        except GlmRequestError as exc:
+            if exc.http_status == 401:
                 return {"success": False, "message": "连接失败 - API Key 鉴权未通过或无效"}
-            elif response.status_code == 402:
+            if exc.http_status == 402:
                 return {"success": False, "message": "连接失败 - GLM API 额度已耗尽，请充值或更换 API Key"}
-            elif response.status_code == 429:
+            if exc.http_status == 429 or exc.business_code == 1302 or exc.reason == "rate_limited":
                 return {"success": False, "message": "连接失败 - 触发限流，请求并发过高"}
-            else:
-                err_text = response.text
-                quota_message = self._resolve_quota_message(f"{response.status_code} {err_text}")
-                if quota_message:
-                    return {"success": False, "message": f"连接失败 - {quota_message}"}
-                print(f"GLM API Error HTTP {response.status_code}: {err_text}")
-                return {"success": False, "message": f"连接异常 - 状态码: {response.status_code} - {err_text[:80]}"}
-                
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "API连接失败 - 请求超时，请检查您的网络连接"}
-        except requests.exceptions.ConnectionError:
-            return {"success": False, "message": "API连接失败 - 无法连接到智谱 API 服务器"}
-        except Exception as e:
-            return {"success": False, "message": f"网络或API未知异常: {str(e)[:80]}"}
+            if exc.reason == "timeout":
+                return {"success": False, "message": "API连接失败 - 请求超时，请检查您的网络连接"}
+            if exc.reason == "connection_error":
+                return {"success": False, "message": "API连接失败 - 无法连接到智谱 API 服务器"}
+            if exc.http_status is not None:
+                return {"success": False, "message": f"连接异常 - 状态码: {exc.http_status}"}
+            return {"success": False, "message": "网络或API未知异常: GLM 请求失败"}
+        except Exception:
+            return {"success": False, "message": "网络或API未知异常: GLM 请求失败"}
 
     def test_email_auth(self, email_address, auth_code):
         if not email_address or not auth_code:
@@ -2423,6 +2412,7 @@ class InvoiceAppAPI:
             summary={"attachments": len(attachments_info or [])},
         )
         import copy
+        import inspect
         import os
         import traceback
         from invoice_extractor import InvoiceExtractor
@@ -2444,7 +2434,15 @@ class InvoiceAppAPI:
             },
         )
             
-        extractor = InvoiceExtractor(api_key=api_key, output_dir=save_path)
+        extractor_parameters = inspect.signature(InvoiceExtractor).parameters.values()
+        supports_glm_settings = any(
+            parameter.name == "glm_settings" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in extractor_parameters
+        )
+        extractor_kwargs = {"api_key": api_key, "output_dir": save_path}
+        if supports_glm_settings:
+            extractor_kwargs["glm_settings"] = self._settings_store.load() or {}
+        extractor = InvoiceExtractor(**extractor_kwargs)
         output_state_dir = self._output_state_dir(save_path)
         extractor.processed_records_file = os.path.join(output_state_dir, "processed_records.json")
         self._packaged_diag_write("run_loop_extractor_ready", "_run_processing_loop", "success")

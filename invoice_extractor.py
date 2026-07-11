@@ -3,15 +3,15 @@ import re
 import json
 import base64
 import copy
+import hashlib
 import logging
 import shutil
 import datetime as dt
 import unicodedata
 import fitz  # PyMuPDF
-import requests
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 from document_types import MANUAL_REVIEW_FOLDER, get_document_type_names, normalize_document_type
 from email_body_receipts import CANONICAL_MARKER
+from glm_runtime import GlmRuntime
 from invoice_domain import DocumentIdentity, InvoiceRecord
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,12 +28,20 @@ def normalize_ocr_compat_text(value):
     return unicodedata.normalize("NFKC", str(value or "")).translate(OCR_COMPAT_TRANSLATION)
 
 class InvoiceExtractor:
-    def __init__(self, api_key=None, output_dir="extracted_invoices"):
+    def __init__(
+        self,
+        api_key=None,
+        output_dir="extracted_invoices",
+        *,
+        glm_runtime=None,
+        glm_settings=None,
+    ):
         """
         初始化大模型提取器, 使用 GLM-4.5V 解决图文识别发票信息并结构化
         """
         self.api_key = api_key or ""
         self.model = "glm-4.5v"
+        self.glm_runtime = glm_runtime or GlmRuntime(self.api_key, settings=glm_settings)
         self.output_dir = os.path.abspath(output_dir)
         self.processed_records_file = os.path.join(self.output_dir, "processed_records.json")
         self.last_extraction_trace = {}
@@ -1154,8 +1162,6 @@ class InvoiceExtractor:
         """3.2 Construct the Vision/OCR API payload and extract structured JSON using dual engines"""
         import time
 
-        class LayoutParsingError(Exception): pass
-
         extraction_trace = {
             "engine": None,
             "reason_code": None,
@@ -1227,7 +1233,12 @@ class InvoiceExtractor:
                 result = json.loads(content)
             except json.JSONDecodeError as e:
                 # 极端情况下若JSON严重破损，不直接崩溃，返回一个兜底包让 Manual_Check 接手
-                logging.warning(f"Failed to decode LLM JSON: {e}. Raw content: {content}")
+                response_fingerprint = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+                logging.warning(
+                    "Failed to decode LLM JSON: %s; response_fingerprint=%s",
+                    type(e).__name__,
+                    response_fingerprint,
+                )
                 return {"Type": "解析失败", "Date": "未知", "Seller": "无法读取商户", "Amount": "0.00"}
             
             # Type constraint validation heuristic fallback
@@ -1243,7 +1254,6 @@ class InvoiceExtractor:
             
             return result
 
-        @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(2), reraise=True, retry=retry_if_not_exception_type(LayoutParsingError))
         def _call_track_a_ocr(file_path):
             logging.info("Track A - Calling OCR (glm-ocr layout_parsing)...")
             print(">>> [进度] 开始 OCR 提取...")
@@ -1279,40 +1289,30 @@ class InvoiceExtractor:
                     mime_type = mime_map.get(ext, 'image/png')
                     file_data_uri = f"data:{mime_type};base64,{img_b64}"
                 
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-                
                 payload = {
-                    "model": "glm-ocr",
                     "file": file_data_uri
                 }
-                
-                res = requests.post("https://open.bigmodel.cn/api/paas/v4/layout_parsing", headers=headers, json=payload, timeout=90)
-                
-                if res.status_code in [400, 404]:
-                    print(f">>> [错误] layout_parsing 接口返回 {res.status_code}，详情: {res.text}。准备自动切换至 Track B (glm-4.5v)。")
-                    raise LayoutParsingError(f"HTTP {res.status_code}")
-                res.raise_for_status()
-            except LayoutParsingError:
-                raise
+
+                def _parse_ocr_response(body):
+                    text = body.get("md_results", "") if isinstance(body, dict) else ""
+                    if not text or len(text.strip()) < 5:
+                        raise ValueError("OCR text missing or too short")
+                    return text
+
+                text = self.glm_runtime.request(
+                    "ocr",
+                    payload,
+                    _parse_ocr_response,
+                    attempts=2,
+                )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
                 raise
-            
-            text = res.json().get('md_results', '')
-            if not text or len(text.strip()) < 5:
-                print(">>> [错误] 模型调用失败，原因: OCR 文本过空")
-                raise ValueError("OCR text missing or too short.")
             print(">>> [进度] OCR 提取完成")
             return text
 
-        @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3), reraise=True)
         def _call_track_a_llm(ocr_text):
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             payload = {
-                "model": "glm-4-flash",
                 "messages": [
                     {"role": "system", "content": prompt_text},
                     {"role": "user", "content": f"以下是提取出的票据文本，请提取信息并输出严格 JSON:\n\n{ocr_text}"}
@@ -1322,24 +1322,24 @@ class InvoiceExtractor:
             logging.info("Track A - Calling Text LLM (glm-4-flash)...")
             print(">>> [进度] 开始 LLM 分类及字段提取...")
             try:
-                res = requests.post("https://open.bigmodel.cn/api/paas/v4/chat/completions", headers=headers, json=payload, timeout=45)
-                res.raise_for_status()
+                result = self.glm_runtime.request(
+                    "text",
+                    payload,
+                    lambda body: _parse_json_result(body["choices"][0]["message"]["content"]),
+                    attempts=3,
+                )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
                 raise
-            content = res.json()["choices"][0]["message"]["content"]
             print(">>> [进度] LLM 分类完成")
-            return _parse_json_result(content)
+            return result
 
-        @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3), reraise=True)
         def _call_track_b_vision(b64_list):
             import threading
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             messages_content = [{"type": "text", "text": prompt_text}]
             for b64 in b64_list:
                 messages_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
             payload = {
-                "model": "glm-4.5v",
                 "messages": [{"role": "user", "content": messages_content}],
                 "temperature": 0.1
             }
@@ -1356,8 +1356,12 @@ class InvoiceExtractor:
             t.start()
             
             try:
-                res = requests.post("https://open.bigmodel.cn/api/paas/v4/chat/completions", headers=headers, json=payload, timeout=60)
-                res.raise_for_status()
+                result = self.glm_runtime.request(
+                    "vision_quality",
+                    payload,
+                    lambda body: _parse_json_result(body["choices"][0]["message"]["content"]),
+                    attempts=3,
+                )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
                 raise
@@ -1365,9 +1369,8 @@ class InvoiceExtractor:
                 stop_event.set()
                 t.join(timeout=1.0)
                 
-            content = res.json()["choices"][0]["message"]["content"]
             print(">>> [进度] 视觉提取完成")
-            return _parse_json_result(content)
+            return result
 
         def _print_success_summary(res_dict):
             if res_dict:

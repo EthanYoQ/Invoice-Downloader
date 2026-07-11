@@ -13,6 +13,11 @@ LEGACY_APP_DIR_NAMES = (
 SETTINGS_FILE_NAME = "user_settings.json"
 SENSITIVE_KEYS = {"auth_code", "api_key"}
 DEFAULT_OUTPUT_DIR_NAME = "发票整理"
+DEFAULT_GLM_PROFILE_LIMITS = {"ocr": 2, "text": 2, "vision_quality": 2}
+DEFAULT_GLM_MODEL_CANDIDATES = {
+    "text": [],
+    "vision_quality": [],
+}
 
 
 class DATA_BLOB(ctypes.Structure):
