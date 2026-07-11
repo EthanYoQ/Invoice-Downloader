@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import random
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Callable, Mapping
@@ -17,6 +19,23 @@ CHAT_ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 CONCURRENCY_LIMIT_CODES = frozenset({429, 1302})
 TRANSIENT_OVERLOAD_CODES = frozenset({1305, 1312})
 SUCCESS_BUSINESS_CODES = frozenset({0, 200})
+MAX_REQUEST_TIMEOUT_SECONDS = 600.0
+
+
+def _validate_timeout_seconds(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("timeout_seconds must be a real number")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("timeout_seconds is unsafe") from exc
+    if (
+        not math.isfinite(normalized)
+        or normalized <= 0
+        or normalized > MAX_REQUEST_TIMEOUT_SECONDS
+    ):
+        raise ValueError("timeout_seconds is outside the safe range")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -36,10 +55,7 @@ class ModelProfile:
             raise TypeError("max_concurrency must be an integer")
         if self.max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
-        if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, (int, float)):
-            raise TypeError("timeout_seconds must be numeric")
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
+        _validate_timeout_seconds(self.timeout_seconds)
 
 
 DEFAULT_PROFILES = MappingProxyType(
@@ -64,7 +80,12 @@ def default_profiles(settings: Mapping | None = None) -> Mapping[str, ModelProfi
         for alias, value in limits.items():
             if alias not in configured:
                 continue
-            ceiling = _bounded_int(value, configured[alias].max_concurrency, minimum=1, maximum=16)
+            ceiling = _bounded_int(
+                value,
+                configured[alias].max_concurrency,
+                minimum=1,
+                maximum=configured[alias].max_concurrency,
+            )
             configured[alias] = replace(configured[alias], max_concurrency=ceiling)
     return MappingProxyType(configured)
 
@@ -95,6 +116,8 @@ class AdaptiveConcurrencyLimiter:
         self._active = 0
         self._successes_since_limit = 0
         self._condition = threading.Condition()
+        self._waiters = deque()
+        self._closed = False
 
     @property
     def current_limit(self):
@@ -106,11 +129,36 @@ class AdaptiveConcurrencyLimiter:
         with self._condition:
             return self._active
 
-    def acquire(self):
+    @property
+    def waiting_count(self):
         with self._condition:
-            while self._active >= self._current_limit:
-                self._condition.wait()
-            self._active += 1
+            return len(self._waiters)
+
+    def acquire(self):
+        token = object()
+        acquired = False
+        with self._condition:
+            if self._closed:
+                raise LimiterClosedError("concurrency limiter is closed")
+            self._waiters.append(token)
+            try:
+                while True:
+                    if self._closed:
+                        raise LimiterClosedError("concurrency limiter is closed")
+                    if self._waiters[0] is token and self._active < self._current_limit:
+                        self._waiters.popleft()
+                        self._active += 1
+                        acquired = True
+                        self._condition.notify_all()
+                        return
+                    self._condition.wait()
+            finally:
+                if not acquired:
+                    try:
+                        self._waiters.remove(token)
+                    except ValueError:
+                        pass
+                    self._condition.notify_all()
 
     def release(self):
         with self._condition:
@@ -130,6 +178,8 @@ class AdaptiveConcurrencyLimiter:
 
     def record_success(self):
         with self._condition:
+            if self._closed:
+                return
             if self._current_limit >= self.configured_ceiling:
                 self._successes_since_limit = 0
                 return
@@ -139,6 +189,21 @@ class AdaptiveConcurrencyLimiter:
             self._current_limit = min(self.configured_ceiling, self._current_limit + 1)
             self._successes_since_limit = 0
             self._condition.notify_all()
+
+    def close(self):
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+
+
+class LimiterClosedError(RuntimeError):
+    pass
+
+
+class GlmRuntimeClosedError(RuntimeError):
+    pass
 
 
 class GlmRequestError(RuntimeError):
@@ -202,8 +267,20 @@ class GlmRuntime:
         }
         self.last_trace = {}
         self._trace_lock = threading.Lock()
+        self._state_condition = threading.Condition()
+        self._closing = False
+        self._closed = False
+        self._active_requests = 0
 
-    def request(self, profile_name, payload, parser, *, attempts=None):
+    def request(
+        self,
+        profile_name,
+        payload,
+        parser,
+        *,
+        attempts=None,
+        timeout_seconds=None,
+    ):
         if profile_name not in self.profiles:
             raise KeyError(f"unknown GLM profile: {profile_name}")
         if not callable(parser):
@@ -213,44 +290,61 @@ class GlmRuntime:
             raise ValueError("attempts must be a positive integer")
 
         profile = self.profiles[profile_name]
+        request_timeout = (
+            float(profile.timeout_seconds)
+            if timeout_seconds is None
+            else _validate_timeout_seconds(timeout_seconds)
+        )
         request_payload = copy.deepcopy(dict(payload or {}))
         request_payload["model"] = profile.name
-        last_error = None
-        for attempt in range(1, attempt_limit + 1):
-            started = self.clock()
-            result = self._request_once(profile_name, profile, request_payload, parser)
-            outcome = "success" if result.error is None else result.error.reason
-            self._record_trace(
-                profile_name,
-                profile,
-                attempt,
-                result.http_status,
-                result.business_code,
-                outcome,
-                started,
-            )
-            if result.error is None:
-                self.limiters[profile_name].record_success()
-                return result.parsed
-            last_error = result.error
-            if not result.retryable or attempt >= attempt_limit:
-                raise last_error
-            self.sleep(self.retry_delay(attempt))
-        raise last_error or GlmRequestError(profile_name)
+        self._enter_request()
+        try:
+            last_error = None
+            for attempt in range(1, attempt_limit + 1):
+                if attempt > 1:
+                    self._raise_if_closing()
+                started = self.clock()
+                result = self._request_once(
+                    profile_name,
+                    profile,
+                    request_payload,
+                    parser,
+                    request_timeout,
+                )
+                outcome = "success" if result.error is None else result.error.reason
+                self._record_trace(
+                    profile_name,
+                    profile,
+                    attempt,
+                    result.http_status,
+                    result.business_code,
+                    outcome,
+                    started,
+                )
+                if result.error is None:
+                    self.limiters[profile_name].record_success()
+                    return result.parsed
+                last_error = result.error
+                if not result.retryable or attempt >= attempt_limit:
+                    raise last_error
+                self.sleep(self.retry_delay(attempt))
+            raise last_error or GlmRequestError(profile_name)
+        finally:
+            self._leave_request()
 
-    def _request_once(self, profile_name, profile, payload, parser):
+    def _request_once(self, profile_name, profile, payload, parser, timeout_seconds):
         limiter = self.limiters[profile_name]
-        limiter.acquire()
+        try:
+            limiter.acquire()
+        except LimiterClosedError as exc:
+            raise GlmRuntimeClosedError("GLM runtime is closing") from exc
+        response = None
         try:
             try:
-                response = self.session.post(
+                response = self._send_immutable_request(
                     profile.endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=profile.timeout_seconds,
+                    payload,
+                    timeout_seconds,
                 )
             except requests.Timeout:
                 return self._failure(profile_name, reason="timeout", retryable=True)
@@ -327,6 +421,10 @@ class GlmRuntime:
                 business_code=business_code,
             )
         finally:
+            if response is not None:
+                close_response = getattr(response, "close", None)
+                if callable(close_response):
+                    close_response()
             limiter.release()
 
     @staticmethod
@@ -351,13 +449,91 @@ class GlmRuntime:
         )
 
     def retry_delay(self, attempt):
-        base = min(8.0, 2.0 ** max(0, int(attempt) - 1))
+        base = min(8.0, max(2.0, 2.0 ** max(0, int(attempt) - 1)))
         try:
             random_value = float(self.random_source())
         except (TypeError, ValueError, OverflowError):
             random_value = 0.0
         jitter = min(0.5, max(0.0, random_value * 0.5))
         return min(10.0, base + jitter)
+
+    def _send_immutable_request(self, endpoint, payload, timeout_seconds):
+        """Send through the sole Session's adapter pool without mutable Session.request state."""
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        if isinstance(self.session, requests.Session):
+            prepared = requests.Request(
+                "POST",
+                endpoint,
+                headers=headers,
+                json=payload,
+            ).prepare()
+            environment = self.session.merge_environment_settings(
+                prepared.url,
+                {},
+                None,
+                None,
+                None,
+            )
+            adapter = self.session.get_adapter(prepared.url)
+            return adapter.send(prepared, timeout=timeout_seconds, **environment)
+        return self.session.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=timeout_seconds,
+        )
+
+    def _enter_request(self):
+        with self._state_condition:
+            if self._closing or self._closed:
+                raise GlmRuntimeClosedError("GLM runtime is closing")
+            self._active_requests += 1
+
+    def _leave_request(self):
+        with self._state_condition:
+            if self._active_requests <= 0:
+                raise RuntimeError("runtime request accounting underflow")
+            self._active_requests -= 1
+            self._state_condition.notify_all()
+
+    def _raise_if_closing(self):
+        with self._state_condition:
+            if self._closing or self._closed:
+                raise GlmRuntimeClosedError("GLM runtime is closing")
+
+    def close(self):
+        with self._state_condition:
+            if self._closed:
+                return
+            if self._closing:
+                while not self._closed:
+                    self._state_condition.wait()
+                return
+            self._closing = True
+            for limiter in self.limiters.values():
+                limiter.close()
+            while self._active_requests:
+                self._state_condition.wait()
+        try:
+            self.session.close()
+        except Exception:
+            logging.debug("GLM session close failed", exc_info=False)
+        finally:
+            with self._state_condition:
+                self._closed = True
+                self._state_condition.notify_all()
+
+    def __enter__(self):
+        self._raise_if_closing()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
 
     def _record_trace(
         self,

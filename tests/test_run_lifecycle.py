@@ -1106,6 +1106,9 @@ def test_processing_loop_internal_exception_reaches_worker_failed_terminal_once(
         def load_processed_records(self):
             return {}
 
+        def close(self):
+            finalizers.append("extractor_close")
+
     monkeypatch.setattr("email_fetcher.EmailFetcher", Fetcher)
     monkeypatch.setattr("invoice_extractor.InvoiceExtractor", FakeExtractor)
     monkeypatch.setattr(api, "_output_state_dir", lambda save_path: str(tmp_path / "state"))
@@ -1140,11 +1143,40 @@ def test_processing_loop_internal_exception_reaches_worker_failed_terminal_once(
     assert api.run_state == "failed"
     assert terminal_events == ["failed"]
     assert not any(extra.get("result") == "completed" for stage, event, extra in stage_events if stage == "frontend_processing_worker")
-    assert finalizers == ["disconnect", "cleanup"]
+    assert finalizers == ["extractor_close", "disconnect", "cleanup"]
     assert propagated == ["ProcessingLoopFailure"]
     assert "PROCESSING_FAILED" in api.last_error
     assert "请重试" in api.last_error
     assert "secret.example" not in api.last_error
+
+
+def test_processing_loop_closes_extractor_when_preamble_fails(tmp_path, monkeypatch):
+    api = InvoiceAppAPI()
+    closes = []
+
+    class FakeExtractor:
+        def __init__(self, api_key, output_dir):
+            self.processed_records_file = ""
+
+        def load_processed_records(self):
+            raise RuntimeError("preamble failed")
+
+        def close(self):
+            closes.append("closed")
+
+    monkeypatch.setattr("invoice_extractor.InvoiceExtractor", FakeExtractor)
+    monkeypatch.setattr(api, "_output_state_dir", lambda _save_path: str(tmp_path / "state"))
+    monkeypatch.setattr(api, "_load_output_run_state", lambda _state_dir: {})
+    monkeypatch.setattr(api, "_mark_output_run_state", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="preamble failed"):
+        api._run_processing_loop(
+            [{"filepath": str(tmp_path / "missing.pdf")}],
+            "api-key",
+            str(tmp_path / "output"),
+        )
+
+    assert closes == ["closed"]
 
 
 def test_each_run_owns_a_unique_staging_directory(tmp_path, monkeypatch):

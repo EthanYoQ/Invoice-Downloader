@@ -1855,6 +1855,7 @@ class InvoiceAppAPI:
         if len(api_key) <= 5:
             return {"success": False, "message": "连接失败 - API Key 格式不正确"}
 
+        runtime = None
         try:
             payload = {
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -1866,6 +1867,7 @@ class InvoiceAppAPI:
                 payload,
                 lambda body: body["choices"][0]["message"]["content"],
                 attempts=1,
+                timeout_seconds=15,
             )
             return {"success": True, "message": "连接成功 - 智谱 GLM 服务已就绪"}
         except GlmRequestError as exc:
@@ -1884,6 +1886,11 @@ class InvoiceAppAPI:
             return {"success": False, "message": "网络或API未知异常: GLM 请求失败"}
         except Exception:
             return {"success": False, "message": "网络或API未知异常: GLM 请求失败"}
+        finally:
+            if runtime is not None:
+                close_runtime = getattr(runtime, "close", None)
+                if callable(close_runtime):
+                    close_runtime()
 
     def test_email_auth(self, email_address, auth_code):
         if not email_address or not auth_code:
@@ -2404,7 +2411,63 @@ class InvoiceAppAPI:
                 user_message="处理过程中发生异常，请重试；如持续失败请查看诊断报告。",
             )
 
-    def _run_processing_loop(self, attachments_info, api_key, save_path, since_date=None, before_date=None, rules_text=""):
+    def _run_processing_loop(
+        self,
+        attachments_info,
+        api_key,
+        save_path,
+        since_date=None,
+        before_date=None,
+        rules_text="",
+    ):
+        import inspect
+        from invoice_extractor import InvoiceExtractor
+
+        if not attachments_info:
+            return self._run_processing_loop_with_extractor(
+                attachments_info,
+                api_key,
+                save_path,
+                since_date,
+                before_date,
+                rules_text,
+                _extractor=None,
+            )
+        extractor_parameters = inspect.signature(InvoiceExtractor).parameters.values()
+        supports_glm_settings = any(
+            parameter.name == "glm_settings"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in extractor_parameters
+        )
+        extractor_kwargs = {"api_key": api_key, "output_dir": save_path}
+        if supports_glm_settings:
+            extractor_kwargs["glm_settings"] = self._settings_store.load() or {}
+        owned_extractor = InvoiceExtractor(**extractor_kwargs)
+        try:
+            return self._run_processing_loop_with_extractor(
+                attachments_info,
+                api_key,
+                save_path,
+                since_date,
+                before_date,
+                rules_text,
+                _extractor=owned_extractor,
+            )
+        finally:
+            close_extractor = getattr(owned_extractor, "close", None)
+            if callable(close_extractor):
+                close_extractor()
+
+    def _run_processing_loop_with_extractor(
+        self,
+        attachments_info,
+        api_key,
+        save_path,
+        since_date=None,
+        before_date=None,
+        rules_text="",
+        _extractor=None,
+    ):
         self._packaged_diag_write(
             "run_loop_enter",
             "_run_processing_loop",
@@ -2412,10 +2475,8 @@ class InvoiceAppAPI:
             summary={"attachments": len(attachments_info or [])},
         )
         import copy
-        import inspect
         import os
         import traceback
-        from invoice_extractor import InvoiceExtractor
         
         total_attachments = len(attachments_info)
         if total_attachments == 0:
@@ -2434,15 +2495,7 @@ class InvoiceAppAPI:
             },
         )
             
-        extractor_parameters = inspect.signature(InvoiceExtractor).parameters.values()
-        supports_glm_settings = any(
-            parameter.name == "glm_settings" or parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in extractor_parameters
-        )
-        extractor_kwargs = {"api_key": api_key, "output_dir": save_path}
-        if supports_glm_settings:
-            extractor_kwargs["glm_settings"] = self._settings_store.load() or {}
-        extractor = InvoiceExtractor(**extractor_kwargs)
+        extractor = _extractor
         output_state_dir = self._output_state_dir(save_path)
         extractor.processed_records_file = os.path.join(output_state_dir, "processed_records.json")
         self._packaged_diag_write("run_loop_extractor_ready", "_run_processing_loop", "success")

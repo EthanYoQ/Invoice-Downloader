@@ -6,6 +6,7 @@ import copy
 import hashlib
 import logging
 import shutil
+import threading
 import datetime as dt
 import unicodedata
 import fitz  # PyMuPDF
@@ -42,12 +43,31 @@ class InvoiceExtractor:
         self.api_key = api_key or ""
         self.model = "glm-4.5v"
         self.glm_runtime = glm_runtime or GlmRuntime(self.api_key, settings=glm_settings)
+        self._close_lock = threading.Lock()
+        self._closed = False
         self.output_dir = os.path.abspath(output_dir)
         self.processed_records_file = os.path.join(self.output_dir, "processed_records.json")
         self.last_extraction_trace = {}
         self.last_route_trace = {}
         self.last_timing_trace = {}
         os.makedirs(self.output_dir, exist_ok=True)
+
+    def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        close_runtime = getattr(self.glm_runtime, "close", None)
+        if callable(close_runtime):
+            close_runtime()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
 
     @staticmethod
     def _valid_types():
@@ -1304,6 +1324,7 @@ class InvoiceExtractor:
                     payload,
                     _parse_ocr_response,
                     attempts=2,
+                    timeout_seconds=90,
                 )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
@@ -1327,6 +1348,7 @@ class InvoiceExtractor:
                     payload,
                     lambda body: _parse_json_result(body["choices"][0]["message"]["content"]),
                     attempts=3,
+                    timeout_seconds=45,
                 )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
@@ -1361,6 +1383,7 @@ class InvoiceExtractor:
                     payload,
                     lambda body: _parse_json_result(body["choices"][0]["message"]["content"]),
                     attempts=3,
+                    timeout_seconds=60,
                 )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
