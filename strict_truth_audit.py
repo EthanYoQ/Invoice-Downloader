@@ -1,14 +1,44 @@
 import argparse
+import datetime as dt
 import hashlib
 import json
+import os
 import re
+import subprocess
+import tempfile
+import unicodedata
 from pathlib import Path
 
-from document_types import get_archive_folder
-from invoice_extractor import normalize_ocr_compat_text
+from truth_contracts import TruthContractError, TruthManifest
 
 
 CAPTURE_KINDS = {"archive", "manual_check", "manual_review"}
+OCR_COMPAT_TRANSLATION = str.maketrans({"⻔": "门", "⻝": "食", "⻨": "麦", "⻆": "角"})
+ARCHIVE_FOLDERS = {
+    "打车": "打车",
+    "行程单": "打车",
+    "火车票": "火车票",
+    "机票": "机票",
+    "住宿发票": "住宿发票",
+    "住宿水单": "住宿发票",
+    "餐饮": "餐饮",
+    "过路费": "过路费",
+    "定额发票": "定额发票",
+    "其他": "其他",
+    "航班行程单": "机票",
+    "住宿确认单": "住宿发票",
+    "差旅服务费": "差旅服务费",
+    "非目标公司发票": "非目标公司发票",
+    "个人非报销发票": "个人非报销发票",
+}
+
+
+def normalize_ocr_compat_text(value) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).translate(OCR_COMPAT_TRANSLATION)
+
+
+def get_archive_folder(document_type: str) -> str:
+    return ARCHIVE_FOLDERS.get(str(document_type or ""), str(document_type or "其他"))
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -836,6 +866,57 @@ def write_markdown(result: dict, path: Path):
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+
+
+def candidate_revision(run_root: Path) -> str:
+    config_path = run_root / "monitoring" / "run_config.json"
+    if config_path.exists():
+        try:
+            revision = str(json.loads(config_path.read_text(encoding="utf-8")).get("candidate_revision") or "").strip()
+            if revision:
+                return revision
+        except (OSError, json.JSONDecodeError):
+            pass
+    override = os.environ.get("INVOICEFLOW_CANDIDATE_REVISION", "").strip()
+    if override:
+        return override
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def audit_run_id(run_root: Path) -> str:
+    config_path = run_root / "monitoring" / "run_config.json"
+    if config_path.exists():
+        try:
+            run_id = str(json.loads(config_path.read_text(encoding="utf-8")).get("run_id") or "").strip()
+            if run_id:
+                return run_id
+        except (OSError, json.JSONDecodeError):
+            pass
+    return run_root.resolve().name
+
+
 def strict_exit_code(summary: dict) -> int:
     counts = {key: int(summary.get(key, 0) or 0) for key in ("p0", "p1", "p2", "manual")}
     return 1 if any(counts.values()) else 0
@@ -848,15 +929,28 @@ def main():
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
-    manifest = json.loads(Path(args.truth_manifest).read_text(encoding="utf-8"))
-    if manifest.get("summary", {}).get("finalized") is not True or manifest.get("summary", {}).get("pending_review_count") != 0:
-        raise SystemExit("truth manifest is not finalized or pending_review_count is not 0")
+    try:
+        raw_manifest = json.loads(Path(args.truth_manifest).read_text(encoding="utf-8"))
+        validate_truth_ids(raw_manifest.get("included", []))
+        manifest = TruthManifest.from_mapping(raw_manifest).to_mapping()
+    except (OSError, json.JSONDecodeError, TruthContractError, ValueError) as exc:
+        raise SystemExit(f"invalid truth manifest: {exc}") from None
     try:
         result = compare(manifest, Path(args.run_root))
     except ValueError as exc:
         raise SystemExit(f"invalid truth manifest: {exc}") from None
     output = Path(args.output) if args.output else Path(args.truth_manifest).with_name("strict_truth_audit_result.json")
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_counts = {
+        "p0": result["p0_conclusion"]["count"],
+        "p1": result["user_p1_conclusion"]["count"],
+        "p2": result["p2_conclusion"]["count"],
+        "manual": len(result["manual_check_rows"]),
+    }
+    result["generated_at_utc"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    result["run_id"] = audit_run_id(Path(args.run_root))
+    result["candidate_revision"] = candidate_revision(Path(args.run_root))
+    result["exit_code"] = strict_exit_code(summary_counts)
+    write_json_atomic(output, result)
     markdown_output = output.with_suffix(".md")
     write_markdown(result, markdown_output)
     comparison_report = output.parent / "comparison_report.md"
@@ -872,12 +966,7 @@ def main():
         "output": str(output),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    raise SystemExit(strict_exit_code({
-        "p0": summary["p0_count"],
-        "p1": summary["user_p1_count"],
-        "p2": summary["p2_count"],
-        "manual": summary["manual_check_count"],
-    }))
+    raise SystemExit(result["exit_code"])
 
 
 if __name__ == "__main__":

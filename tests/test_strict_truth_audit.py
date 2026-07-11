@@ -7,6 +7,22 @@ import pytest
 import strict_truth_audit as audit
 
 
+def _complete_summary():
+    return {
+        "dataset": "fixture",
+        "date_from": "2026-06-01",
+        "date_to": "2026-06-13",
+        "before_exclusive": "2026-06-14",
+        "mailbox": "INBOX",
+        "account_domain": "qq.com",
+        "target_company": "目标公司",
+        "included_count": 0,
+        "excluded_count": 0,
+        "pending_review_count": 0,
+        "finalized": True,
+    }
+
+
 def test_assignment_cannot_reuse_one_artifact_for_two_truth_rows():
     rows = [
         {"truth_id": "t1", "invoice_number": "12345678"},
@@ -145,7 +161,7 @@ def test_main_exits_from_every_strict_category(monkeypatch, tmp_path, strict_fie
     run_root = tmp_path / "run"
     run_root.mkdir()
     manifest_path.write_text(
-        json.dumps({"summary": {"finalized": True, "pending_review_count": 0}, "included": []}),
+        json.dumps({"summary": _complete_summary(), "included": [], "excluded": [], "pending_review": []}),
         encoding="utf-8",
     )
     monkeypatch.setattr(audit, "compare", lambda manifest, root: _main_result(strict_field))
@@ -162,6 +178,10 @@ def test_main_exits_from_every_strict_category(monkeypatch, tmp_path, strict_fie
     assert exc_info.value.code == expected_code
     assert output_path.exists()
     assert output_path.with_suffix(".md").exists()
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["exit_code"] == expected_code
+    assert payload["candidate_revision"]
+    assert payload["generated_at_utc"].endswith("Z")
 
 
 def test_main_rejects_duplicate_truth_ids_with_clear_cli_error(monkeypatch, tmp_path):
@@ -169,8 +189,10 @@ def test_main_rejects_duplicate_truth_ids_with_clear_cli_error(monkeypatch, tmp_
     run_root = tmp_path / "run"
     run_root.mkdir()
     manifest_path.write_text(json.dumps({
-        "summary": {"finalized": True, "pending_review_count": 0},
+        "summary": {**_complete_summary(), "included_count": 2},
         "included": [{"truth_id": "t1"}, {"truth_id": "t1"}],
+        "excluded": [],
+        "pending_review": [],
     }), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [
         "strict_truth_audit.py",
