@@ -257,6 +257,183 @@ def match_truth(row: dict, artifacts: list[dict], output_hashes: dict) -> tuple[
     return None, "no_match"
 
 
+MATCH_METHODS = (
+    "invoice_number",
+    "sha256",
+    "source_email_id+file_name",
+    "source_email_id+amount+seller",
+    "date+amount+seller",
+)
+
+
+def _candidate_artifact_indexes(row: dict, artifacts: list[dict], output_hashes: dict) -> tuple[list[int], str]:
+    invoice = norm_invoice(row.get("invoice_number"))
+    if invoice:
+        matches = [index for index, artifact in enumerate(artifacts) if invoice == artifact.get("invoice_number")]
+        if matches:
+            return matches, "invoice_number"
+
+    truth_sha = row.get("sha256", "")
+    if truth_sha and truth_sha in output_hashes:
+        matched_path = str(Path(output_hashes[truth_sha]).resolve()).lower()
+        matches = [
+            index for index, artifact in enumerate(artifacts)
+            if artifact.get("path") and str(Path(artifact["path"]).resolve()).lower() == matched_path
+        ]
+        if matches:
+            return matches, "sha256"
+
+    source_email = str(row.get("source_email_id", ""))
+    file_name = row.get("file_name", "")
+    matches = [
+        index for index, artifact in enumerate(artifacts)
+        if source_email
+        and source_email == str(artifact.get("email_id", ""))
+        and file_name
+        and file_name == artifact.get("source_filename", "")
+    ]
+    if matches:
+        return matches, "source_email_id+file_name"
+
+    amount = norm_amount(row.get("amount", ""))
+    seller = row.get("seller", "")
+    matches = [
+        index for index, artifact in enumerate(artifacts)
+        if source_email
+        and source_email == str(artifact.get("email_id", ""))
+        and amount
+        and amount == artifact.get("amount")
+        and contains_fuzzy(seller, artifact.get("seller", ""))
+    ]
+    if matches:
+        return matches, "source_email_id+amount+seller"
+
+    date = norm_date(row.get("invoice_date", ""))
+    matches = [
+        index for index, artifact in enumerate(artifacts)
+        if amount
+        and amount == artifact.get("amount")
+        and date
+        and date == artifact.get("date")
+        and contains_fuzzy(seller, artifact.get("seller", ""))
+    ]
+    if matches:
+        return matches, "date+amount+seller"
+    return [], "no_match"
+
+
+def _maximum_matching(adjacency: dict[int, list[int]], rows: list[int], excluded_artifacts=frozenset()) -> dict[int, int]:
+    artifact_to_row = {}
+
+    def augment(row_index: int, seen: set[int]) -> bool:
+        for artifact_index in adjacency.get(row_index, []):
+            if artifact_index in excluded_artifacts or artifact_index in seen:
+                continue
+            seen.add(artifact_index)
+            owner = artifact_to_row.get(artifact_index)
+            if owner is None or augment(owner, seen):
+                artifact_to_row[artifact_index] = row_index
+                return True
+        return False
+
+    for row_index in rows:
+        augment(row_index, set())
+    return {row_index: artifact_index for artifact_index, row_index in artifact_to_row.items()}
+
+
+def assign_truth_matches(rows: list[dict], artifacts: list[dict], output_hashes: dict) -> dict[str, tuple[dict | None, str]]:
+    assignment_artifacts = list(artifacts)
+    known_paths = {
+        str(Path(artifact.get("path", "")).resolve()).lower()
+        for artifact in assignment_artifacts
+        if artifact.get("path")
+    }
+    for row in rows:
+        truth_sha = row.get("sha256", "")
+        matched_path = output_hashes.get(truth_sha) if truth_sha else None
+        if not matched_path:
+            continue
+        resolved = str(Path(matched_path).resolve()).lower()
+        if resolved in known_paths:
+            continue
+        parent = Path(matched_path).parent.name
+        assignment_artifacts.append({
+            "path": matched_path,
+            "sha256": truth_sha,
+            "category": parent,
+            "display_type": parent,
+            "used_manual_check": parent == "待人工复核",
+            "kind": "manual_check" if parent == "待人工复核" else "archive",
+        })
+        known_paths.add(resolved)
+
+    candidates = {}
+    methods = {}
+    for row_index, row in enumerate(rows):
+        indexes, method = _candidate_artifact_indexes(row, assignment_artifacts, output_hashes)
+        candidates[row_index] = sorted(
+            indexes,
+            key=lambda index: (
+                is_retention_artifact(assignment_artifacts[index]),
+                str(assignment_artifacts[index].get("path", "")),
+            ),
+        )
+        methods[row_index] = method
+
+    assigned = {
+        str(row.get("truth_id", "")): (None, "no_match")
+        for row in rows
+    }
+    used_artifacts = set()
+    strong_edges = []
+    for row_index, indexes in candidates.items():
+        method = methods[row_index]
+        if method not in {"invoice_number", "sha256"}:
+            continue
+        for artifact_index in indexes:
+            strong_edges.append((
+                MATCH_METHODS.index(method),
+                is_retention_artifact(assignment_artifacts[artifact_index]),
+                str(assignment_artifacts[artifact_index].get("path", "")),
+                str(rows[row_index].get("truth_id", "")),
+                row_index,
+                artifact_index,
+            ))
+    assigned_rows = set()
+    for *_, row_index, artifact_index in sorted(strong_edges):
+        if row_index in assigned_rows or artifact_index in used_artifacts:
+            continue
+        truth_id = str(rows[row_index].get("truth_id", ""))
+        assigned[truth_id] = (assignment_artifacts[artifact_index], methods[row_index])
+        assigned_rows.add(row_index)
+        used_artifacts.add(artifact_index)
+
+    composite_rows = [
+        row_index for row_index in range(len(rows))
+        if row_index not in assigned_rows and methods[row_index] not in {"invoice_number", "sha256", "no_match"}
+    ]
+    composite_rows.sort(key=lambda index: str(rows[index].get("truth_id", "")))
+    adjacency = {
+        row_index: [index for index in candidates[row_index] if index not in used_artifacts]
+        for row_index in composite_rows
+    }
+    baseline_size = len(_maximum_matching(adjacency, composite_rows, used_artifacts))
+    for row_index in composite_rows:
+        other_rows = [index for index in composite_rows if index != row_index]
+        possible_artifacts = []
+        for artifact_index in adjacency[row_index]:
+            remaining = _maximum_matching(adjacency, other_rows, used_artifacts | {artifact_index})
+            if len(remaining) + 1 == baseline_size:
+                possible_artifacts.append(artifact_index)
+        can_be_unmatched = len(_maximum_matching(adjacency, other_rows, used_artifacts)) == baseline_size
+        truth_id = str(rows[row_index].get("truth_id", ""))
+        if len(possible_artifacts) == 1 and not can_be_unmatched:
+            assigned[truth_id] = (assignment_artifacts[possible_artifacts[0]], methods[row_index])
+        elif possible_artifacts:
+            assigned[truth_id] = (None, "ambiguous_match")
+    return assigned
+
+
 def category_matches_expected(row: dict, artifact: dict) -> bool:
     expected = row.get("expected_category", "")
     if not expected:
@@ -291,7 +468,7 @@ def infer_required_hotel_pairs(rows: list[dict]) -> list[dict]:
         groups.setdefault((date, amount), []).append(row)
 
     required = []
-    for (date, amount), group_rows in groups.items():
+    for (date, amount), group_rows in sorted(groups.items()):
         invoices = [
             row for row in group_rows
             if row.get("truth_type") == "住宿发票" and row.get("document_role") != "hotel_folio"
@@ -300,13 +477,23 @@ def infer_required_hotel_pairs(rows: list[dict]) -> list[dict]:
             row for row in group_rows
             if row.get("truth_type") == "住宿水单" or row.get("document_role") == "hotel_folio"
         ]
+        invoice_truth_ids = sorted(str(row.get("truth_id", "")) for row in invoices)
+        companion_truth_ids = sorted(str(row.get("truth_id", "")) for row in folios)
         if len(invoices) == 1 and len(folios) == 1:
             required.append({
                 "pair_key": f"hotel:{date}:{amount}",
-                "date": date,
-                "amount": amount,
-                "invoice_truth_id": invoices[0].get("truth_id"),
-                "folio_truth_id": folios[0].get("truth_id"),
+                "status": "required",
+                "invoice_truth_ids": invoice_truth_ids,
+                "companion_truth_ids": companion_truth_ids,
+                "reason": "single_hotel_invoice_and_folio_share_date_and_amount",
+            })
+        elif invoices and folios:
+            required.append({
+                "pair_key": f"hotel:{date}:{amount}",
+                "status": "ambiguous",
+                "invoice_truth_ids": invoice_truth_ids,
+                "companion_truth_ids": companion_truth_ids,
+                "reason": "multiple_hotel_pairings_share_date_and_amount",
             })
     return required
 
@@ -335,26 +522,56 @@ def infer_required_ride_pairs(rows: list[dict]) -> list[dict]:
         elif "行程单" in truth_type or "itinerary" in role or "报销单" in role:
             itineraries.append(row)
 
+    adjacency = {
+        invoice_index: {
+            itinerary_index for itinerary_index, itinerary in enumerate(itineraries)
+            if _amounts_match_for_ride(
+                norm_amount(invoice.get("amount", "")),
+                norm_amount(itinerary.get("amount", "")),
+            )
+        }
+        for invoice_index, invoice in enumerate(invoices)
+    }
     required = []
-    used_itineraries = set()
-    for invoice in invoices:
-        invoice_amount = norm_amount(invoice.get("amount", ""))
-        matches = []
-        for index, itinerary in enumerate(itineraries):
-            if index in used_itineraries:
+    visited_invoices = set()
+    visited_itineraries = set()
+    for start_invoice in range(len(invoices)):
+        if start_invoice in visited_invoices or not adjacency[start_invoice]:
+            continue
+        component_invoices = set()
+        component_itineraries = set()
+        pending_invoices = [start_invoice]
+        while pending_invoices:
+            invoice_index = pending_invoices.pop()
+            if invoice_index in component_invoices:
                 continue
-            itinerary_amount = norm_amount(itinerary.get("amount", ""))
-            if _amounts_match_for_ride(invoice_amount, itinerary_amount):
-                matches.append((index, itinerary))
-        if len(matches) == 1:
-            index, itinerary = matches[0]
-            used_itineraries.add(index)
-            required.append({
-                "pair_key": f"ride:{invoice_amount}:{invoice.get('truth_id')}:{itinerary.get('truth_id')}",
-                "amount": invoice_amount,
-                "invoice_truth_id": invoice.get("truth_id"),
-                "itinerary_truth_id": itinerary.get("truth_id"),
-            })
+            component_invoices.add(invoice_index)
+            for itinerary_index in adjacency[invoice_index]:
+                if itinerary_index in component_itineraries:
+                    continue
+                component_itineraries.add(itinerary_index)
+                pending_invoices.extend(
+                    other_invoice
+                    for other_invoice, matches in adjacency.items()
+                    if itinerary_index in matches and other_invoice not in component_invoices
+                )
+        visited_invoices.update(component_invoices)
+        visited_itineraries.update(component_itineraries)
+        invoice_truth_ids = sorted(str(invoices[index].get("truth_id", "")) for index in component_invoices)
+        companion_truth_ids = sorted(str(itineraries[index].get("truth_id", "")) for index in component_itineraries)
+        amounts = sorted({norm_amount(invoices[index].get("amount", "")) for index in component_invoices})
+        pair_key = f"ride:{'+'.join(amounts)}"
+        is_required = len(component_invoices) == 1 and len(component_itineraries) == 1
+        required.append({
+            "pair_key": pair_key,
+            "status": "required" if is_required else "ambiguous",
+            "invoice_truth_ids": invoice_truth_ids,
+            "companion_truth_ids": companion_truth_ids,
+            "reason": (
+                "single_ride_invoice_and_itinerary_have_compatible_amounts"
+                if is_required else "multiple_ride_pairings_share_amount"
+            ),
+        })
     return required
 
 
@@ -404,8 +621,11 @@ def ride_pair_is_combined(invoice_artifact: dict, itinerary_artifact: dict) -> b
 def evaluate_p2_pairs(manifest: dict, matched_by_truth_id: dict[str, dict]) -> dict:
     bad_rows = []
     for pair in infer_required_hotel_pairs(manifest.get("included", [])):
-        invoice_artifact = matched_by_truth_id.get(pair["invoice_truth_id"])
-        folio_artifact = matched_by_truth_id.get(pair["folio_truth_id"])
+        if pair["status"] == "ambiguous":
+            bad_rows.append(pair)
+            continue
+        invoice_artifact = matched_by_truth_id.get(pair["invoice_truth_ids"][0])
+        folio_artifact = matched_by_truth_id.get(pair["companion_truth_ids"][0])
         if not invoice_artifact or not folio_artifact:
             continue
         if not hotel_pair_is_combined(invoice_artifact, folio_artifact):
@@ -416,8 +636,11 @@ def evaluate_p2_pairs(manifest: dict, matched_by_truth_id: dict[str, dict]) -> d
                 "folio_path": folio_artifact.get("path", ""),
             })
     for pair in infer_required_ride_pairs(manifest.get("included", [])):
-        invoice_artifact = matched_by_truth_id.get(pair["invoice_truth_id"])
-        itinerary_artifact = matched_by_truth_id.get(pair["itinerary_truth_id"])
+        if pair["status"] == "ambiguous":
+            bad_rows.append(pair)
+            continue
+        invoice_artifact = matched_by_truth_id.get(pair["invoice_truth_ids"][0])
+        itinerary_artifact = matched_by_truth_id.get(pair["companion_truth_ids"][0])
         if not invoice_artifact or not itinerary_artifact:
             continue
         if not ride_pair_is_combined(invoice_artifact, itinerary_artifact):
@@ -437,6 +660,7 @@ def evaluate_p2_pairs(manifest: dict, matched_by_truth_id: dict[str, dict]) -> d
 
 def compare(manifest: dict, run_root: Path) -> dict:
     artifacts, output_hashes = load_artifacts(run_root)
+    assignments = assign_truth_matches(manifest.get("included", []), artifacts, output_hashes)
     p0_rows = []
     matched_rows = []
     manual_check_rows = []
@@ -445,7 +669,7 @@ def compare(manifest: dict, run_root: Path) -> dict:
     matched_by_truth_id = {}
 
     for row in manifest.get("included", []):
-        artifact, method = match_truth(row, artifacts, output_hashes)
+        artifact, method = assignments[str(row.get("truth_id", ""))]
         if not artifact:
             p0_rows.append({
                 "truth_id": row.get("truth_id"),
@@ -559,6 +783,11 @@ def write_markdown(result: dict, path: Path):
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def strict_exit_code(summary: dict) -> int:
+    counts = {key: int(summary.get(key, 0) or 0) for key in ("p0", "p1", "p2", "manual")}
+    return 1 if any(counts.values()) else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Strictly compare a finalized invoice truth set with a batch run.")
     parser.add_argument("--truth-manifest", required=True)
@@ -577,7 +806,7 @@ def main():
     comparison_report = output.parent / "comparison_report.md"
     if comparison_report.name != markdown_output.name:
         comparison_report.write_text(markdown_output.read_text(encoding="utf-8"), encoding="utf-8")
-    print(json.dumps({
+    summary = {
         "p0_count": result["p0_conclusion"]["count"],
         "p0_passed": result["p0_conclusion"]["passed"],
         "user_p1_count": result["user_p1_conclusion"]["count"],
@@ -585,9 +814,14 @@ def main():
         "p2_passed": result["p2_conclusion"]["passed"],
         "manual_check_count": len(result["manual_check_rows"]),
         "output": str(output),
-    }, ensure_ascii=False, indent=2))
-    if result["p0_conclusion"]["count"]:
-        raise SystemExit(2)
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    raise SystemExit(strict_exit_code({
+        "p0": summary["p0_count"],
+        "p1": summary["user_p1_count"],
+        "p2": summary["p2_count"],
+        "manual": summary["manual_check_count"],
+    }))
 
 
 if __name__ == "__main__":
