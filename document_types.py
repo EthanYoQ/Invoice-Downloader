@@ -5,6 +5,8 @@
 新增类型只需在 DOCUMENT_TYPES 字典中加一个条目。
 """
 
+from collections.abc import Callable
+import re
 from typing import NewType, cast
 
 MANUAL_REVIEW_FOLDER = "待人工复核"
@@ -34,6 +36,102 @@ DOCUMENT_TYPES = {
 }
 
 DocumentType = NewType("DocumentType", str)
+
+STRONG_TRAIN_EVIDENCE_REASON = "CLASSIFIED_AS_TRAIN_BY_STRONG_EVIDENCE"
+
+
+def _compact_evidence_text(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip().lower()
+
+
+def looks_like_train_ticket(
+    doc_type: object,
+    seller: object,
+    info_json: dict | None,
+    info: dict | None,
+    file_name: object,
+    *,
+    preview_loader: Callable[[], str] | None = None,
+) -> bool:
+    """Preserve the legacy strong train-ticket evidence decision exactly."""
+    compact_doc_type = _compact_evidence_text(doc_type)
+    compact_seller = _compact_evidence_text(seller)
+    compact_train = _compact_evidence_text("火车票")
+    compact_rail = _compact_evidence_text("铁路")
+    compact_bullet = _compact_evidence_text("高铁")
+    compact_ticket = _compact_evidence_text("铁路电子客票")
+
+    if any(
+        token in compact_doc_type
+        for token in (compact_train, compact_rail, compact_bullet)
+    ):
+        return True
+    if _compact_evidence_text("中国铁路") in compact_seller:
+        return True
+
+    fields = info_json or {}
+    metadata = info or {}
+    departure_city = str(fields.get("Departure_City", "") or "").strip()
+    destination_city = str(fields.get("Destination_City", "") or "").strip()
+    context_parts = [
+        str(file_name or ""),
+        str(metadata.get("subject", "") or ""),
+        str(metadata.get("attachment_name", "") or ""),
+        str(metadata.get("original_filename", "") or ""),
+    ]
+    compact_context = _compact_evidence_text(
+        " ".join(part for part in context_parts if part)
+    )
+    evidence_tokens = (
+        compact_ticket,
+        compact_train,
+        compact_rail,
+        compact_bullet,
+        "12306",
+    )
+    if departure_city and destination_city and any(
+        token in compact_context for token in evidence_tokens
+    ):
+        return True
+
+    if not departure_city or not destination_city:
+        return False
+    if compact_doc_type not in {
+        _compact_evidence_text("机票"),
+        _compact_evidence_text("航班行程单"),
+    }:
+        return False
+
+    preview_text = preview_loader() if preview_loader is not None else ""
+    compact_preview = _compact_evidence_text(preview_text)
+    return any(token in compact_preview for token in evidence_tokens)
+
+
+def apply_strong_train_evidence_override(
+    normalized_type: str,
+    original_type: str,
+    seller: str,
+    info_json: dict,
+    info: dict,
+    file_name: str,
+    *,
+    preview_loader: Callable[[], str] | None = None,
+) -> tuple[str, list[str]]:
+    if _compact_evidence_text(normalized_type) not in {
+        _compact_evidence_text("机票"),
+        _compact_evidence_text("航班行程单"),
+    }:
+        return normalized_type, []
+    if not looks_like_train_ticket(
+        original_type,
+        seller,
+        info_json,
+        info,
+        file_name,
+        preview_loader=preview_loader,
+    ):
+        return normalized_type, []
+    return "火车票", [STRONG_TRAIN_EVIDENCE_REASON]
 
 
 def get_document_type_names() -> list[str]:

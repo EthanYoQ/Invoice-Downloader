@@ -42,6 +42,22 @@ class DocumentAcceptanceService:
             "is_invoice": fields.get("is_invoice", True),
         }
 
+    @staticmethod
+    def write_canonical_fields(
+        info_json: dict[str, Any], snapshot: dict[str, Any] | None
+    ) -> None:
+        if not snapshot:
+            return
+        for field in (
+            "Date",
+            "Amount",
+            "Purchaser",
+            "Seller",
+            "InvoiceCode",
+            "InvoiceNumber",
+        ):
+            info_json[field] = snapshot[field]
+
     def evaluate(
         self,
         metadata: dict[str, Any],

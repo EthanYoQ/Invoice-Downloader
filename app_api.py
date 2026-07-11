@@ -1285,42 +1285,17 @@ class InvoiceAppAPI:
         return ""
 
     def _looks_like_train_ticket(self, doc_type, seller, info_json, info, file_name, pdf_path=""):
-        compact_doc_type = self._compact_text(doc_type)
-        compact_seller = self._compact_text(seller)
-        compact_train = self._compact_text("\u706b\u8f66\u7968")
-        compact_rail = self._compact_text("\u94c1\u8def")
-        compact_bullet = self._compact_text("\u9ad8\u94c1")
-        compact_ticket = self._compact_text("\u94c1\u8def\u7535\u5b50\u5ba2\u7968")
-        compact_rail_seller = self._compact_text("\u4e2d\u56fd\u94c1\u8def")
+        from document_types import looks_like_train_ticket
 
-        if any(token in compact_doc_type for token in (compact_train, compact_rail, compact_bullet)):
-            return True
-        if compact_rail_seller in compact_seller:
-            return True
-
-        departure_city = str((info_json or {}).get("Departure_City", "") or "").strip()
-        destination_city = str((info_json or {}).get("Destination_City", "") or "").strip()
-        context_parts = [
-            str(file_name or ""),
-            str((info or {}).get("subject", "") or ""),
-            str((info or {}).get("attachment_name", "") or ""),
-            str((info or {}).get("original_filename", "") or ""),
-        ]
-        compact_context = self._compact_text(" ".join(part for part in context_parts if part))
-        if departure_city and destination_city and any(
-            token in compact_context for token in (compact_ticket, compact_train, compact_rail, compact_bullet, "12306")
-        ):
-            return True
-
-        if not departure_city or not destination_city:
-            return False
-        if compact_doc_type not in {self._compact_text("\u673a\u7968"), self._compact_text("\u822a\u73ed\u884c\u7a0b\u5355")}:
-            return False
-
-        preview_text = self._extract_pdf_preview_text(pdf_path, max_pages=1)
-        compact_preview = self._compact_text(preview_text)
-        return any(
-            token in compact_preview for token in (compact_ticket, compact_train, compact_rail, compact_bullet, "12306")
+        return looks_like_train_ticket(
+            doc_type,
+            seller,
+            info_json,
+            info,
+            file_name,
+            preview_loader=lambda: self._extract_pdf_preview_text(
+                pdf_path, max_pages=1
+            ),
         )
 
     def _provider_fields_match(self, expected_fields, normalized_snapshot, info_json, recovered_fields=None):

@@ -318,3 +318,39 @@ git diff --check HEAD^ HEAD: passed
 Strict output: tmp/strict_truth_audit_3fe4c05_20260711T184430Z.json
 Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
 ```
+
+## Final Normalization and Strong Train-Evidence Remediation
+
+The final two Important findings were closed after `2c8ed535` without touching
+`stash@{0}` or starting Task 9.
+
+- After provider acceptance succeeds, the canonical normalized Date, Amount,
+  Purchaser, Seller, InvoiceCode, and InvoiceNumber are written back before
+  type/company classification, business dedupe, frontend state, and routing.
+  The legacy `unknown` defaults and string coercion remain unchanged.
+- The strong train-evidence rule now lives in `document_types`. The AppAPI
+  method is a compatibility delegate, while the production archive adapter
+  applies the shared override after ordinary normalization and outside the CWT
+  branch. The stable trace reason remains
+  `CLASSIFIED_AS_TRAIN_BY_STRONG_EVIDENCE`.
+- RED tests reproduced the unnormalized standard filename and missing train
+  override. GREEN tests cover real standard routing, both model air types,
+  seller/12306/route/PDF evidence, a real airline negative, and CWT precedence.
+
+Pre-commit evidence:
+
+```text
+Reviewer suite: 48 passed
+Focused Task 8/refactor/P2/lifecycle/GLM/provider/email/security: 352 passed, 33 subtests passed
+Full pytest: 494 passed, 109 subtests passed
+py_compile: passed
+Task 8 Ruff: passed
+AppAPI non-baseline Ruff: passed
+AppAPI full Ruff baseline: unchanged 4 findings from 2c8ed535
+git diff --check: passed
+Strict output: tmp/strict_truth_audit_task8_final_two_precommit_20260711T185714Z.json
+Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
+```
+
+As before, this strict check re-audits an older accepted output. A fresh clean
+mailbox batch on the current code remains the final release gate.

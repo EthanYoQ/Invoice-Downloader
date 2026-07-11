@@ -121,6 +121,7 @@ class AppArchiveAdapter:
         from app_api import normalize_document_type_for_archive
         from company_rules import classify_purchaser_relation
         from document_types import (
+            apply_strong_train_evidence_override,
             classify_cwt_document_type,
             get_archive_folder,
             is_exempt_type,
@@ -149,6 +150,13 @@ class AppArchiveAdapter:
         acceptance_rejected = not acceptance.get("accepted", True)
         if acceptance_rejected:
             payload["archive_status"] = "acceptance_rejected"
+        else:
+            from document_acceptance import DocumentAcceptanceService
+
+            normalized_snapshot = self.acceptance_service.normalized_snapshot(info_json)
+            DocumentAcceptanceService.write_canonical_fields(
+                info_json, normalized_snapshot
+            )
         original_type = str(info_json.get("Type") or "")
         seller = str(info_json.get("Seller") or "")
         is_cwt = (
@@ -188,7 +196,25 @@ class AppArchiveAdapter:
             doc_type, reason_codes = normalize_document_type_for_archive(
                 info_json, file_name
             )
-            if original_type in {"住宿确认单", "航班行程单", "差旅服务费"}:
+            preview_reader = getattr(self.api, "_extract_pdf_preview_text", None)
+            doc_type, train_reason_codes = apply_strong_train_evidence_override(
+                doc_type,
+                original_type,
+                seller,
+                info_json,
+                metadata,
+                file_name,
+                preview_loader=(
+                    lambda: preview_reader(pdf_path, max_pages=1)
+                    if callable(preview_reader)
+                    else ""
+                ),
+            )
+            reason_codes.extend(train_reason_codes)
+            if (
+                not train_reason_codes
+                and original_type in {"住宿确认单", "航班行程单", "差旅服务费"}
+            ):
                 doc_type = original_type
                 reason_codes.append("PRESERVED_REGISTERED_SUPPORTING_TYPE")
         info_json["Type"] = doc_type

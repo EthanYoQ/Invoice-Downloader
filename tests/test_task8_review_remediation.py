@@ -1013,3 +1013,174 @@ def _adapter(tmp_path, api, extractor, trace_store=None):
         acceptance_service=acceptance,
         pairing_finalizer=lambda *_args: None,
     )
+
+
+def test_production_adapter_writes_normalized_snapshot_before_standard_route(
+    tmp_path: Path,
+):
+    from invoice_extractor import InvoiceExtractor
+
+    source = tmp_path / "raw.pdf"
+    source.write_bytes(b"%PDF-1.4\nnormalized route")
+    outcome = _resolved_outcome(
+        source,
+        info_json={
+            "Date": "2026-06-10",
+            "Amount": "¥ 1,000.00",
+            "Purchaser": "辉瑞投资有限公司",
+            "Seller": "标准商户",
+            "InvoiceCode": "  CODE  ",
+            "InvoiceNumber": "  NUMBER  ",
+            "Type": "餐饮",
+        },
+    )
+    extractor = InvoiceExtractor.__new__(InvoiceExtractor)
+    extractor.output_dir = str(tmp_path / "output")
+    extractor.last_route_trace = {}
+    trace_store = _TraceStore()
+    adapter = _adapter(tmp_path, _ArchiveAPI(), extractor, trace_store)
+
+    report = ArchiveService(
+        normalizer=adapter.normalize,
+        classifier=adapter.classify,
+        archive_operation=adapter.archive_operation,
+        dedupe_key=adapter.dedupe_key,
+        finalizer=adapter.finalize,
+    ).archive([outcome], tmp_path)
+
+    archived = report.outcomes[0]
+    assert archived.outcome.status == "resolved"
+    assert Path(archived.archive_path).name == "20260610_餐饮_1000.00_标准商户.pdf"
+    assert adapter.pairing_metadata[str(archived.archive_path)]["date"] == "20260610"
+    assert adapter.pairing_metadata[str(archived.archive_path)]["amount"] == "1000.00"
+    normalized = trace_store.fields[outcome.candidate.identity.document_id][
+        "normalized_fields"
+    ]
+    assert {field: normalized[field] for field in (
+        "Date",
+        "Amount",
+        "Purchaser",
+        "Seller",
+        "InvoiceCode",
+        "InvoiceNumber",
+    )} == {
+        "Date": "20260610",
+        "Amount": "1000.00",
+        "Purchaser": "辉瑞投资有限公司",
+        "Seller": "标准商户",
+        "InvoiceCode": "CODE",
+        "InvoiceNumber": "NUMBER",
+    }
+
+
+@pytest.mark.parametrize("model_type", ["机票", "航班行程单"])
+def test_strong_train_evidence_overrides_model_air_type_in_adapter(
+    tmp_path: Path, model_type: str
+):
+    from app_api import InvoiceAppAPI
+
+    source = tmp_path / "ticket.pdf"
+    source.write_bytes(b"%PDF-1.4\ntrain")
+    api = InvoiceAppAPI()
+    api._inspect_pdf_health = lambda _path: {"pdf_health_class": "healthy"}
+    api._extract_pdf_preview_text = lambda *_args, **_kwargs: "铁路电子客票 12306"
+    outcome = _resolved_outcome(
+        source,
+        metadata={"subject": "电子客票"},
+        info_json={
+            "Type": model_type,
+            "Seller": "中国铁路",
+            "Departure_City": "北京",
+            "Destination_City": "上海",
+        },
+    )
+
+    payload = _adapter(tmp_path, api, _ArchiveExtractor([])).normalize(outcome)
+
+    assert payload["info_json"]["Type"] == "火车票"
+    assert "CLASSIFIED_AS_TRAIN_BY_STRONG_EVIDENCE" in payload[
+        "classification_reason_codes"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "info_json", "expected_type"),
+    [
+        (
+            {"subject": "航空电子客票"},
+            {
+                "Type": "机票",
+                "Seller": "中国东方航空股份有限公司",
+                "Departure_City": "北京",
+                "Destination_City": "上海",
+            },
+            "机票",
+        ),
+        (
+            {"sender": "notification@citsgbt.com", "subject": "CWT flight"},
+            {
+                "Type": "机票",
+                "Seller": "中国铁路",
+                "Departure_City": "北京",
+                "Destination_City": "上海",
+            },
+            "航班行程单",
+        ),
+    ],
+)
+def test_strong_train_override_does_not_capture_airline_or_cwt(
+    tmp_path: Path, metadata: dict, info_json: dict, expected_type: str
+):
+    from app_api import InvoiceAppAPI
+
+    source = tmp_path / "travel.pdf"
+    source.write_bytes(b"%PDF-1.4\ntravel")
+    api = InvoiceAppAPI()
+    api._inspect_pdf_health = lambda _path: {"pdf_health_class": "healthy"}
+    api._extract_pdf_preview_text = lambda *_args, **_kwargs: "航空电子客票"
+    outcome = _resolved_outcome(source, metadata=metadata, info_json=info_json)
+
+    payload = _adapter(tmp_path, api, _ArchiveExtractor([])).normalize(outcome)
+
+    assert payload["info_json"]["Type"] == expected_type
+    assert "CLASSIFIED_AS_TRAIN_BY_STRONG_EVIDENCE" not in payload[
+        "classification_reason_codes"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("seller", "subject", "preview", "expected"),
+    [
+        ("中国铁路", "电子客票", "", True),
+        ("其他承运人", "12306 电子客票", "", True),
+        ("其他承运人", "电子客票", "铁路电子客票", True),
+        ("中国东方航空", "航空电子客票", "航空电子客票", False),
+    ],
+)
+def test_app_api_train_compatibility_delegate_matches_shared_rule(
+    seller: str, subject: str, preview: str, expected: bool
+):
+    from app_api import InvoiceAppAPI
+    from document_types import looks_like_train_ticket
+
+    info_json = {
+        "Departure_City": "北京",
+        "Destination_City": "上海",
+    }
+    info = {"subject": subject}
+    api = InvoiceAppAPI()
+    api._extract_pdf_preview_text = lambda *_args, **_kwargs: preview
+
+    shared = looks_like_train_ticket(
+        "机票",
+        seller,
+        info_json,
+        info,
+        "ticket.pdf",
+        preview_loader=lambda: preview,
+    )
+
+    assert shared is expected
+    assert api._looks_like_train_ticket(
+        "机票", seller, info_json, info, "ticket.pdf", pdf_path="ticket.pdf"
+    ) is expected
