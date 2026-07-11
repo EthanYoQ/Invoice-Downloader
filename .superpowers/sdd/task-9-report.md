@@ -93,3 +93,17 @@ the hardened audit still reports the finalized 215-row truth consistently, but
 does not prove this coordinator code produced those artifacts. The fresh clean
 mailbox run remains a later whole-project release gate and is not part of Task
 9 acceptance.
+
+## Post-Commit Evidence
+
+```text
+Code commit: fa28b28
+Evidence report commit: abc9205
+Coordinator/GLM/email/provider/URL/security/P2 focus: 327 passed, 33 subtests passed
+Full pytest: 518 passed, 109 subtests passed
+Ruff, py_compile, git diff --check: passed
+Strict output: tmp/strict_truth_audit_abc9205_20260711T191850Z.json
+Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
+Worktree: clean
+Stash: stash@{0} preserved and untouched
+```
