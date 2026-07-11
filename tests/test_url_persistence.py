@@ -7,8 +7,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from app_api import (
     InvoiceAppAPI,
+    ProcessingLoopFailure,
     _FallbackDocumentTraceStore,
     build_processing_history_key,
 )
@@ -372,11 +375,12 @@ def test_live_progress_poll_before_url_finally_never_exposes_candidate_identity(
         patch("pdf_converter.PDFConverter.process_invoice_links", pause_after_pre_browser_log),
         patch("app_api.time.sleep", return_value=None),
     ):
-        api._run_processing_loop(
-            [candidate],
-            api_key="synthetic",
-            save_path=str(tmp_path / "output"),
-        )
+        with pytest.raises(ProcessingLoopFailure, match="PROCESSING_PIPELINE_INCOMPLETE"):
+            api._run_processing_loop(
+                [candidate],
+                api_key="synthetic",
+                save_path=str(tmp_path / "output"),
+            )
 
     rendered = json.dumps(captured["progress"], ensure_ascii=False, default=str)
     assert "URL-candidate-" in rendered
@@ -480,9 +484,10 @@ def test_live_purchaser_mismatch_log_redacts_url_candidate_but_preserves_attachm
     class FakeExtractor:
         last_extraction_trace = {}
         last_timing_trace = {}
+        last_route_trace = {}
 
-        def __init__(self, api_key, output_dir):
-            del api_key, output_dir
+        def __init__(self, api_key, output_dir, **kwargs):
+            del api_key, output_dir, kwargs
             self.processed_records_file = ""
 
         def load_processed_records(self):
@@ -491,6 +496,19 @@ def test_live_purchaser_mismatch_log_redacts_url_candidate_but_preserves_attachm
         def pdf_to_base64_image(self, pdf_path):
             del pdf_path
             return "c3ludGhldGlj"
+
+        def probe_local_only(self, pdf_path, document_context=None):
+            del pdf_path, document_context
+            return type(
+                "Probe",
+                (),
+                {
+                    "status": "needs_remote",
+                    "result": None,
+                    "reason_code": "LOCAL_PROBE_UNRESOLVED",
+                    "engine": "",
+                },
+            )()
 
         def extract_info_via_llm(self, *args, **kwargs):
             del args, kwargs
@@ -504,6 +522,15 @@ def test_live_purchaser_mismatch_log_redacts_url_candidate_but_preserves_attachm
                 "InvoiceNumber": "INVOICE-NUMBER-SECRET",
                 "is_invoice": True,
             }
+
+        extract_remote_only = extract_info_via_llm
+
+        def close(self):
+            pass
+
+        def route_and_rename_file(self, pdf_path, _info, custom_rules=None):
+            del custom_rules
+            return True, pdf_path
 
     def run_candidate(info, case_dir):
         api = InvoiceAppAPI()

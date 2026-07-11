@@ -72,6 +72,56 @@ def test_candidate_document_identity_is_stable_when_input_order_changes():
     assert [candidate.sequence for candidate in reverse] == [0, 1]
 
 
+def test_canonical_identity_uses_email_alias_and_attachment_content_digest(tmp_path: Path):
+    first = tmp_path / "same.pdf"
+    second_dir = tmp_path / "other"
+    second_dir.mkdir()
+    second = second_dir / "same.pdf"
+    first.write_bytes(b"first-content")
+    second.write_bytes(b"second-content")
+
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": str(first), "email_id": "mail-1"},
+            {"filepath": str(second), "source_email_id": "mail-1"},
+        ]
+    )
+
+    assert candidates[0].identity.source_message_uid == "mail-1"
+    assert candidates[1].identity.source_message_uid == "mail-1"
+    assert candidates[0].identity.document_id != candidates[1].identity.document_id
+    assert all(len(candidate.identity.document_id) == 64 for candidate in candidates)
+
+
+def test_canonical_url_identity_is_scoped_by_email_without_storing_raw_url():
+    raw_url = "HTTPS://Example.COM/path/invoice?id=secret#fragment"
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": raw_url, "source_url": raw_url, "email_id": "mail-1", "is_url": True},
+            {"filepath": raw_url, "source_url": raw_url, "email_id": "mail-2", "is_url": True},
+        ]
+    )
+
+    assert candidates[0].identity.document_id != candidates[1].identity.document_id
+    assert raw_url not in candidates[0].identity.source_locator
+    assert candidates[0].identity.source_locator.startswith("url_sha256:")
+    assert "secret" not in candidates[0].source_filename
+    assert raw_url not in repr(candidates[0].trace_context)
+
+
+def test_candidate_pipeline_never_uses_incoming_legacy_document_id_for_lookup(tmp_path: Path):
+    source = tmp_path / "invoice.pdf"
+    source.write_bytes(b"canonical-content")
+
+    candidate = CandidatePipeline().collect(
+        [{"filepath": str(source), "email_id": "mail-1", "document_id": "legacy-md5"}]
+    )[0]
+
+    assert candidate.identity.document_id != "legacy-md5"
+    assert len(candidate.identity.document_id) == 64
+    assert candidate.trace_context["legacy_document_id"] != candidate.identity.document_id
+
+
 def test_malformed_candidate_is_retained_as_explicit_manual_legacy_row():
     candidates = CandidatePipeline().collect([None, {"subject": "missing path"}])
 
@@ -107,6 +157,34 @@ def test_extraction_outcome_payload_is_deeply_immutable_and_can_be_thawed():
     assert outcome.to_legacy_payload() == {"nested": {"values": [1, 2]}}
     with pytest.raises((AttributeError, TypeError)):
         outcome.payload["nested"]["values"] += (3,)  # type: ignore[index,operator]
+
+
+def test_extraction_outcome_trace_context_is_deeply_immutable():
+    trace = {"nested": {"events": ["start"]}}
+    outcome = ExtractionOutcome(
+        candidate=_candidate(0),
+        status="resolved",
+        payload={},
+        trace_context=trace,
+    )
+    trace["nested"]["events"].append("late")
+
+    assert outcome.to_legacy_trace_context() == {"nested": {"events": ["start"]}}
+    with pytest.raises((AttributeError, TypeError)):
+        outcome.trace_context["nested"]["events"] += ("late",)  # type: ignore[index,operator]
+
+
+def test_extraction_outcome_inherits_candidate_legacy_trace_shape_by_default():
+    base = _candidate(0)
+    candidate = DocumentCandidate(
+        identity=base.identity,
+        sequence=0,
+        trace_context={"legacy_document_id": "trace-only"},
+    )
+
+    outcome = ExtractionOutcome.resolved(candidate, {"ok": True})
+
+    assert outcome.to_legacy_trace_context() == {"legacy_document_id": "trace-only"}
 
 
 def test_unresolved_safe_remote_work_overlaps_but_never_exceeds_verified_two():
@@ -298,6 +376,96 @@ def test_pending_workers_check_stop_before_remote_side_effects():
     ]
 
 
+def test_incremental_scheduler_stops_submitting_after_first_quota_terminal():
+    from glm_runtime import GlmRequestError
+
+    remote_calls = []
+
+    def remote(candidate):
+        remote_calls.append(candidate.sequence)
+        if candidate.sequence == 0:
+            raise GlmRequestError("text", http_status=402, reason="http_error")
+        time.sleep(0.05)
+        return {"sequence": candidate.sequence}
+
+    outcomes = ExtractionPipeline(
+        local_parser=lambda _candidate: None,
+        remote_extractor=remote,
+        max_workers=2,
+        verified_ceiling=lambda: 2,
+    ).extract([_candidate(index) for index in range(5)])
+
+    assert len(remote_calls) <= 2
+    assert len(outcomes) == 5
+    assert outcomes[0].status == "quota_exhausted"
+    assert all(outcome.is_terminal for outcome in outcomes)
+    assert all(
+        outcome.status == "quota_exhausted" for outcome in outcomes[2:]
+    )
+    assert all("secret" not in outcome.message for outcome in outcomes)
+
+
+def test_executor_submit_exception_becomes_outcome_and_later_candidate_continues(monkeypatch):
+    import extraction_pipeline as module
+
+    real_executor = module.ThreadPoolExecutor
+    submit_count = 0
+
+    class SubmitFailingExecutor(real_executor):
+        def submit(self, fn, /, *args, **kwargs):
+            nonlocal submit_count
+            submit_count += 1
+            if submit_count == 1:
+                raise RuntimeError("submit secret")
+            return super().submit(fn, *args, **kwargs)
+
+    monkeypatch.setattr(module, "ThreadPoolExecutor", SubmitFailingExecutor)
+    outcomes = ExtractionPipeline(
+        local_parser=lambda _candidate: None,
+        remote_extractor=lambda candidate: {"sequence": candidate.sequence},
+        max_workers=1,
+    ).extract([_candidate(0), _candidate(1)])
+
+    assert [outcome.status for outcome in outcomes] == ["unresolved", "resolved"]
+    assert "secret" not in outcomes[0].message
+
+
+def test_remote_completion_emits_progress_before_slower_batch_finishes():
+    first_done = threading.Event()
+    release_second = threading.Event()
+    progress = []
+
+    def remote(candidate):
+        if candidate.sequence == 0:
+            first_done.set()
+            return {"sequence": 0}
+        assert release_second.wait(timeout=2)
+        return {"sequence": 1}
+
+    pipeline = ExtractionPipeline(
+        local_parser=lambda _candidate: None,
+        remote_extractor=remote,
+        max_workers=2,
+        progress_callback=lambda completed, total, percent: progress.append(
+            (completed, total, percent)
+        ),
+    )
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.extend(pipeline.extract([_candidate(0), _candidate(1)]))
+    )
+    worker.start()
+    assert first_done.wait(timeout=2)
+    deadline = time.time() + 2
+    while time.time() < deadline and not any(completed == 1 for completed, *_ in progress):
+        time.sleep(0.01)
+
+    assert any(completed == 1 for completed, *_ in progress)
+    release_second.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+
+
 def test_duplicate_sequences_do_not_overwrite_or_hide_terminal_outcomes():
     first = _candidate(0, name="a.pdf")
     second = _candidate(0, name="b.pdf")
@@ -392,6 +560,76 @@ def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_p
     assert events == 2
 
 
+def test_archive_pairing_finalizer_renames_hotel_pair_adjacent_and_reports_count(tmp_path: Path):
+    from archive_service import reconcile_archive_pairs
+
+    hotel = tmp_path / "住宿发票"
+    hotel.mkdir()
+    invoice = hotel / "20260610_住宿发票_424.15_上海锐丞酒店管理有限公司.pdf"
+    folio = hotel / "20260610_住宿水单_424.15_上海张江CitiGO欢阁酒店.pdf"
+    invoice.write_bytes(b"invoice")
+    folio.write_bytes(b"folio")
+
+    counts = reconcile_archive_pairs(tmp_path)
+    names = sorted(path.name for path in hotel.iterdir())
+
+    assert counts == {"ride": 0, "hotel": 1}
+    assert names == [
+        "20260610-住宿-01-发票_424.15元.pdf",
+        "20260610-住宿-01-水单_424.15元.pdf",
+    ]
+
+
+def test_archive_pairing_updates_trace_targets_and_combine_results(tmp_path: Path):
+    from archive_service import reconcile_archive_pairs
+
+    hotel = tmp_path / "住宿发票"
+    hotel.mkdir()
+    invoice = hotel / "20260610_住宿发票_424.15_酒店.pdf"
+    folio = hotel / "20260610_住宿水单_424.15_酒店.pdf"
+    invoice.write_bytes(b"invoice")
+    folio.write_bytes(b"folio")
+
+    class TraceStore:
+        ids = {str(invoice): "invoice-id", str(folio): "folio-id"}
+        fields = {}
+
+        def get_document_id_by_archive_target(self, path):
+            return self.ids.get(str(path))
+
+        def move_archive_target(self, source, target):
+            document_id = self.ids.pop(str(source))
+            self.ids[str(target)] = document_id
+
+        def set_fields(self, document_id, **fields):
+            self.fields[document_id] = fields
+
+    trace_store = TraceStore()
+    reconcile_archive_pairs(tmp_path, trace_store=trace_store)
+
+    assert trace_store.fields["invoice-id"]["combine_result"]["status"] == "matched"
+    assert trace_store.fields["folio-id"]["combine_result"]["status"] == "matched"
+    assert all(Path(path).exists() for path in trace_store.ids)
+
+
+def test_archive_pairing_fails_closed_before_overwriting_existing_target(tmp_path: Path):
+    from archive_service import reconcile_archive_pairs
+
+    hotel = tmp_path / "住宿发票"
+    hotel.mkdir()
+    invoice = hotel / "20260610_住宿发票_424.15_酒店.pdf"
+    folio = hotel / "20260610_住宿水单_424.15_酒店.pdf"
+    invoice.write_bytes(b"invoice")
+    folio.write_bytes(b"folio")
+    (hotel / "20260610-住宿-01-发票_424.15元.pdf").mkdir()
+
+    with pytest.raises(RuntimeError, match="ARCHIVE_PAIR_TARGET_COLLISION"):
+        reconcile_archive_pairs(tmp_path)
+
+    assert invoice.exists()
+    assert folio.exists()
+
+
 def test_progress_is_monotonic_bounded_and_has_stable_total():
     events: list[tuple[int, int, int]] = []
     candidates = [_candidate(index) for index in range(4)]
@@ -461,24 +699,42 @@ def test_executor_is_closed_when_submission_fails(monkeypatch):
     assert outcomes[0].status == "unresolved"
 
 
-def test_legacy_batch_delegate_receives_original_order_and_exact_candidate_count(tmp_path: Path):
-    received: list[list[dict]] = []
+def test_archive_service_owns_ordered_normalize_classify_write_and_finalize(tmp_path: Path):
+    calls = []
     candidates = [_candidate(index) for index in range(3)]
     outcomes = [
-        ExtractionOutcome.resolved(candidate, candidate.to_legacy())
+        ExtractionOutcome.resolved(candidate, {"sequence": candidate.sequence})
         for candidate in reversed(candidates)
     ]
-    service = ArchiveService(writer=lambda *_args: pytest.fail("single writer not used"))
-
-    result = service.delegate_batch(
-        outcomes,
-        tmp_path,
-        lambda legacy_rows: received.append(legacy_rows) or "legacy-result",
+    service = ArchiveService(
+        normalizer=lambda outcome: calls.append(("normalize", outcome.candidate.sequence))
+        or outcome.to_legacy_payload(),
+        classifier=lambda payload: calls.append(("classify", payload["sequence"]))
+        or "餐饮",
+        archive_operation=lambda outcome, payload, category, _root: calls.append(
+            ("write", outcome.candidate.sequence, payload["sequence"], category)
+        )
+        or str(tmp_path / f"{outcome.candidate.sequence}.pdf"),
+        finalizer=lambda report, _root: calls.append(
+            ("finalize", tuple(item.outcome.candidate.sequence for item in report.outcomes))
+        ),
     )
 
-    assert result == "legacy-result"
-    assert len(received[0]) == 3
-    assert [row["message_uid"] for row in received[0]] == ["uid-0", "uid-1", "uid-2"]
+    report = service.archive(outcomes, tmp_path)
+
+    assert report.can_complete is True
+    assert calls == [
+        ("normalize", 0),
+        ("classify", 0),
+        ("write", 0, 0, "餐饮"),
+        ("normalize", 1),
+        ("classify", 1),
+        ("write", 1, 1, "餐饮"),
+        ("normalize", 2),
+        ("classify", 2),
+        ("write", 2, 2, "餐饮"),
+        ("finalize", (0, 1, 2)),
+    ]
 
 
 def test_app_api_processing_compatibility_path_delegates_to_all_three_pipeline_modules():
@@ -488,240 +744,264 @@ def test_app_api_processing_compatibility_path_delegates_to_all_three_pipeline_m
 
     source = inspect.getsource(InvoiceAppAPI._run_processing_loop_with_extractor)
     assert "CandidatePipeline" in source
+    assert "CandidatePreflight" in source
     assert "ExtractionPipeline" in source
+    assert "SharedRuntimeRemoteExtractor" in source
     assert "ArchiveService" in source
-    assert "delegate_batch" in source
+    assert "AppArchiveAdapter" in source
+    assert ".archive(" in source
+    assert "delegate_batch" not in source
+    assert "_run_processing_loop_legacy_with_extractor" not in source
+    assert "def _prepare_local" not in source
+    assert "def _extract_remote" not in source
+    assert "def _default_archive_operation" not in source
+    assert len(source.splitlines()) < 180
 
 
-def test_app_api_pipeline_bridge_preserves_rows_extractor_and_call_shape():
-    from types import MethodType
-
-    from app_api import InvoiceAppAPI
-
-    api = object.__new__(InvoiceAppAPI)
-    calls = []
-
-    def legacy(
-        _self,
-        rows,
-        api_key,
-        save_path,
-        since_date,
-        before_date,
-        rules_text,
-        _extractor,
-        _prepared_extractions=None,
-    ):
-        assert _prepared_extractions == {}
-        calls.append(
-            (rows, api_key, save_path, since_date, before_date, rules_text, _extractor)
-        )
-        return "done"
-
-    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
-    rows = [
-        {
-            "filepath": "C:/staging/a.pdf",
-            "subject": "subject",
-            "nested": {"list": [1, 2]},
-        }
-    ]
-    extractor = object()
-
-    result = api._run_processing_loop_with_extractor(
-        rows,
-        "key",
-        "C:/output",
-        "2026-01-01",
-        "2026-01-02",
-        "rules",
-        _extractor=extractor,
-    )
-
-    assert result == "done"
-    assert calls == [
-        (
-            rows,
-            "key",
-            "C:/output",
-            "2026-01-01",
-            "2026-01-02",
-            "rules",
-            extractor,
-        )
-    ]
+def test_whole_batch_archive_delegate_is_removed():
+    assert not hasattr(ArchiveService, "delegate_batch")
 
 
-def test_app_api_safe_local_documents_use_shared_runtime_with_actual_overlap_max_two():
-    from types import MethodType, SimpleNamespace
+def test_production_app_bridge_models_once_archives_in_order_and_cleans_sidecar(tmp_path: Path):
+    from types import SimpleNamespace
 
     from app_api import InvoiceAppAPI
 
-    api = object.__new__(InvoiceAppAPI)
+    api = InvoiceAppAPI()
     api._stop_requested = False
-    received = []
-    prepared_results = {}
-    lock = threading.Lock()
-    barrier = threading.Barrier(2)
-    active = maximum = closed = 0
+    progress_events = []
+    api._safe_emit_stage_event = lambda stage, event, payload: progress_events.append(
+        (stage, event, payload)
+    )
+    api._run_processing_loop_legacy_with_extractor = lambda *_args, **_kwargs: pytest.fail(
+        "whole-batch legacy path must be unreachable"
+    )
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"{index}.pdf"
+        path.write_bytes((f"content-{index}" * 200).encode())
+        paths.append(path)
+    rows = [
+        {"filepath": str(paths[0]), "email_id": "mail-1"},
+        {"filepath": str(paths[1]), "email_id": "mail-1"},
+        {"filepath": str(paths[0]), "email_id": "mail-1"},
+    ]
+    model_calls = []
+    archive_order = []
 
     class OwnerExtractor:
         glm_runtime = SimpleNamespace(
-            profiles={
-                "ocr": SimpleNamespace(max_concurrency=2),
-                "text": SimpleNamespace(max_concurrency=2),
-                "vision_quality": SimpleNamespace(max_concurrency=2),
-            }
+            profiles={"text": SimpleNamespace(max_concurrency=2)}
         )
+
+        @staticmethod
+        def load_processed_records():
+            return {}
+
+        @staticmethod
+        def probe_local_only(_path, document_context=None):
+            del document_context
+            return SimpleNamespace(status="needs_remote", result=None, reason_code="LOCAL_PROBE_UNRESOLVED", engine="")
 
         @staticmethod
         def pdf_to_base64_image(path):
             return [f"image:{Path(path).name}"]
 
-    class WorkerExtractor:
+    class Worker:
         last_extraction_trace = {}
         last_timing_trace = {}
 
-        def extract_info_via_llm(self, _images, **context):
-            nonlocal active, maximum
-            with lock:
-                active += 1
-                maximum = max(maximum, active)
-            try:
-                if Path(context["pdf_path"]).stem in {"0", "1"}:
-                    barrier.wait(timeout=2)
-                else:
-                    time.sleep(0.02)
-                return {"Seller": Path(context["pdf_path"]).name}
-            finally:
-                with lock:
-                    active -= 1
+        @staticmethod
+        def extract_remote_only(_images, **context):
+            model_calls.append(context["pdf_path"])
+            return {
+                "is_invoice": True,
+                "Date": "20260601",
+                "Purchaser": "辉瑞投资有限公司",
+                "Seller": Path(context["pdf_path"]).stem,
+                "Amount": "1.00",
+                "Type": "餐饮",
+            }
 
-        def close(self):
-            nonlocal closed
-            closed += 1
+        @staticmethod
+        def close():
+            pass
 
-    def legacy(_self, rows, *_args, **kwargs):
-        received.extend(rows)
-        prepared_results.update(kwargs.get("_prepared_extractions") or {})
-        return "done"
+    def archive_operation(outcome, payload, _category, _root):
+        archive_order.append(outcome.candidate.sequence)
+        return payload["pdf_path"]
 
-    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
-    rows = [{"filepath": f"C:/staging/{index}.pdf"} for index in range(4)]
-
-    result = api._run_processing_loop_with_extractor(
+    report = api._run_processing_loop_with_extractor(
         rows,
         "key",
-        "C:/output",
-        "2026-01-01",
-        "2026-01-02",
-        "rules",
+        str(tmp_path / "output"),
         _extractor=OwnerExtractor(),
-        _worker_extractor_factory=lambda _runtime: WorkerExtractor(),
+        _worker_extractor_factory=lambda _runtime: Worker(),
+        _archive_operation=archive_operation,
+        _pairing_finalizer=lambda _report, _root: None,
     )
 
-    assert result == "done"
-    assert maximum == 2
-    assert closed == 4
-    assert [row["filepath"] for row in received] == [row["filepath"] for row in rows]
-    assert sorted(
-        prepared["info_json"]["Seller"] for prepared in prepared_results.values()
-    ) == [
-        "0.pdf",
-        "1.pdf",
-        "2.pdf",
-        "3.pdf",
-    ]
-    assert all("_pipeline_prepared" not in row for row in received)
+    assert len(model_calls) == 2
+    assert archive_order == [0, 1]
+    assert report.duplicate_count == 1
+    assert report.can_complete is True
+    assert any(event == "progress" for _stage, event, _payload in progress_events)
+    assert not hasattr(api, "_pipeline_sidecar")
 
 
-def test_app_api_retain_only_and_url_candidates_bypass_parallel_model_workers():
-    from types import MethodType, SimpleNamespace
+def test_production_app_bridge_quota_is_p0_fail_closed_and_never_completes(tmp_path: Path):
+    from types import SimpleNamespace
 
-    from app_api import InvoiceAppAPI
+    from app_api import InvoiceAppAPI, ProcessingLoopFailure
+    from glm_runtime import GlmRequestError
 
-    api = object.__new__(InvoiceAppAPI)
+    api = InvoiceAppAPI()
     api._stop_requested = False
-    received = []
-    prepared_results = {}
-    factories = 0
+    path = tmp_path / "invoice.pdf"
+    path.write_bytes(b"invoice" * 300)
 
     class OwnerExtractor:
-        glm_runtime = SimpleNamespace(profiles={})
+        glm_runtime = SimpleNamespace(
+            profiles={"text": SimpleNamespace(max_concurrency=2)}
+        )
+
+        @staticmethod
+        def load_processed_records():
+            return {}
+
+        @staticmethod
+        def probe_local_only(_path, document_context=None):
+            del document_context
+            return SimpleNamespace(status="needs_remote", result=None, reason_code="LOCAL_PROBE_UNRESOLVED", engine="")
 
         @staticmethod
         def pdf_to_base64_image(_path):
-            pytest.fail("retained and URL candidates stay on the legacy path")
+            return ["image"]
 
-    def factory(_runtime):
-        nonlocal factories
-        factories += 1
-        pytest.fail("worker must not be created")
+    class Worker:
+        @staticmethod
+        def extract_remote_only(*_args, **_kwargs):
+            raise GlmRequestError("text", http_status=402, reason="http_error")
 
-    def legacy(_self, rows, *_args, **kwargs):
-        received.extend(rows)
-        prepared_results.update(kwargs.get("_prepared_extractions") or {})
-        return "done"
+        @staticmethod
+        def close():
+            pass
 
-    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
-    rows = [
-        {"filepath": "C:/staging/retain.pdf", "candidate_action": "retain_only"},
-        {"filepath": "https://example.com/invoice", "is_url": True},
-    ]
+    terminal_statuses = []
 
-    result = api._run_processing_loop_with_extractor(
-        rows,
-        "key",
-        "C:/output",
-        _extractor=OwnerExtractor(),
-        _worker_extractor_factory=factory,
-    )
+    def retain_terminal(outcome, *_args):
+        from archive_service import ArchiveDecision
 
-    assert result == "done"
-    assert factories == 0
-    assert received == rows
+        terminal_statuses.append(outcome.status)
+        return ArchiveDecision(path=str(path), status="unresolved")
+
+    with pytest.raises(ProcessingLoopFailure, match="PROCESSING_PIPELINE_INCOMPLETE"):
+        api._run_processing_loop_with_extractor(
+            [{"filepath": str(path), "email_id": "mail-1"}],
+            "key",
+            str(tmp_path / "output"),
+            _extractor=OwnerExtractor(),
+            _worker_extractor_factory=lambda _runtime: Worker(),
+            _archive_operation=retain_terminal,
+            _pairing_finalizer=lambda _report, _root: None,
+        )
+    assert terminal_statuses == ["quota_exhausted"]
+    assert not hasattr(api, "_pipeline_sidecar")
 
 
-def test_app_api_local_conversion_exception_is_retained_for_legacy_handling():
-    from types import MethodType, SimpleNamespace
+def test_production_app_default_archive_operation_routes_local_result_once(tmp_path: Path):
+    from types import SimpleNamespace
 
     from app_api import InvoiceAppAPI
 
-    api = object.__new__(InvoiceAppAPI)
+    api = InvoiceAppAPI()
     api._stop_requested = False
-    received = []
-    prepared_results = {}
+    source = tmp_path / "invoice.pdf"
+    source.write_bytes(b"invoice" * 300)
+    routed = []
 
-    class OwnerExtractor:
+    class Extractor:
+        glm_runtime = SimpleNamespace(profiles={})
+        last_route_trace = {"status": "archived"}
+
+        @staticmethod
+        def load_processed_records():
+            return {}
+
+        @staticmethod
+        def probe_local_only(_path, document_context=None):
+            del document_context
+            return SimpleNamespace(
+                status="resolved",
+                result={
+                    "is_invoice": True,
+                    "Date": "20260601",
+                    "Purchaser": "辉瑞投资有限公司",
+                    "Seller": "Local Seller",
+                    "Amount": "1.00",
+                    "InvoiceCode": "",
+                    "InvoiceNumber": "",
+                    "Type": "餐饮",
+                },
+                reason_code="LOCAL_STANDARD_EINVOICE_PDF_FAST_PATH",
+                engine="local_standard_einvoice_pdf",
+            )
+
+        @staticmethod
+        def route_and_rename_file(path, info, custom_rules=None):
+            routed.append((path, info["Seller"], custom_rules))
+            return True, path
+
+    report = api._run_processing_loop_with_extractor(
+        [{"filepath": str(source), "email_id": "mail-1"}],
+        "key",
+        str(tmp_path / "output"),
+        _extractor=Extractor(),
+        _worker_extractor_factory=lambda _runtime: pytest.fail("local result bypasses model"),
+        _pairing_finalizer=lambda _report, _root: None,
+    )
+
+    assert report.archived_count == 1
+    assert report.can_complete is True
+    assert len(routed) == 1
+
+
+def test_production_app_history_duplicate_makes_zero_model_and_archive_calls(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from app_api import InvoiceAppAPI
+
+    api = InvoiceAppAPI()
+    api._stop_requested = False
+    source = tmp_path / "invoice.pdf"
+    source.write_bytes(b"invoice" * 300)
+    row = {"filepath": str(source), "email_id": "mail-1"}
+    document_id = CandidatePipeline().collect([row])[0].identity.document_id
+    api._load_committed_history = lambda _state_dir: {document_id}
+
+    class Extractor:
         glm_runtime = SimpleNamespace(profiles={})
 
         @staticmethod
-        def pdf_to_base64_image(_path):
-            raise ValueError("private local path")
+        def load_processed_records():
+            return {}
 
-    def legacy(_self, rows, *_args, **kwargs):
-        received.extend(rows)
-        prepared_results.update(kwargs.get("_prepared_extractions") or {})
-        return "done"
+        @staticmethod
+        def probe_local_only(*_args, **_kwargs):
+            pytest.fail("history duplicate must stop before local/model work")
 
-    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
-
-    result = api._run_processing_loop_with_extractor(
-        [{"filepath": "C:/staging/broken.pdf"}],
+    report = api._run_processing_loop_with_extractor(
+        [row],
         "key",
-        "C:/output",
-        _extractor=OwnerExtractor(),
-        _worker_extractor_factory=lambda _runtime: pytest.fail("remote must not run"),
+        str(tmp_path / "output"),
+        _extractor=Extractor(),
+        _worker_extractor_factory=lambda _runtime: pytest.fail("no model"),
+        _archive_operation=lambda *_args: pytest.fail("no archive"),
+        _pairing_finalizer=lambda _report, _root: None,
     )
 
-    assert result == "done"
-    assert list(prepared_results.values()) == [
-        {
-            "base64_img": None,
-            "preprocess_error_type": "ValueError",
-        }
-    ]
-    assert "_pipeline_prepared" not in received[0]
+    assert report.duplicate_count == 1
+    assert report.can_complete is True
 
 
 def test_worker_local_extractor_close_does_not_close_shared_run_runtime(tmp_path: Path):
@@ -746,106 +1026,90 @@ def test_worker_local_extractor_close_does_not_close_shared_run_runtime(tmp_path
     assert closes == 0
 
 
-def test_app_api_worker_factory_failure_reaches_legacy_retention_then_fails_closed():
-    from types import MethodType, SimpleNamespace
+def test_invoice_extractor_local_probe_resolves_without_glm(monkeypatch, tmp_path: Path):
+    from invoice_extractor import InvoiceExtractor
 
-    from app_api import InvoiceAppAPI, ProcessingLoopFailure
+    pdf_path = tmp_path / "local.pdf"
+    pdf_path.write_bytes(b"local")
 
-    api = object.__new__(InvoiceAppAPI)
-    api._stop_requested = False
-    api.quota_exhausted = False
-    received = []
-    prepared_results = {}
-
-    class OwnerExtractor:
-        glm_runtime = SimpleNamespace(profiles={})
-
+    class Runtime:
         @staticmethod
-        def pdf_to_base64_image(_path):
-            return ["image"]
+        def request(*_args, **_kwargs):
+            pytest.fail("local-only probe must never invoke GLM")
 
-    def legacy(_self, rows, *_args, **kwargs):
-        received.extend(rows)
-        prepared_results.update(kwargs.get("_prepared_extractions") or {})
-        return "done"
-
-    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
-
-    with pytest.raises(ProcessingLoopFailure, match="PROCESSING_PIPELINE_UNRESOLVED"):
-        api._run_processing_loop_with_extractor(
-            [{"filepath": "C:/staging/a.pdf"}],
-            "key",
-            "C:/output",
-            _extractor=OwnerExtractor(),
-            _worker_extractor_factory=lambda _runtime: (_ for _ in ()).throw(
-                RuntimeError("secret factory detail")
-            ),
-        )
-
-    assert len(received) == 1
-    prepared = next(iter(prepared_results.values()))
-    assert prepared["error_reason"] == "PIPELINE_REMOTE_EXTRACTION_FAILED"
-    assert prepared["exception_type"] == "RuntimeError"
-    assert "secret" not in repr(prepared)
-
-
-def test_app_api_worker_close_failure_does_not_override_success_or_leak_text():
-    from types import MethodType, SimpleNamespace
-
-    from app_api import InvoiceAppAPI
-
-    api = object.__new__(InvoiceAppAPI)
-    api._stop_requested = False
-    api.quota_exhausted = False
-    prepared_results = {}
-
-    class OwnerExtractor:
-        glm_runtime = SimpleNamespace(profiles={})
-
-        @staticmethod
-        def pdf_to_base64_image(_path):
-            return ["image"]
-
-    class Worker:
-        last_extraction_trace = {}
-        last_timing_trace = {}
-
-        @staticmethod
-        def extract_info_via_llm(_images, **_context):
-            return {"Seller": "safe"}
-
-        @staticmethod
-        def close():
-            raise RuntimeError("close secret")
-
-    def legacy(_self, _rows, *_args, **kwargs):
-        prepared_results.update(kwargs.get("_prepared_extractions") or {})
-        return "done"
-
-    api._run_processing_loop_legacy_with_extractor = MethodType(legacy, api)
-
-    result = api._run_processing_loop_with_extractor(
-        [{"filepath": "C:/staging/a.pdf"}],
-        "key",
-        "C:/output",
-        _extractor=OwnerExtractor(),
-        _worker_extractor_factory=lambda _runtime: Worker(),
+    extractor = InvoiceExtractor(
+        output_dir=tmp_path / "out",
+        glm_runtime=Runtime(),
+        close_glm_runtime=False,
+    )
+    local_result = {
+        "is_invoice": True,
+        "Date": "20260601",
+        "Purchaser": "辉瑞投资有限公司",
+        "Seller": "Local Seller",
+        "Amount": "1.00",
+        "Type": "餐饮",
+    }
+    monkeypatch.setattr(
+        extractor, "_try_extract_email_body_receipt_from_pdf_text", lambda _path: local_result
     )
 
-    assert result == "done"
-    prepared = next(iter(prepared_results.values()))
-    assert prepared["info_json"] == {"Seller": "safe"}
-    assert prepared["worker_close_error_type"] == "RuntimeError"
-    assert "secret" not in repr(prepared)
+    probe = extractor.probe_local_only(str(pdf_path), document_context={})
+
+    assert probe.status == "resolved"
+    assert probe.result["Seller"] == "Local Seller"
+    assert probe.reason_code == "LOCAL_EMAIL_BODY_RECEIPT_PDF_FAST_PATH"
 
 
-def test_legacy_archive_path_consumes_prepared_images_results_and_failures():
-    import inspect
+def test_invoice_extractor_remote_only_skips_every_local_probe(monkeypatch, tmp_path: Path):
+    import fitz
 
-    from app_api import InvoiceAppAPI
+    from invoice_extractor import InvoiceExtractor
 
-    source = inspect.getsource(InvoiceAppAPI._run_processing_loop_legacy_with_extractor)
-    assert "prepared_extractions.pop(document_id" in source
-    assert 'prepared_extraction.get("base64_img")' in source
-    assert 'prepared_extraction.get("info_json")' in source
-    assert 'prepared_extraction.get("error_reason")' in source
+    pdf_path = tmp_path / "remote.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "remote extraction document")
+    document.save(pdf_path)
+    document.close()
+    with pdf_path.open("ab") as handle:
+        handle.write(b" " * 1024)
+
+    calls = []
+
+    class Runtime:
+        @staticmethod
+        def request(profile, _payload, parser, **_kwargs):
+            calls.append(profile)
+            if profile == "ocr":
+                return parser({"md_results": "invoice date seller amount enough text"})
+            return parser(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"is_invoice":true,"Date":"20260601",'
+                                '"Purchaser":"辉瑞投资有限公司","Seller":"Remote Seller",'
+                                '"Amount":"2.00","Type":"餐饮"}'
+                            }
+                        }
+                    ]
+                }
+            )
+
+    extractor = InvoiceExtractor(
+        output_dir=tmp_path / "out",
+        glm_runtime=Runtime(),
+        close_glm_runtime=False,
+    )
+    monkeypatch.setattr(
+        extractor,
+        "probe_local_only",
+        lambda *_args, **_kwargs: pytest.fail("remote-only method must not call local probe"),
+    )
+    images = extractor.pdf_to_base64_image(str(pdf_path))
+
+    result = extractor.extract_remote_only(images, pdf_path=str(pdf_path))
+
+    assert result["Seller"] == "Remote Seller"
+    assert calls == ["ocr", "text"]

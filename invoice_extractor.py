@@ -9,6 +9,7 @@ import shutil
 import threading
 import datetime as dt
 import unicodedata
+from dataclasses import dataclass
 import fitz  # PyMuPDF
 from document_types import MANUAL_REVIEW_FOLDER, get_document_type_names, normalize_document_type
 from email_body_receipts import CANONICAL_MARKER
@@ -16,6 +17,14 @@ from glm_runtime import GlmRuntime
 from invoice_domain import DocumentIdentity, InvoiceRecord
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+@dataclass(frozen=True)
+class LocalExtractionProbe:
+    status: str
+    result: dict | None = None
+    reason_code: str = ""
+    engine: str = ""
 
 OCR_COMPAT_TRANSLATION = str.maketrans({
     "⻔": "门",
@@ -1181,7 +1190,90 @@ class InvoiceExtractor:
             return None
         return result
 
-    def extract_info_via_llm(self, base64_images, custom_rules="", pdf_path=None, document_context=None):
+    def probe_local_only(self, pdf_path, document_context=None):
+        """Run deterministic extraction paths without touching the GLM runtime."""
+        if not pdf_path or not os.path.exists(pdf_path):
+            return LocalExtractionProbe("invalid", reason_code="LOCAL_SOURCE_MISSING")
+        abs_pdf_path = os.path.abspath(pdf_path)
+        probes = (
+            (
+                "local_email_body_receipt_pdf",
+                "LOCAL_EMAIL_BODY_RECEIPT_PDF_FAST_PATH",
+                lambda: self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_foreign_invoice_pdf",
+                "LOCAL_FOREIGN_INVOICE_PDF_FAST_PATH",
+                lambda: self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_cits_gbt_pdf",
+                "LOCAL_CITS_GBT_PDF_FAST_PATH",
+                lambda: self._try_extract_cits_gbt_from_pdf_text(
+                    abs_pdf_path, document_context=document_context
+                ),
+            ),
+            (
+                "local_ride_itinerary_pdf",
+                "LOCAL_RIDE_ITINERARY_PDF_FAST_PATH",
+                lambda: self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_ihg_folio_pdf",
+                "LOCAL_IHG_FOLIO_PDF_FAST_PATH",
+                lambda: self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_standard_einvoice_pdf",
+                "LOCAL_STANDARD_EINVOICE_PDF_FAST_PATH",
+                lambda: self._try_extract_standard_china_einvoice_from_pdf_text_v2(
+                    abs_pdf_path
+                )
+                or self._try_extract_standard_china_einvoice_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_didi_pdf",
+                "LOCAL_DIDI_PDF_FAST_PATH",
+                lambda: self._try_extract_didi_invoice_from_pdf_text(abs_pdf_path),
+            ),
+        )
+        for engine, reason_code, probe in probes:
+            result = probe()
+            if result:
+                return LocalExtractionProbe(
+                    "resolved",
+                    result=self._adapt_extraction_result(
+                        result,
+                        pdf_path=abs_pdf_path,
+                        document_context=document_context,
+                    ),
+                    reason_code=reason_code,
+                    engine=engine,
+                )
+        if os.path.getsize(abs_pdf_path) < 1000:
+            return LocalExtractionProbe("invalid", reason_code="LOCAL_SOURCE_TOO_SMALL")
+        return LocalExtractionProbe("needs_remote", reason_code="LOCAL_PROBE_UNRESOLVED")
+
+    def extract_remote_only(
+        self, base64_images, custom_rules="", pdf_path=None, document_context=None
+    ):
+        return self.extract_info_via_llm(
+            base64_images,
+            custom_rules=custom_rules,
+            pdf_path=pdf_path,
+            document_context=document_context,
+            _allow_local_probe=False,
+        )
+
+    def extract_info_via_llm(
+        self,
+        base64_images,
+        custom_rules="",
+        pdf_path=None,
+        document_context=None,
+        *,
+        _allow_local_probe=True,
+    ):
         """3.2 Construct the Vision/OCR API payload and extract structured JSON using dual engines"""
         import time
 
@@ -1419,7 +1511,11 @@ class InvoiceExtractor:
             # 强制日志输出物理校验信息
             print(f">>> [物理校验] 绝对路径: {abs_pdf_path} | 真实字节: {actual_size}")
 
-            email_body_receipt_result = self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path)
+            email_body_receipt_result = (
+                self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if email_body_receipt_result:
                 email_body_receipt_result = _adapt_result(email_body_receipt_result)
                 extraction_trace["engine"] = "local_email_body_receipt_pdf"
@@ -1434,7 +1530,11 @@ class InvoiceExtractor:
             if actual_size < 1000:
                 raise ValueError(f"文件大小异常: 仅 {actual_size} bytes，拒绝处理。")
 
-            foreign_invoice_result = self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path)
+            foreign_invoice_result = (
+                self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if foreign_invoice_result:
                 foreign_invoice_result = _adapt_result(foreign_invoice_result)
                 extraction_trace["engine"] = "local_foreign_invoice_pdf"
@@ -1446,7 +1546,13 @@ class InvoiceExtractor:
                 _print_success_summary(foreign_invoice_result)
                 return foreign_invoice_result
 
-            cits_gbt_result = self._try_extract_cits_gbt_from_pdf_text(abs_pdf_path, document_context=document_context)
+            cits_gbt_result = (
+                self._try_extract_cits_gbt_from_pdf_text(
+                    abs_pdf_path, document_context=document_context
+                )
+                if _allow_local_probe
+                else None
+            )
             if cits_gbt_result:
                 cits_gbt_result = _adapt_result(cits_gbt_result)
                 extraction_trace["engine"] = "local_cits_gbt_pdf"
@@ -1458,7 +1564,11 @@ class InvoiceExtractor:
                 _print_success_summary(cits_gbt_result)
                 return cits_gbt_result
 
-            ride_itinerary_result = self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path)
+            ride_itinerary_result = (
+                self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if ride_itinerary_result:
                 ride_itinerary_result = _adapt_result(ride_itinerary_result)
                 extraction_trace["engine"] = "local_ride_itinerary_pdf"
@@ -1470,7 +1580,11 @@ class InvoiceExtractor:
                 _print_success_summary(ride_itinerary_result)
                 return ride_itinerary_result
 
-            ihg_folio_result = self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path)
+            ihg_folio_result = (
+                self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if ihg_folio_result:
                 ihg_folio_result = _adapt_result(ihg_folio_result)
                 extraction_trace["engine"] = "local_ihg_folio_pdf"
@@ -1482,8 +1596,12 @@ class InvoiceExtractor:
                 _print_success_summary(ihg_folio_result)
                 return ihg_folio_result
 
-            local_standard_result = self._try_extract_standard_china_einvoice_from_pdf_text_v2(abs_pdf_path)
-            if not local_standard_result:
+            local_standard_result = (
+                self._try_extract_standard_china_einvoice_from_pdf_text_v2(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
+            if not local_standard_result and _allow_local_probe:
                 local_standard_result = self._try_extract_standard_china_einvoice_from_pdf_text(abs_pdf_path)
             if local_standard_result:
                 local_standard_result = _adapt_result(local_standard_result)
@@ -1551,7 +1669,11 @@ class InvoiceExtractor:
                 "reason_code": "TRACK_B_FAILED",
                 "message": str(e),
             }
-            local_fallback_result = self._try_extract_didi_invoice_from_pdf_text(pdf_path)
+            local_fallback_result = (
+                self._try_extract_didi_invoice_from_pdf_text(pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if local_fallback_result:
                 local_fallback_result = _adapt_result(local_fallback_result)
                 extraction_trace["engine"] = "local_didi_pdf_fallback"

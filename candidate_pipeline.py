@@ -5,6 +5,7 @@ import hashlib
 import os
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 from invoice_domain import DocumentIdentity
 
@@ -51,6 +52,25 @@ def thaw_legacy_value(value: Any) -> Any:
 
 def _freeze_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return freeze_legacy_value(dict(value or {}))
+
+
+def _stream_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalized_url_digest(value: str) -> str:
+    parsed = urlsplit(str(value or "").strip())
+    hostname = (parsed.hostname or "").lower()
+    if parsed.port:
+        hostname = f"{hostname}:{parsed.port}"
+    normalized = urlunsplit(
+        ((parsed.scheme or "https").lower(), hostname, parsed.path or "/", parsed.query, "")
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -136,10 +156,17 @@ class CandidatePipeline:
                 metadata.setdefault(
                     "prefilter_reason_code", "MALFORMED_DOCUMENT_CANDIDATE"
                 )
-            filename = os.path.basename(source_path) or str(metadata.get("filename") or "")
+            is_url = bool(metadata.get("is_url") or source_url)
+            filename = (
+                os.path.basename(urlsplit(source_url or source_path).path)
+                if is_url
+                else os.path.basename(source_path)
+            ) or str(metadata.get("filename") or "")
             message_uid = str(
                 metadata.get("message_uid")
                 or metadata.get("source_message_uid")
+                or metadata.get("source_email_id")
+                or metadata.get("email_id")
                 or metadata.get("uid")
                 or ""
             )
@@ -153,24 +180,46 @@ class CandidatePipeline:
                     str(sequence),
                 )
             )
-            stable_document_seed = "|".join(
+            if is_url:
+                source_digest = _normalized_url_digest(source_url or source_path)
+                source_locator = f"url_sha256:{source_digest}"
+            else:
+                attachment_part_id = str(
+                    metadata.get("attachment_part_id")
+                    or metadata.get("part_id")
+                    or metadata.get("content_id")
+                    or ""
+                )
+                if source_path and os.path.isfile(source_path):
+                    source_digest = _stream_sha256(source_path)
+                elif attachment_part_id:
+                    source_digest = hashlib.sha256(
+                        attachment_part_id.encode("utf-8")
+                    ).hexdigest()
+                else:
+                    source_digest = hashlib.sha256(
+                        os.path.abspath(source_path).encode("utf-8", errors="replace")
+                    ).hexdigest()
+                source_locator = source_path
+            stable_document_seed = "\0".join(
                 (
                     message_uid,
-                    source_url or source_path,
+                    source_digest,
                     filename,
                     provider_group_key,
                     str(metadata.get("subject") or ""),
                     str(metadata.get("tier", 0)),
                 )
             )
-            document_id = str(metadata.get("document_id") or "") or hashlib.md5(
+            document_id = hashlib.sha256(
                 stable_document_seed.encode("utf-8")
             ).hexdigest()
-            legacy_document_id = hashlib.md5(
-                legacy_document_seed.encode("utf-8")
-            ).hexdigest()
-            source_locator = source_url or source_path
-            source_kind = "url" if metadata.get("is_url") or source_url else "attachment"
+            legacy_document_id = str(
+                metadata.get("legacy_document_id")
+                or metadata.get("document_id")
+                or hashlib.md5(legacy_document_seed.encode("utf-8")).hexdigest()
+            )
+            source_kind = "url" if is_url else "attachment"
             identity = DocumentIdentity(
                 document_id=document_id,
                 source_message_uid=message_uid,
@@ -198,3 +247,152 @@ class CandidatePipeline:
                 )
             )
         return candidates
+
+
+class CandidatePreflight:
+    """Serial qualification, recovery, dedupe, and pure-local extraction."""
+
+    def __init__(
+        self,
+        *,
+        api: Any,
+        extractor: Any,
+        working_history: set[str],
+        sidecar: dict[str, dict[str, Any]],
+        sidecar_lock: Any,
+        converter_factory: Any,
+    ) -> None:
+        self.api = api
+        self.extractor = extractor
+        self.working_history = working_history
+        self.sidecar = sidecar
+        self.sidecar_lock = sidecar_lock
+        self.converter_factory = converter_factory
+        self.seen_identities: set[str] = set()
+        self.seen_provider_groups: set[str] = set()
+
+    @staticmethod
+    def terminal(candidate, reason_code, *, status="retained"):
+        from extraction_pipeline import ExtractionOutcome
+
+        return ExtractionOutcome(
+            candidate=candidate,
+            status=status,
+            reason_code=str(reason_code or status),
+            message=str(reason_code or status),
+            artifact_path=candidate.source_path,
+        )
+
+    def _recover_url(self, candidate, legacy):
+        provider_group = str(legacy.get("provider_group_key") or "")
+        if provider_group and provider_group in self.seen_provider_groups:
+            return self.terminal(
+                candidate, "PROVIDER_GROUP_ALREADY_PROCESSED", status="duplicate"
+            )
+        if self.api._should_gate_controlled_run_url(legacy):
+            return self.terminal(candidate, "CONTROLLED_RUN_NON_PROVIDER_URL_SKIPPED")
+        converter = self.converter_factory()
+        self.api._append_log(
+            "抓取:",
+            f"正在启动无头浏览器抓取网页: {self.api._url_candidate_label(legacy)}",
+            "text-blue-400",
+        )
+        try:
+            results = converter.process_invoice_links(
+                candidate.source_path,
+                legacy.get("subject", "Link_Invoice"),
+                f"url_{candidate.sequence}",
+                return_metadata=True,
+                candidate_info=legacy,
+            )
+        except Exception:
+            return self.terminal(candidate, "URL_DOWNLOAD_FAILED", status="unresolved")
+        if not results:
+            return self.terminal(candidate, "URL_DOWNLOAD_FAILED", status="unresolved")
+        result = dict(results[0] or {})
+        if str(result.get("status") or "").lower() in {"failed", "skipped"}:
+            return self.terminal(
+                candidate,
+                str(result.get("reason_code") or "URL_DOWNLOAD_FAILED"),
+                status="unresolved",
+            )
+        pdf_path = str(result.get("pdf_path") or "")
+        if not pdf_path:
+            return self.terminal(candidate, "URL_DOWNLOAD_FAILED", status="unresolved")
+        if provider_group:
+            self.seen_provider_groups.add(provider_group)
+        legacy.update(
+            {
+                "filepath": pdf_path,
+                "resolved_url": result.get("resolved_url", ""),
+                "download_mode": result.get("download_mode", ""),
+                "provider_family": result.get(
+                    "provider_family", legacy.get("provider_family", "")
+                ),
+                "provider_recovered_fields": result.get("selected_fields", {}),
+            }
+        )
+        return pdf_path
+
+    def __call__(self, candidate):
+        from extraction_pipeline import ExtractionOutcome
+
+        legacy = candidate.to_legacy()
+        canonical_id = candidate.identity.document_id
+        if canonical_id in self.seen_identities:
+            return self.terminal(candidate, "CURRENT_RUN_DUPLICATE_SKIP", status="duplicate")
+        if canonical_id in self.working_history:
+            return self.terminal(candidate, "HISTORY_DUPLICATE_SKIP", status="duplicate")
+        self.seen_identities.add(canonical_id)
+        self.working_history.add(canonical_id)
+
+        action = str(legacy.get("candidate_action") or "")
+        if action == "retain_only":
+            return self.terminal(
+                candidate, legacy.get("prefilter_reason_code") or "P0_B_RETENTION"
+            )
+        if action == "manual_review":
+            return self.terminal(
+                candidate,
+                legacy.get("prefilter_reason_code") or "P0_C_MANUAL_REVIEW",
+                status="manual_review",
+            )
+        if action == "skip":
+            return self.terminal(candidate, "PREFILTER_SKIP", status="duplicate")
+
+        pdf_path = candidate.source_path
+        if candidate.identity.source_kind == "url":
+            recovery = self._recover_url(candidate, legacy)
+            if isinstance(recovery, ExtractionOutcome):
+                return recovery
+            pdf_path = recovery
+
+        probe = self.extractor.probe_local_only(pdf_path, document_context=legacy)
+        if probe.status == "resolved":
+            return ExtractionOutcome.resolved(
+                candidate,
+                {
+                    "pdf_path": pdf_path,
+                    "metadata": legacy,
+                    "info_json": probe.result,
+                    "extraction_trace": {
+                        "engine": probe.engine,
+                        "reason_code": probe.reason_code,
+                    },
+                    "extraction_timing": {},
+                },
+            )
+        if probe.status != "needs_remote":
+            return self.terminal(
+                candidate, probe.reason_code or "LOCAL_PREFLIGHT_FAILED"
+            )
+        base64_img = self.extractor.pdf_to_base64_image(pdf_path)
+        if not base64_img:
+            return self.terminal(candidate, "PDF_TO_IMAGE_FAILED")
+        with self.sidecar_lock:
+            self.sidecar[canonical_id] = {
+                "pdf_path": pdf_path,
+                "metadata": legacy,
+                "base64_img": base64_img,
+            }
+        return None
