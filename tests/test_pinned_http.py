@@ -21,6 +21,14 @@ def direct_target(url="https://invoice.example/document?value=synthetic"):
     return policy.validate(url)
 
 
+def single_ip_target(url="https://invoice.example/document?value=synthetic"):
+    policy = PublicUrlPolicy(
+        resolver=lambda host, port: [PUBLIC_A],
+        proxy_endpoint=None,
+    )
+    return policy.validate(url)
+
+
 def proxy_target(url="https://invoice.example/document?value=synthetic"):
     policy = PublicUrlPolicy(
         resolver=lambda host, port: ["198.18.0.42"],
@@ -48,6 +56,7 @@ class FakeRawResponse:
         self.released = 0
         self.read_calls = 0
         self._offset = 0
+        self.lifecycle = []
 
     def read(self, amount=None, decode_content=True):
         del decode_content
@@ -60,9 +69,11 @@ class FakeRawResponse:
         return chunk
 
     def close(self):
+        self.lifecycle.append("close")
         self.closed += 1
 
     def release_conn(self):
+        self.lifecycle.append("release")
         self.released += 1
 
 
@@ -362,11 +373,13 @@ def test_content_length_over_limit_rejects_before_body_read_and_releases_connect
 
     with pytest.raises(Exception, match="response exceeds configured size limit"):
         transport.request(
-            requests.Session(), "GET", direct_target(), max_response_bytes=8
+            requests.Session(), "GET", single_ip_target(), max_response_bytes=8
         )
 
     assert raw.read_calls == 0
-    assert raw.closed == raw.released == 1
+    assert raw.lifecycle == ["close"]
+    assert raw.closed == 1
+    assert raw.released == 0
 
 
 def test_unknown_length_body_rejects_when_streamed_bytes_cross_limit_and_closes():
@@ -376,13 +389,15 @@ def test_unknown_length_body_rejects_when_streamed_bytes_cross_limit_and_closes(
 
     with pytest.raises(Exception) as caught:
         transport.request(
-            requests.Session(), "GET", direct_target(), max_response_bytes=8
+            requests.Session(), "GET", single_ip_target(), max_response_bytes=8
         )
 
     assert "response exceeds configured size limit" in str(caught.value)
     assert "document" not in str(caught.value)
     assert raw.read_calls >= 1
-    assert raw.closed == raw.released == 1
+    assert raw.lifecycle == ["close"]
+    assert raw.closed == 1
+    assert raw.released == 0
 
 
 def test_streamed_body_at_limit_is_buffered_and_connection_is_released():
@@ -398,3 +413,75 @@ def test_streamed_body_at_limit_is_buffered_and_connection_is_released():
     assert manager.calls[0][2]["preload_content"] is False
     assert raw.read_calls >= 1
     assert raw.closed == raw.released == 1
+    assert raw.lifecycle == ["release", "close"]
+
+
+def test_unread_oversized_response_does_not_poison_next_keep_alive_request():
+    pool_state = {"poisoned": False}
+
+    class PoolAwareRaw(FakeRawResponse):
+        def release_conn(self):
+            if self._offset < len(self.data):
+                pool_state["poisoned"] = True
+            super().release_conn()
+
+    oversized = PoolAwareRaw(
+        data=b"oversized",
+        headers={"Content-Length": "9"},
+    )
+    clean = PoolAwareRaw(status=204, data=b"")
+
+    class KeepAliveManager:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, method, url, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return oversized
+            if pool_state["poisoned"]:
+                raise urllib3.exceptions.ProtocolError(
+                    "dirty socket reused", OSError("stale oversized body")
+                )
+            return clean
+
+    manager = KeepAliveManager()
+    transport = PinnedHttpTransport(pool_manager_factory=lambda **kwargs: manager)
+
+    with pytest.raises(Exception, match="response exceeds configured size limit"):
+        transport.request(
+            requests.Session(), "GET", single_ip_target(), max_response_bytes=8
+        )
+    response = transport.request(
+        requests.Session(), "GET", single_ip_target(), max_response_bytes=8
+    )
+
+    assert response.status_code == 204
+    assert pool_state["poisoned"] is False
+    assert oversized.lifecycle == ["close"]
+    assert clean.lifecycle == ["release", "close"]
+
+
+def test_partial_read_failure_closes_without_releasing_dirty_connection():
+    class PartialFailureRaw(FakeRawResponse):
+        def read(self, amount=None, decode_content=True):
+            if self.read_calls == 0:
+                return super().read(4, decode_content=decode_content)
+            self.read_calls += 1
+            raise urllib3.exceptions.ReadTimeoutError(
+                None, None, "SYNTHETIC_PARTIAL_READ_DETAIL"
+            )
+
+    raw = PartialFailureRaw(data=b"12345678")
+    manager = FakeManager(raw)
+    transport = PinnedHttpTransport(pool_manager_factory=lambda **kwargs: manager)
+
+    with pytest.raises(Exception) as caught:
+        transport.request(
+            requests.Session(), "GET", single_ip_target(), max_response_bytes=8
+        )
+
+    assert "SYNTHETIC_PARTIAL_READ_DETAIL" not in str(caught.value)
+    assert raw.lifecycle == ["close"]
+    assert raw.closed == 1
+    assert raw.released == 0

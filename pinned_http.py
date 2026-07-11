@@ -236,7 +236,7 @@ class PinnedHttpTransport:
             if declared_size is not None and declared_size > limit:
                 raise PinnedResponseTooLargeError()
 
-        chunks = []
+        buffer = bytearray()
         total = 0
         while True:
             read_size = min(cls.READ_CHUNK_BYTES, limit - total + 1)
@@ -246,12 +246,15 @@ class PinnedHttpTransport:
             total += len(chunk)
             if total > limit:
                 raise PinnedResponseTooLargeError()
-            chunks.append(bytes(chunk))
-        return b"".join(chunks)
+            buffer.extend(chunk)
+        return bytes(buffer)
 
     @staticmethod
-    def _close_raw_response(raw):
+    def _dispose_raw_response(raw, reusable):
         if raw is None:
+            return
+        if not reusable:
+            raw.close()
             return
         try:
             raw.release_conn()
@@ -294,6 +297,7 @@ class PinnedHttpTransport:
 
         for selected_ip in addresses:
             raw = None
+            body_consumed = False
             try:
                 plan = self.build_plan(
                     target,
@@ -322,6 +326,7 @@ class PinnedHttpTransport:
                     max_response_bytes=max_response_bytes,
                     decode_content=decode_content,
                 )
+                body_consumed = True
                 if decode_content and "Content-Encoding" in response_headers:
                     response_headers.pop("Content-Encoding", None)
                     response_headers.pop("Content-Length", None)
@@ -343,6 +348,6 @@ class PinnedHttpTransport:
                     continue
                 raise PinnedHttpConnectionError() from None
             finally:
-                self._close_raw_response(raw)
+                self._dispose_raw_response(raw, reusable=body_consumed)
 
         raise PinnedHttpConnectionError()

@@ -88,6 +88,40 @@ def test_accepts_public_https_hostname_and_freezes_all_addresses():
     assert validated.resolved_addresses == (PUBLIC_V4, PUBLIC_V6)
 
 
+def test_idna_hostname_is_canonicalized_before_resolution_and_sanitization():
+    resolved_hosts = []
+
+    def resolver(host, port):
+        resolved_hosts.append((host, port))
+        return [PUBLIC_V4]
+
+    policy = direct_policy(resolver=resolver)
+    validated = policy.validate("https://b\u00fccher.example/invoice?token=secret")
+
+    assert resolved_hosts == [("xn--bcher-kva.example", 443)]
+    assert validated.host == "xn--bcher-kva.example"
+    assert validated.url == "https://xn--bcher-kva.example/invoice?token=secret"
+    assert policy.sanitize(validated.url) == "https://xn--bcher-kva.example/<redacted>"
+
+
+def test_trailing_dot_hostname_is_normalized_before_policy_and_logging():
+    resolved_hosts = []
+
+    def resolver(host, port):
+        resolved_hosts.append((host, port))
+        return [PUBLIC_V4]
+
+    policy = direct_policy(resolver=resolver)
+    validated = policy.validate("https://PUBLIC.EXAMPLE./invoice?token=secret")
+
+    assert resolved_hosts == [("public.example", 443)]
+    assert validated.host == "public.example"
+    assert validated.url == "https://public.example/invoice?token=secret"
+    assert policy.sanitize("https://PUBLIC.EXAMPLE./secret") == (
+        "https://public.example/<redacted>"
+    )
+
+
 def test_rejects_private_redirect_destination():
     policy = direct_policy(resolver=resolver_for({"invoice.example": [PUBLIC_V4]}))
     current = policy.validate("https://invoice.example/start")

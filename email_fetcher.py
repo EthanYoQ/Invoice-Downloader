@@ -34,6 +34,7 @@ from provider_direct_invoice import (
     infer_direct_invoice_family,
     is_direct_invoice_family_url,
 )
+from url_trace_sanitizer import sanitize_url_for_log, stable_hash
 try:
     from pyzbar.pyzbar import decode
 except ImportError:
@@ -360,7 +361,11 @@ def _expand_bwjf_shortlink(url, timeout=5):
         )
         response.close()
     except Exception as exc:
-        logging.warning(f"Failed to expand bwjf shortlink {url}: {exc}")
+        logging.warning(
+            "Failed to expand bwjf shortlink %s (%s)",
+            sanitize_url_for_log(url),
+            type(exc).__name__,
+        )
         return None
 
     if response.status_code not in {301, 302, 303, 307, 308}:
@@ -1449,7 +1454,11 @@ class EmailFetcher:
                                                 if url:
                                                     normalized_url = normalize_invoice_link_candidate(url)
                                                     if normalized_url != url.strip():
-                                                        logging.info(f"Normalized embedded invoice link: {url} -> {normalized_url}")
+                                                        logging.info(
+                                                            "Normalized embedded invoice link: %s -> %s",
+                                                            sanitize_url_for_log(url),
+                                                            sanitize_url_for_log(normalized_url),
+                                                        )
                                                     links_found.append((normalized_url, text))
                                     except Exception:
                                         pass
@@ -1717,7 +1726,10 @@ class EmailFetcher:
                                     "prefilter_reason_code": decision["prefilter_reason_code"],
                                     "prefilter_signals": decision["prefilter_signals"],
                                 })
-                                logging.info(f"Discovered embedded invoice link: {link}")
+                                logging.info(
+                                    "Discovered embedded invoice link: %s",
+                                    sanitize_url_for_log(link),
+                                )
 
                 except Exception as e:
                     logging.error(f"Error processing email {e_id.decode()}: {e}")
@@ -1909,7 +1921,11 @@ class EmailFetcher:
                                         if url:
                                             normalized_url = normalize_invoice_link_candidate(url)
                                             if normalized_url != url.strip():
-                                                logging.info(f"Normalized embedded invoice link: {url} -> {normalized_url}")
+                                                logging.info(
+                                                    "Normalized embedded invoice link: %s -> %s",
+                                                    sanitize_url_for_log(url),
+                                                    sanitize_url_for_log(normalized_url),
+                                                )
                                             links_found.append((normalized_url, text))
                             except Exception:
                                 pass
@@ -2306,7 +2322,11 @@ class EmailFetcher:
                                 body_text=body_text,
                             )
                         if decision["candidate_action"] == "drop":
-                            logging.info(f"Dropped A-layer URL candidate: {link} ({decision['prefilter_reason_code']})")
+                            logging.info(
+                                "Dropped A-layer URL candidate: %s (%s)",
+                                sanitize_url_for_log(link),
+                                decision["prefilter_reason_code"],
+                            )
                             continue
 
                         provider_family = decision.get("provider_family", "")
@@ -2342,7 +2362,11 @@ class EmailFetcher:
                         provider_group_key = decision.get("provider_group_key", "")
                         if provider_group_key:
                             if provider_group_key in emitted_provider_groups:
-                                logging.info(f"Skipped duplicate provider-group URL candidate: {link} ({provider_group_key})")
+                                logging.info(
+                                    "Skipped duplicate provider-group URL candidate: %s (%s)",
+                                    sanitize_url_for_log(link),
+                                    stable_hash(provider_group_key),
+                                )
                                 continue
                             emitted_provider_groups.add(provider_group_key)
                         else:
@@ -2352,7 +2376,10 @@ class EmailFetcher:
                                 decision.get("provider_family", ""),
                             )
                             if fallback_group_key in emitted_fallback_groups:
-                                logging.info(f"Skipped duplicate URL candidate: {link}")
+                                logging.info(
+                                    "Skipped duplicate URL candidate: %s",
+                                    sanitize_url_for_log(link),
+                                )
                                 continue
                             emitted_fallback_groups.add(fallback_group_key)
 
@@ -2387,7 +2414,10 @@ class EmailFetcher:
                                 ),
                             })
                         results.append(result_payload)
-                        logging.info(f"Discovered embedded invoice link: {link}")
+                        logging.info(
+                            "Discovered embedded invoice link: %s",
+                            sanitize_url_for_log(link),
+                        )
 
                     if email_diag["entered_main_chain"]:
                         email_diag["terminal_status"] = "entered_main_chain"

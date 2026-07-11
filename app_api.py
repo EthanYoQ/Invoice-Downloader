@@ -25,6 +25,11 @@ from document_types import MANUAL_REVIEW_FOLDER, get_archive_folder, is_exempt_t
 from email_channel import resolve_channel
 from frontend_run_context import ensure_run_context_dirs, load_run_context, serialize_run_context
 from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
+from url_trace_sanitizer import (
+    build_url_evidence,
+    sanitize_persistence_payload,
+    stable_hash,
+)
 from user_settings import (
     UserSettingsStore,
     ensure_directory,
@@ -761,6 +766,7 @@ class InvoiceAppAPI:
             "zip_context": info.get("zip_context"),
             "candidate_bucket": info.get("candidate_bucket"),
             "candidate_action": info.get("candidate_action"),
+            "candidate_index": info.get("candidate_index"),
             "source_kind": info.get("source_kind"),
             "prefilter_reason_code": info.get("prefilter_reason_code"),
             "prefilter_signals": info.get("prefilter_signals", {}),
@@ -780,7 +786,11 @@ class InvoiceAppAPI:
         }
         if extra:
             payload.update(extra)
-        return {key: value for key, value in payload.items() if value is not None}
+        return self._sanitize_url_persistence_payload(payload)
+
+    @staticmethod
+    def _sanitize_url_persistence_payload(payload):
+        return sanitize_persistence_payload(dict(payload or {}))
 
     def _is_controlled_truth_run(self):
         if not self._run_context.get("enabled"):
@@ -2583,6 +2593,9 @@ class InvoiceAppAPI:
                             processed_filepaths.add(pdf_path) # [Fix] Mark URL links as processed on failure
                             continue
                         link_result = dict(link_results[0] or {})
+                        persisted_link_result = self._sanitize_url_persistence_payload(
+                            link_result
+                        )
                         if provider_group_key:
                             processed_provider_groups.add(provider_group_key)
 
@@ -2664,7 +2677,7 @@ class InvoiceAppAPI:
                                 failure_severity = "failure"
                             trace_store.set_fields(
                                 document_id,
-                                source_download_result=link_result,
+                                source_download_result=persisted_link_result,
                                 naming_result={"status": "skipped", "reason_code": link_reason_code},
                                 archive_target=retained_path,
                             )
@@ -2717,7 +2730,7 @@ class InvoiceAppAPI:
                             })
                             trace_store.set_fields(
                                 document_id,
-                                source_download_result=link_result,
+                                source_download_result=persisted_link_result,
                                 naming_result={"status": "skipped", "reason_code": recovery_reason_code},
                                 archive_target=retained_path,
                             )
@@ -2747,7 +2760,10 @@ class InvoiceAppAPI:
                             "body_excerpt": link_result.get("body_excerpt", ""),
                             "page_title": link_result.get("page_title", ""),
                         })
-                        trace_store.set_fields(document_id, source_download_result=link_result)
+                        trace_store.set_fields(
+                            document_id,
+                            source_download_result=persisted_link_result,
+                        )
                         pdf_path = link_result["pdf_path"]
                         file_name = os.path.basename(pdf_path)
                         time.sleep(0.5) # 确保无头浏览器下载的 PDF 磁盘 IO 写入完成
@@ -4191,27 +4207,30 @@ class InvoiceAppAPI:
     def _retain_artifact(self, save_path, source_path, bucket, reason, metadata=None):
         """在 staging 清理前保留一份可追踪的原件副本。"""
         import json
-        import re
         import shutil
         import uuid
 
         retention_dir = os.path.join(save_path, "_audit_retention", bucket)
         os.makedirs(retention_dir, exist_ok=True)
+        runtime_metadata = dict(metadata or {})
+        safe_metadata = self._sanitize_url_persistence_payload(runtime_metadata)
 
         is_url_placeholder = (
-            metadata
+            runtime_metadata
             and (
-                metadata.get("source_kind") == "url"
+                runtime_metadata.get("source_kind") == "url"
                 or str(source_path).startswith(("http://", "https://"))
             )
             and (not source_path or not os.path.exists(source_path))
         )
 
         if is_url_placeholder:
-            subject = str((metadata or {}).get("subject", "LinkRetention"))
-            safe_subject = re.sub(r"\s+", "_", re.sub(r'[\\/:*?"<>|]+', "_", subject)).strip(" _")[:40] or "LinkRetention"
-            candidate_index = int((metadata or {}).get("candidate_index", 1) or 1)
-            original_name = f"LinkRetention_{safe_subject}_{candidate_index}.url.txt"
+            url_evidence = build_url_evidence(source_path, bucket)
+            candidate_index = int(runtime_metadata.get("candidate_index", 1) or 1)
+            original_name = (
+                f"LinkRetention_{url_evidence['source_hash'][:16]}_"
+                f"{candidate_index}.url.txt"
+            )
             target_name = original_name
             target_path = os.path.join(retention_dir, target_name)
             while os.path.exists(target_path):
@@ -4219,12 +4238,15 @@ class InvoiceAppAPI:
                 target_name = f"{stem}_{uuid.uuid4().hex[:6]}{ext}"
                 target_path = os.path.join(retention_dir, target_name)
             with open(target_path, "w", encoding="utf-8") as fh:
-                fh.write(str(source_path))
+                json.dump(url_evidence, fh, ensure_ascii=False, indent=2)
         else:
             if not source_path or not os.path.exists(source_path):
                 return source_path
 
             original_name = os.path.basename(source_path)
+            _, extension = os.path.splitext(original_name)
+            evidence_name = stable_hash(self._user_safe_source_reference(source_path))[:20]
+            original_name = f"Retained_{evidence_name}{extension.lower()}"
             target_name = original_name
             target_path = os.path.join(retention_dir, target_name)
             while os.path.exists(target_path):
@@ -4236,13 +4258,20 @@ class InvoiceAppAPI:
 
         sidecar = f"{target_path}.json"
         payload = {
-            "reason": reason,
-            "original_path": self._user_safe_source_reference(source_path),
-            "retained_path": target_path,
+            "kind": "retention",
+            "status": "retained",
+            "reason_code": str(bucket),
+            "reason_hash": stable_hash(reason),
+            "source_hash": stable_hash(
+                source_path if is_url_placeholder else self._user_safe_source_reference(source_path)
+            ),
+            "retained_name_hash": stable_hash(os.path.basename(target_path)),
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        if metadata:
-            payload["metadata"] = metadata
+        if is_url_placeholder:
+            payload.update(url_evidence)
+        if safe_metadata:
+            payload["metadata"] = safe_metadata
 
         try:
             with open(sidecar, "w", encoding="utf-8") as fh:
@@ -4253,15 +4282,15 @@ class InvoiceAppAPI:
         self.audit_counts["retention"] = int(self.audit_counts.get("retention", 0) or 0) + 1
         self._safe_emit_artifact_event(
             "retention",
-            target_path,
-            document_id=(metadata or {}).get("document_id"),
-            source_kind=(metadata or {}).get("source_kind"),
-            reason_code=(metadata or {}).get("prefilter_reason_code") or bucket,
+            os.path.basename(target_path),
+            document_id=safe_metadata.get("document_hash"),
+            source_kind=safe_metadata.get("source_kind"),
+            reason_code=safe_metadata.get("prefilter_reason_code") or bucket,
             category=bucket,
             extra={
                 "bucket": bucket,
-                "retention_reason": reason,
-                "metadata": metadata or {},
+                "retention_reason_hash": stable_hash(reason),
+                "metadata": safe_metadata,
             },
         )
 
@@ -4270,12 +4299,13 @@ class InvoiceAppAPI:
     def _send_to_manual_check(self, save_path, source_path, reason, metadata=None, is_url=False):
         """把待人工复核候选写入用户输出目录下的中文复核目录。"""
         import json
-        import re
         import shutil
         import uuid
 
         manual_dir = os.path.join(save_path, MANUAL_REVIEW_FOLDER)
         os.makedirs(manual_dir, exist_ok=True)
+        runtime_metadata = dict(metadata or {})
+        safe_metadata = self._sanitize_url_persistence_payload(runtime_metadata)
 
         def _unique_path(filename):
             target_path = os.path.join(manual_dir, filename)
@@ -4287,38 +4317,42 @@ class InvoiceAppAPI:
             return target_path
 
         if is_url:
-            subject = ""
-            if metadata:
-                subject = str(metadata.get("subject", "LinkReview"))
-            safe_subject = re.sub(r'\s+', '_', re.sub(r'[\\/:*?"<>|]+', '_', subject)).strip(" _")[:40] or "LinkReview"
-            candidate_index = 1
-            if metadata:
-                candidate_index = int(metadata.get("candidate_index", 1) or 1)
-            target_path = _unique_path(f"P0_LinkReview_{safe_subject}_{candidate_index}.url.txt")
+            url_evidence = build_url_evidence(source_path, reason)
+            candidate_index = int(runtime_metadata.get("candidate_index", 1) or 1)
+            target_path = _unique_path(
+                f"P0_LinkReview_{url_evidence['source_hash'][:16]}_"
+                f"{candidate_index}.url.txt"
+            )
             with open(target_path, "w", encoding="utf-8") as fh:
-                fh.write(str(source_path))
-            original_path = self._user_safe_source_reference(source_path)
+                json.dump(url_evidence, fh, ensure_ascii=False, indent=2)
         else:
             if not source_path or not os.path.exists(source_path):
                 return source_path
             original_name = os.path.basename(source_path)
             prefix = "P0_Review"
-            if metadata and metadata.get("file_name"):
-                original_name = os.path.basename(str(metadata["file_name"]))
-            target_path = _unique_path(f"{prefix}_{original_name}")
+            if runtime_metadata.get("file_name"):
+                original_name = os.path.basename(str(runtime_metadata["file_name"]))
+            _, extension = os.path.splitext(original_name)
+            evidence_name = stable_hash(self._user_safe_source_reference(source_path))[:20]
+            target_path = _unique_path(f"{prefix}_{evidence_name}{extension.lower()}")
             shutil.copy2(source_path, target_path)
-            original_path = self._user_safe_source_reference(source_path)
 
         sidecar = f"{target_path}.json"
         payload = {
-            "reason": reason,
-            "original_path": original_path,
-            "review_path": target_path,
+            "kind": "manual_check",
+            "status": "pending_review",
+            "reason_hash": stable_hash(reason),
+            "source_hash": stable_hash(
+                source_path if is_url else self._user_safe_source_reference(source_path)
+            ),
+            "review_name_hash": stable_hash(os.path.basename(target_path)),
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "is_url": is_url,
         }
-        if metadata:
-            payload["metadata"] = metadata
+        if is_url:
+            payload.update(url_evidence)
+        if safe_metadata:
+            payload["metadata"] = safe_metadata
 
         try:
             with open(sidecar, "w", encoding="utf-8") as fh:
@@ -4329,14 +4363,15 @@ class InvoiceAppAPI:
         self.audit_counts["manual_check"] = int(self.audit_counts.get("manual_check", 0) or 0) + 1
         self._safe_emit_artifact_event(
             "manual_check",
-            target_path,
-            document_id=(metadata or {}).get("document_id"),
-            source_kind=(metadata or {}).get("source_kind"),
-            reason_code=reason,
+            os.path.basename(target_path),
+            document_id=safe_metadata.get("document_hash"),
+            source_kind=safe_metadata.get("source_kind"),
+            reason_code="manual_review",
             category=MANUAL_REVIEW_FOLDER,
             extra={
                 "is_url": bool(is_url),
-                "metadata": metadata or {},
+                "reason_hash": stable_hash(reason),
+                "metadata": safe_metadata,
             },
         )
 

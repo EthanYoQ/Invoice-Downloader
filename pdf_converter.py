@@ -1,8 +1,8 @@
 import json
 import logging
-import math
 import os
 import re
+import shutil
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import fitz  # PyMuPDF
@@ -52,23 +52,6 @@ from url_security import PublicUrlPolicy, PublicUrlPolicyError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-class _PersistenceSafeMetadata(dict):
-    def __init__(self, runtime_metadata, persisted_metadata):
-        super().__init__(persisted_metadata)
-        self._runtime_metadata = dict(runtime_metadata)
-
-    def __getitem__(self, key):
-        if key in self._runtime_metadata:
-            return self._runtime_metadata[key]
-        return super().__getitem__(key)
-
-    def get(self, key, default=None):
-        return self._runtime_metadata.get(key, super().get(key, default))
-
-    def __contains__(self, key):
-        return key in self._runtime_metadata or super().__contains__(key)
-
-
 class PDFConverter:
     DIRECT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
     BROWSER_DOCUMENT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
@@ -76,23 +59,6 @@ class PDFConverter:
     BROWSER_PASSIVE_RESOURCE_TYPES = frozenset(
         {"script", "stylesheet", "image", "media", "font"}
     )
-    PERSISTENCE_SCALAR_FIELDS = frozenset(
-        {
-            "kind",
-            "status",
-            "status_code",
-            "reason",
-            "reason_code",
-            "provider",
-            "provider_family",
-            "count",
-        }
-    )
-    PERSISTENCE_CONTAINER_FIELDS = frozenset(
-        {"timing_ms", "captured_network", "captured_artifacts"}
-    )
-    PERSISTENCE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{0,128}$")
-
     BAIWANG_CLICK_TARGETS = {
         "pdf": [
             "a:has-text('下载PDF')",
@@ -283,56 +249,6 @@ class PDFConverter:
             "message": exc.reason,
             "source": source,
         }
-
-    def _safe_aggregate_value(self, key, value):
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return value if math.isfinite(value) else None
-        if isinstance(value, str) and self.PERSISTENCE_TOKEN_PATTERN.fullmatch(value):
-            return value
-        return None
-
-    def _sanitize_trace(self, value, field_name=""):
-        parent_key = str(field_name or "").lower()
-        if isinstance(value, dict):
-            sanitized = {}
-            for item_key, item_value in value.items():
-                key = str(item_key or "").lower()
-                if parent_key == "timing_ms":
-                    if key.endswith("_ms") or key.endswith("_count") or key == "count":
-                        safe_value = self._safe_aggregate_value(key, item_value)
-                        if safe_value is not None:
-                            sanitized[item_key] = safe_value
-                    continue
-                if key in self.PERSISTENCE_SCALAR_FIELDS or key.endswith("_count"):
-                    safe_value = self._safe_aggregate_value(key, item_value)
-                    if safe_value is not None:
-                        sanitized[item_key] = safe_value
-                    continue
-                if key in self.PERSISTENCE_CONTAINER_FIELDS:
-                    safe_value = self._sanitize_trace(item_value, key)
-                    if safe_value not in (None, {}, []):
-                        sanitized[item_key] = safe_value
-            return sanitized
-        if isinstance(value, (list, tuple)):
-            sanitized = [self._sanitize_trace(item, parent_key) for item in value]
-            return [item for item in sanitized if item not in (None, {}, [])]
-        return self._safe_aggregate_value(parent_key, value)
-
-    def _persistence_safe_result(self, runtime_metadata):
-        runtime = dict(runtime_metadata or {})
-        persisted = self._sanitize_trace(runtime)
-        for field, count_field in (
-            ("captured_network", "captured_network_count"),
-            ("captured_artifacts", "captured_artifact_count"),
-        ):
-            if field in runtime:
-                persisted[count_field] = len(runtime.get(field) or [])
-                persisted[field] = self._sanitize_trace(runtime.get(field) or [], field)
-        return _PersistenceSafeMetadata(runtime, persisted)
 
     @staticmethod
     def _origin(validated):
@@ -836,22 +752,53 @@ class PDFConverter:
             raise RuntimeError(message)
 
     @staticmethod
+    def _installed_browser_executables():
+        candidates = []
+        for command in ("chrome.exe", "msedge.exe", "chrome", "microsoft-edge"):
+            resolved = shutil.which(command)
+            if resolved:
+                candidates.append(resolved)
+
+        roots = [
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+        relative_paths = (
+            os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+        )
+        for root in roots:
+            if not root:
+                continue
+            for relative_path in relative_paths:
+                candidate = os.path.join(root, relative_path)
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
     def _launch_chromium_browser(playwright, context_label):
+        launch_error = None
         try:
             return playwright.chromium.launch(headless=True)
-        except PlaywrightError as exc:
-            message = (
-                f"{context_label}: Chromium could not be started. "
-                "This code no longer installs browsers at runtime. "
-                "Prepare Chromium at build time and see release_prep/chromium_build_contract.md."
-            )
-            raise RuntimeError(message) from exc
         except Exception as exc:
-            message = (
-                f"{context_label}: failed to launch Chromium. "
-                "See release_prep/chromium_build_contract.md for the build-time preparation contract."
-            )
-            raise RuntimeError(message) from exc
+            launch_error = exc
+
+        for executable_path in PDFConverter._installed_browser_executables():
+            try:
+                return playwright.chromium.launch(
+                    headless=True,
+                    executable_path=executable_path,
+                )
+            except Exception as exc:
+                launch_error = exc
+
+        message = (
+            f"{context_label}: no production-supported Chromium, Chrome, or Edge "
+            "browser could be started. See release_prep/chromium_build_contract.md."
+        )
+        raise RuntimeError(message) from launch_error
 
     def _new_browser_context(self, browser):
         self._browser_request_contexts.clear()
@@ -1441,7 +1388,7 @@ class PDFConverter:
                 selected_artifact, _ = self._select_baiwang_recovery_result(artifacts, expected_fields)
                 if selected_artifact:
                     recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-                    recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
+                    recovery_meta["captured_network"] = list(network_logs[:200])
                     recovery_meta["captured_artifacts"] = [
                         {
                             "path": artifact.get("path", ""),
@@ -1455,9 +1402,6 @@ class PDFConverter:
                         }
                         for artifact in artifacts
                     ]
-                    recovery_meta["captured_artifacts"] = self._sanitize_trace(
-                        recovery_meta["captured_artifacts"]
-                    )
                     recovery_meta.update(
                         {
                             "pdf_path": selected_artifact.get("path", ""),
@@ -1593,7 +1537,7 @@ class PDFConverter:
 
         selected_artifact, select_reason = self._select_baiwang_recovery_result(artifacts, expected_fields)
         recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-        recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
+        recovery_meta["captured_network"] = list(network_logs[:200])
         recovery_meta["captured_artifacts"] = [
             {
                 "path": artifact.get("path", ""),
@@ -1607,9 +1551,6 @@ class PDFConverter:
             }
             for artifact in artifacts
         ]
-        recovery_meta["captured_artifacts"] = self._sanitize_trace(
-            recovery_meta["captured_artifacts"]
-        )
 
         if selected_artifact:
             recovery_meta.update(
@@ -1693,7 +1634,7 @@ class PDFConverter:
         selected_artifact, select_reason = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
         if selected_artifact:
             recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-            recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
+            recovery_meta["captured_network"] = list(network_logs[:200])
             recovery_meta["captured_artifacts"] = [
                 {
                     "path": artifact.get("path", ""),
@@ -1707,9 +1648,6 @@ class PDFConverter:
                 }
                 for artifact in artifacts
             ]
-            recovery_meta["captured_artifacts"] = self._sanitize_trace(
-                recovery_meta["captured_artifacts"]
-            )
             recovery_meta.update(
                 {
                     "resolved_url": self.url_policy.sanitize(
@@ -1732,7 +1670,7 @@ class PDFConverter:
             return recovery_meta
         if provider_family != "bwjf_signed_invoice":
             recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-            recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
+            recovery_meta["captured_network"] = list(network_logs[:200])
             recovery_meta["captured_artifacts"] = [
                 {
                     "path": artifact.get("path", ""),
@@ -1746,9 +1684,6 @@ class PDFConverter:
                 }
                 for artifact in artifacts
             ]
-            recovery_meta["captured_artifacts"] = self._sanitize_trace(
-                recovery_meta["captured_artifacts"]
-            )
             recovery_meta["reason_code"] = f"DIRECT_INVOICE_{select_reason.upper()}"
             recovery_meta["failure_stage"] = "provider_recovery"
             return recovery_meta
@@ -1887,7 +1822,7 @@ class PDFConverter:
 
         selected_artifact, select_reason = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
         recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-        recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
+        recovery_meta["captured_network"] = list(network_logs[:200])
         recovery_meta["captured_artifacts"] = [
             {
                 "path": artifact.get("path", ""),
@@ -1901,9 +1836,6 @@ class PDFConverter:
             }
             for artifact in artifacts
         ]
-        recovery_meta["captured_artifacts"] = self._sanitize_trace(
-            recovery_meta["captured_artifacts"]
-        )
 
         if selected_artifact:
             recovery_meta.update(
@@ -1953,7 +1885,7 @@ class PDFConverter:
                 candidate_info or {},
             )
             if return_metadata:
-                return [self._persistence_safe_result(recovery_meta)]
+                return [dict(recovery_meta)]
             if recovery_meta.get("pdf_path"):
                 return [recovery_meta["pdf_path"]]
             return []
@@ -1966,7 +1898,7 @@ class PDFConverter:
                 candidate_info or {},
             )
             if return_metadata:
-                return [self._persistence_safe_result(recovery_meta)]
+                return [dict(recovery_meta)]
             if recovery_meta.get("pdf_path"):
                 return [recovery_meta["pdf_path"]]
             return []
@@ -2000,7 +1932,7 @@ class PDFConverter:
 
                 def _append_link_result():
                     link_meta["timing_ms"] = {"total_ms": self._elapsed_ms(link_started_at)}
-                    downloaded_items.append(self._persistence_safe_result(link_meta))
+                    downloaded_items.append(dict(link_meta))
 
                 try:
                     response = self._goto_public_page(page, url, self.generic_timeout_ms)

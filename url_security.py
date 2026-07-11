@@ -19,6 +19,13 @@ def _default_resolver(host: str, port: int) -> Sequence[str]:
     return [item[4][0] for item in results]
 
 
+def _canonical_hostname(host: str) -> str:
+    value = str(host or "").rstrip(".")
+    if not value:
+        raise ValueError("hostname is empty")
+    return value.encode("idna").decode("ascii").lower()
+
+
 def _default_peer_getter(response: object) -> tuple[str, int]:
     raw = getattr(response, "raw", None)
     candidates = (
@@ -42,7 +49,7 @@ def _safe_url(url: str) -> str:
     try:
         parsed = urlsplit(str(url or ""))
         scheme = parsed.scheme.lower()
-        host = parsed.hostname or ""
+        host = _canonical_hostname(parsed.hostname or "")
         if not scheme or not host:
             return "<invalid-url>"
         host_text = f"[{host}]" if ":" in host else host
@@ -284,8 +291,8 @@ class PublicUrlPolicy:
         if not host:
             raise PublicUrlPolicyError(raw_url, "hostname is required")
         try:
-            host = host.encode("idna").decode("ascii").lower()
-        except UnicodeError as exc:
+            host = _canonical_hostname(host)
+        except (UnicodeError, ValueError) as exc:
             raise PublicUrlPolicyError(raw_url, "hostname is invalid") from exc
         if host == "localhost" or host.endswith(".localhost"):
             raise PublicUrlPolicyError(raw_url, "localhost is not allowed")

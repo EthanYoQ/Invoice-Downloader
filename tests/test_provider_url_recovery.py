@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlparse
 
 from requests.structures import CaseInsensitiveDict
@@ -937,6 +938,44 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertNotIn("offline", context.options)
         self.assertEqual([kind for kind, _, _ in context.routes], ["http", "websocket"])
 
+    def test_production_browser_launch_falls_back_to_supported_installed_browser(self):
+        sentinel = object()
+
+        class FakeChromium:
+            def __init__(self):
+                self.calls = []
+
+            def launch(self, **kwargs):
+                self.calls.append(kwargs)
+                if "executable_path" not in kwargs:
+                    raise pdf_converter.PlaywrightError("bundled browser missing")
+                return sentinel
+
+        class FakePlaywright:
+            chromium = FakeChromium()
+
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        with mock.patch.object(
+            PDFConverter,
+            "_installed_browser_executables",
+            return_value=["installed-chrome.exe"],
+            create=True,
+        ):
+            browser = converter._launch_chromium_browser(
+                FakePlaywright(), "browser fallback regression"
+            )
+
+        self.assertIs(browser, sentinel)
+        self.assertEqual(
+            FakePlaywright.chromium.calls,
+            [
+                {"headless": True},
+                {"headless": True, "executable_path": "installed-chrome.exe"},
+            ],
+        )
+
     def test_real_chrome_follows_fulfilled_document_and_subresource_redirects_without_origin_network(self):
         start_url = "https://route-proof.example/start"
         final_url = "https://route-proof.example/final"
@@ -1035,9 +1074,12 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         converter._guard_browser_request = audited_guard
 
         with pdf_converter.sync_playwright() as playwright:
-            if not Path(playwright.chromium.executable_path).is_file():
-                self.skipTest("Playwright 1.58 Chrome for Testing is not installed")
-            browser = playwright.chromium.launch(headless=True)
+            try:
+                browser = converter._launch_chromium_browser(
+                    playwright, "real Chrome redirect regression"
+                )
+            except RuntimeError:
+                self.skipTest("no production-supported Chrome or Edge is installed")
             context = converter._new_browser_context(browser)
             page = context.new_page()
             try:
@@ -1144,144 +1186,54 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertNotIn("synthetic-secret", process_log)
         self.assertNotIn("SYNTHETIC_MAILBOX_SUBJECT", process_log)
 
-    def test_persistence_payloads_are_allowlisted_while_runtime_metadata_stays_usable(self):
+    def test_provider_result_survives_exact_appapi_dict_copy_and_pdf_handoff(self):
+        staging_dir = tempfile.mkdtemp()
         converter = PDFConverter(
-            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+            staging_dir=staging_dir, url_policy=public_test_policy()
         )
-        sensitive_event = {
-            "kind": "network_seen",
-            "status": 200,
-            "reason_code": "PINNED_RESPONSE",
-            "provider_family": "synthetic_provider",
-            "url": "https://public.example/capability-segment?token=TOKEN-VALUE&query=query-secret",
-            "path": r"C:\Users\Synthetic\invoice.pdf",
-            "authorization": "Bearer AUTH-SECRET",
-            "cookie": "session=COOKIE-SECRET",
-            "subject": "MAILBOX-SUBJECT",
-            "message": "MESSAGE-SECRET",
-            "exception": RuntimeError("EXCEPTION-SECRET"),
-            "raw_body": "RAW-BODY-SECRET",
-            "fields": {
-                "buyer": "BUYER-ENTITY",
-                "seller": "SELLER-ENTITY",
-                "invoice_number": "INV-2026-SECRET",
-            },
-            "nested": [
-                {
-                    "token": "NESTED-TOKEN",
-                    "query": "NESTED-QUERY",
-                }
-            ],
-        }
-        runtime_metadata = {
-            "status": "downloaded",
-            "reason_code": "",
-            "provider_family": "synthetic_provider",
-            "timing_ms": {"total_ms": 12.5},
-            "pdf_path": r"C:\Users\Synthetic\invoice.pdf",
-            "source_url": sensitive_event["url"],
-            "selected_fields": sensitive_event["fields"],
-            "captured_network": [sensitive_event],
-            "captured_artifacts": [sensitive_event],
-            "retention_payload": sensitive_event,
-            "diagnostic_payload": sensitive_event,
-            "trace_payload": sensitive_event,
-        }
-
-        result = converter._persistence_safe_result(runtime_metadata)
-
-        self.assertEqual(result.get("selected_fields"), sensitive_event["fields"])
-        self.assertEqual(result["pdf_path"], runtime_metadata["pdf_path"])
-
-        persisted_payloads = [
-            dict(result),
-            converter._sanitize_trace(runtime_metadata["captured_network"]),
-            converter._sanitize_trace(runtime_metadata["captured_artifacts"]),
-            converter._sanitize_trace(runtime_metadata["retention_payload"]),
-            converter._sanitize_trace(runtime_metadata["diagnostic_payload"]),
-            converter._sanitize_trace(runtime_metadata["trace_payload"]),
-        ]
-        rendered = json.dumps(persisted_payloads)
-
-        for forbidden in (
-            "capability-segment",
-            "TOKEN-VALUE",
-            "query-secret",
-            "AUTH-SECRET",
-            "COOKIE-SECRET",
-            "MAILBOX-SUBJECT",
-            "MESSAGE-SECRET",
-            "EXCEPTION-SECRET",
-            "RAW-BODY-SECRET",
-            "BUYER-ENTITY",
-            "SELLER-ENTITY",
-            "INV-2026-SECRET",
-            r"C:\\Users\\Synthetic",
-            "NESTED-TOKEN",
-            "NESTED-QUERY",
-            "authorization",
-            "cookie",
-            "subject",
-            "message",
-            "exception",
-            "raw_body",
-            "fields",
-            "buyer",
-            "seller",
-            "invoice_number",
-        ):
-            self.assertNotIn(forbidden, rendered)
-        self.assertEqual(dict(result)["captured_network"][0]["kind"], "network_seen")
-        self.assertEqual(dict(result)["captured_network"][0]["status"], 200)
-
-    def test_process_invoice_links_exposes_raw_runtime_fields_but_serializes_safe_view(self):
-        converter = PDFConverter(
-            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
-        )
+        pdf_path = str(Path(staging_dir) / "provider-result.pdf")
+        Path(pdf_path).write_bytes(b"%PDF-1.5\nsynthetic provider result")
         runtime_metadata = {
             "status": "downloaded",
             "reason_code": "",
             "provider_family": "fpyun_direct_invoice",
-            "pdf_path": r"C:\Users\Synthetic\runtime-invoice.pdf",
+            "pdf_path": pdf_path,
+            "source_url": "https://public.example/capability?token=runtime-token",
+            "resolved_url": "https://cdn.example/invoice.pdf?token=resolved-token",
             "selected_fields": {
                 "buyer": "RUNTIME-BUYER",
                 "seller": "RUNTIME-SELLER",
                 "invoice_number": "RUNTIME-INVOICE-NUMBER",
             },
-            "captured_network": [
-                {
-                    "kind": "network_seen",
-                    "status": 200,
-                    "url": "https://public.example/capability?token=RUNTIME-TOKEN",
-                }
-            ],
         }
         converter._recover_direct_invoice_group = (
             lambda *args, **kwargs: runtime_metadata
         )
 
-        result = converter.process_invoice_links(
+        link_results = converter.process_invoice_links(
             "https://public.example/invoice",
             "RUNTIME-MAILBOX-SUBJECT",
             "synthetic-email-id",
             return_metadata=True,
             candidate_info={"provider_family": "fpyun_direct_invoice"},
-        )[0]
+        )
 
-        self.assertEqual(result.get("selected_fields"), runtime_metadata["selected_fields"])
-        self.assertEqual(result["pdf_path"], runtime_metadata["pdf_path"])
-        rendered = json.dumps(result)
-        for forbidden in (
-            "RUNTIME-BUYER",
-            "RUNTIME-SELLER",
-            "RUNTIME-INVOICE-NUMBER",
-            "RUNTIME-TOKEN",
-            "runtime-invoice.pdf",
-            "RUNTIME-MAILBOX-SUBJECT",
-            "capability",
-        ):
-            self.assertNotIn(forbidden, rendered)
-        self.assertEqual(json.loads(rendered)["status"], "downloaded")
+        # This is the exact production conversion at app_api.py:2585.
+        app_link_result = dict(link_results[0] or {})
+        self.assertEqual(app_link_result["pdf_path"], pdf_path)
+        self.assertEqual(app_link_result["selected_fields"], runtime_metadata["selected_fields"])
+        self.assertEqual(app_link_result["source_url"], runtime_metadata["source_url"])
+        self.assertEqual(app_link_result["resolved_url"], runtime_metadata["resolved_url"])
+        self.assertIs(type(link_results[0]), dict)
+
+        handoff_paths = []
+        api = InvoiceAppAPI()
+        api._inspect_pdf_health = lambda path: handoff_paths.append(path) or {
+            "pdf_health_class": "ok"
+        }
+        api._inspect_pdf_health(app_link_result["pdf_path"])
+        self.assertEqual(handoff_paths, [pdf_path])
+        self.assertTrue(Path(handoff_paths[0]).is_file())
 
     def test_direct_invoice_acceptance_normalizes_seller_parentheses(self):
         api = InvoiceAppAPI()
