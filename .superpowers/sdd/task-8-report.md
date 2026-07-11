@@ -305,3 +305,16 @@ Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
 The strict result above re-audits an older accepted output directory. It does
 not prove the new acceptance and archive path against a fresh mailbox run. A
 real clean batch on the current code remains the final release gate.
+
+Post-remediation-commit evidence:
+
+```text
+Code commit: 3fe4c05e84f559693db7b5a3db5934ab7ebd69cc
+Focused Task 8/refactor/P2/lifecycle/GLM/provider/email/security: 343 passed, 33 subtests passed
+Full pytest: 485 passed, 109 subtests passed
+py_compile: passed
+Task 8 Ruff: passed
+git diff --check HEAD^ HEAD: passed
+Strict output: tmp/strict_truth_audit_3fe4c05_20260711T184430Z.json
+Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
+```
