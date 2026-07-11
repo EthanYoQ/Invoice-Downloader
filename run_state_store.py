@@ -12,10 +12,16 @@ _TERMINAL_STATES = {"completed", "failed"}
 class RunStateStore:
     """Thread-safe owner of the frontend-visible state for one active run."""
 
-    def __init__(self, event_sink: Callable[[dict[str, Any]], None] | None = None):
+    def __init__(
+        self,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
+        state_sink: Callable[[dict[str, Any]], None] | None = None,
+    ):
         self._lock = threading.RLock()
         self._event_sink = event_sink
+        self._state_sink = state_sink
         self._terminal = False
+        self._terminal_reason = ""
         self._state = self._initial_state("")
 
     @staticmethod
@@ -47,11 +53,27 @@ class RunStateStore:
         except Exception:
             return
 
+    def _sync_state_sink(self, snapshot: dict[str, Any]) -> None:
+        callback = self._state_sink
+        if callback is None:
+            return
+        try:
+            callback(copy.deepcopy(snapshot))
+        except Exception:
+            return
+
+    @property
+    def terminal_reason(self) -> str:
+        with self._lock:
+            return self._terminal_reason
+
     def reset(self, run_id: str) -> None:
         with self._lock:
             self._state = self._initial_state(run_id)
             self._terminal = False
+            self._terminal_reason = ""
             snapshot = copy.deepcopy(self._state)
+            self._sync_state_sink(snapshot)
         self._emit(snapshot)
 
     def update(
@@ -106,6 +128,7 @@ class RunStateStore:
                 and not self._state["stop_requested"]
             )
             snapshot = copy.deepcopy(self._state)
+            self._sync_state_sink(snapshot)
         self._emit(snapshot)
 
     def append_log(self, level: str, message: str, color: str = "text-slate-700") -> None:
@@ -121,6 +144,7 @@ class RunStateStore:
                 }
             )
             snapshot = copy.deepcopy(self._state)
+            self._sync_state_sink(snapshot)
         self._emit(snapshot)
 
     def add_processed(self, item: Mapping[str, Any]) -> None:
@@ -129,6 +153,7 @@ class RunStateStore:
                 return
             self._state["processed_invoices"].append(copy.deepcopy(dict(item)))
             snapshot = copy.deepcopy(self._state)
+            self._sync_state_sink(snapshot)
         self._emit(snapshot)
 
     def add_error(self, item: Mapping[str, Any]) -> None:
@@ -137,9 +162,27 @@ class RunStateStore:
                 return
             self._state["error_invoices"].append(copy.deepcopy(dict(item)))
             snapshot = copy.deepcopy(self._state)
+            self._sync_state_sink(snapshot)
         self._emit(snapshot)
 
     def terminal(self, state: str, *, status_text: str, last_error: str = "") -> None:
+        self.terminalize(
+            state,
+            status_text=status_text,
+            last_error=last_error,
+            reason_code="",
+        )
+
+    def terminalize(
+        self,
+        state: str,
+        *,
+        status_text: str,
+        last_error: str = "",
+        reason_code: str = "",
+        logs: list[Mapping[str, Any]] | None = None,
+        statistics: Mapping[str, Any] | None = None,
+    ) -> None:
         normalized = str(state)
         if normalized not in _TERMINAL_STATES:
             raise ValueError("terminal state must be completed or failed")
@@ -151,12 +194,18 @@ class RunStateStore:
             self._state["can_stop"] = False
             self._state["status_text"] = str(status_text)
             self._state["last_error"] = str(last_error)
+            if logs:
+                self._state["logs"].extend(copy.deepcopy(list(logs)))
+            if statistics is not None:
+                self._state["stats"] = copy.deepcopy(dict(statistics))
+            self._terminal_reason = str(reason_code or "")
             if normalized == "completed":
                 self._state["progress"] = 100
             elif self._state["progress"] >= 100:
                 self._state["progress"] = 99
             self._terminal = True
             snapshot = copy.deepcopy(self._state)
+            self._sync_state_sink(snapshot)
         self._emit(snapshot)
 
     def snapshot(self) -> dict[str, Any]:

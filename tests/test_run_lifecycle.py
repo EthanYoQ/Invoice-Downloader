@@ -8,6 +8,12 @@ import pytest
 from app_api import InvoiceAppAPI
 
 
+def run_reserved_worker(api, *args, **kwargs):
+    handle = api._prepare_run_lifecycle()
+    api._run_state_store.reset(handle.run_id)
+    return api._processing_worker(*args, **kwargs, run_handle=handle)
+
+
 def lifecycle_types():
     from run_lifecycle import RunLifecycle, RunState
 
@@ -776,12 +782,17 @@ def test_worker_finalizer_failure_removes_completed_facing_log(tmp_path, monkeyp
         lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
     )
 
-    api._processing_worker("", str(tmp_path / "output"), email_address="a@qq.com", auth_code="x", api_key="y")
+    run_reserved_worker(api, "", str(tmp_path / "output"), email_address="a@qq.com", auth_code="x", api_key="y")
 
     assert api.run_state == "failed"
     assert terminal_events == ["failed"]
     assert all(entry.get("type") != "完成" for entry in api.logs)
     assert "must-not-surface" not in api.last_error
+    frontend = api.get_progress()
+    assert frontend["run_state"] == api.run_state
+    assert frontend["status_text"] == api.status_text
+    assert frontend["last_error"] == api.last_error
+    assert frontend["logs"] == api.logs[-20:]
 
 
 def test_unresolved_mailbox_input_reaches_one_failed_terminal_after_readable_work(
@@ -821,7 +832,8 @@ def test_unresolved_mailbox_input_reaches_one_failed_terminal_after_readable_wor
         lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
     )
 
-    api._processing_worker(
+    run_reserved_worker(
+        api,
         "",
         str(tmp_path / "output"),
         email_address="a@qq.com",
@@ -870,7 +882,8 @@ def test_malformed_uid_search_reaches_one_sanitized_failed_terminal(
         lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
     )
 
-    api._processing_worker(
+    run_reserved_worker(
+        api,
         "",
         str(tmp_path / "output"),
         email_address="a@qq.com",
@@ -966,7 +979,8 @@ def test_actual_post_fetch_processing_exception_reaches_unresolved_failed_termin
         lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
     )
 
-    api._processing_worker(
+    run_reserved_worker(
+        api,
         "",
         str(tmp_path / "output"),
         email_address="a@qq.com",
@@ -1045,7 +1059,7 @@ def test_worker_paths_finalize_before_one_terminal_event(
         lambda old, new: events.append(new) if new in {"completed", "failed"} else None,
     )
 
-    api._processing_worker("", str(tmp_path / "output"), email_address="a@qq.com", auth_code="x", api_key="y")
+    run_reserved_worker(api, "", str(tmp_path / "output"), email_address="a@qq.com", auth_code="x", api_key="y")
 
     assert api.run_state == expected_state
     assert api.status_text == expected_status
@@ -1059,6 +1073,11 @@ def test_worker_paths_finalize_before_one_terminal_event(
         assert actionable_text in api.last_error
         assert "secret.example" not in api.last_error
         assert "API-KEY-SECRET" not in api.last_error
+    frontend = api.get_progress()
+    assert frontend["run_state"] == api.run_state
+    assert frontend["status_text"] == api.status_text
+    assert frontend["last_error"] == api.last_error
+    assert frontend["logs"] == api.logs[-20:]
 
 
 def test_processing_loop_internal_exception_reaches_worker_failed_terminal_once(tmp_path, monkeypatch):
@@ -1138,7 +1157,7 @@ def test_processing_loop_internal_exception_reaches_worker_failed_terminal_once(
         lambda stage, event, extra=None: stage_events.append((stage, event, dict(extra or {}))),
     )
 
-    api._processing_worker("", str(tmp_path / "output"), email_address="a@qq.com", auth_code="x", api_key="y")
+    run_reserved_worker(api, "", str(tmp_path / "output"), email_address="a@qq.com", auth_code="x", api_key="y")
 
     assert api.run_state == "failed"
     assert terminal_events == ["failed"]

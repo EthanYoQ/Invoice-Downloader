@@ -107,3 +107,67 @@ Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
 Worktree: clean
 Stash: stash@{0} preserved and untouched
 ```
+
+## Independent Review Remediation
+
+Task 9 remained unapproved after four Important findings. They were repaired
+with new RED tests without starting Task 10 or touching `stash@{0}`.
+
+### Atomic Facade Admission
+
+- AppAPI now owns one admission lock covering the final active-run check,
+  terminal-handle retirement, new `RunLifecycle.begin`, run-directory capture,
+  worker ownership assignment, and `Thread.start`.
+- `_prepare_run_lifecycle` rejects every existing handle; it never returns or
+  reuses one. The reserved handle is passed explicitly to the worker and
+  coordinator. `RunCoordinator.run` no longer has a staging-dir path and
+  rejects calls without a reserved handle.
+- Dependency-build and thread-start failures finalize and release that exact
+  handle once. A barrier test with two real caller threads proves one worker
+  starts and the second caller deterministically receives the busy response.
+
+### Single Terminal State Owner
+
+- `RunStateStore.terminalize` atomically commits terminal state, status, error,
+  reason, log entries, statistics, legacy-state synchronization, and one event.
+- AppAPI legacy fields are synchronized by the store's state adapter. The
+  coordinator computes the established IMAP, quota, auth, mailbox, startup,
+  processing, cancellation, and success presentation before terminalizing.
+- The worker no longer appends logs or calls `_finish_run` after coordinator
+  return. Missing-credential rejection remains an idle pre-admission response.
+- Tests assert exact legacy/frontend parity for success, cancellation, IMAP,
+  quota, processing, report-start, and finalizer failures.
+
+### Independent Resource Close
+
+- Pipeline close is an idempotent synchronous finalizer owned by the
+  coordinator, not part of the report callback.
+- Finalizer order is `pipeline_close -> report -> disconnect -> cleanup ->
+  terminal`. A close failure is aggregated and fails closed while every later
+  finalizer still runs.
+- A forced report-thread start failure proves the pipeline runtime and mailbox
+  session both close exactly once and cleanup still executes.
+
+### PII Boundary
+
+- Runtime connection logs use irreversible account hash plus channel label.
+  EmailFetcher progress replaces the exact account, authorization code, and API
+  key before state/log persistence.
+- Mail-auth errors no longer echo raw exception text. Packaged diagnostics keep
+  domain-only summaries and hashed exception/status data.
+- An end-to-end admission/worker test seeds a distinctive full address, auth
+  code, and API key and proves they are absent from legacy state, frontend
+  snapshots, store snapshots, events, diagnostics, lifecycle errors, and reprs,
+  while the useful QQ channel remains visible.
+- Source scan result: `NO_FULL_EMAIL_RENDER_PATHS`.
+
+### Remediation Verification
+
+```text
+Coordinator/lifecycle/pipeline/refactor plus GLM/email/provider/URL/P2:
+  337 passed, 33 subtests passed
+Full pytest: 528 passed, 109 subtests passed
+Ruff, py_compile, git diff --check: passed
+Strict output: tmp/strict_truth_audit_task9_reviewfix_precommit_20260711T194001Z.json
+Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
+```

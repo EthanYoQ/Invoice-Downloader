@@ -427,8 +427,8 @@ class InvoiceAppAPI:
         if truth_audit_timeout_seconds is None:
             truth_audit_timeout_seconds = DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS
         self._truth_audit_timeout_seconds = max(0.001, float(truth_audit_timeout_seconds))
+        self._admission_lock = threading.RLock()
         self._run_lifecycle = RunLifecycle()
-        self._run_state_store = RunStateStore()
         self._active_run_handle = None
         self._active_temp_dir = None
         self._terminal_frontend_run_id = ""
@@ -449,6 +449,7 @@ class InvoiceAppAPI:
         self._last_export_path = ""
         self._active_run_config = {}
         self._timing_metrics = {}
+        self._run_state_store = RunStateStore(state_sink=self._apply_run_state_snapshot)
         self._install_packaged_thread_excepthook()
         self.build_identity = load_build_identity()
         self._validate_runtime_build_identity()
@@ -464,8 +465,8 @@ class InvoiceAppAPI:
 
     def _prepare_run_lifecycle(self):
         active = self._active_run_handle
-        if active is not None and active.state not in {RunState.COMPLETED, RunState.FAILED}:
-            return active
+        if active is not None:
+            raise RuntimeError("a run handle is already assigned")
 
         run_token = uuid.uuid4().hex
         external_run_id = str(self._current_run_id or self._run_context.get("run_id", "") or "run")
@@ -478,6 +479,24 @@ class InvoiceAppAPI:
         self._active_run_handle = handle
         self._terminal_frontend_run_id = ""
         return handle
+
+    def _apply_run_state_snapshot(self, snapshot):
+        previous_state = getattr(self, "run_state", "idle")
+        self.progress = int(snapshot.get("progress", 0) or 0)
+        self.status_text = str(snapshot.get("status_text", ""))
+        self.logs = copy.deepcopy(list(snapshot.get("logs", [])))
+        self.discovered_categories = set(snapshot.get("new_categories", []))
+        self.stats = copy.deepcopy(dict(snapshot.get("stats", {})))
+        self.processed_invoices = copy.deepcopy(list(snapshot.get("processed_invoices", [])))
+        self.error_invoices = copy.deepcopy(list(snapshot.get("error_invoices", [])))
+        self._is_running = bool(snapshot.get("is_running", False))
+        self.run_state = str(snapshot.get("run_state", "idle"))
+        self.last_error = str(snapshot.get("last_error", ""))
+        self._stop_requested = bool(snapshot.get("stop_requested", False))
+        self.quota_exhausted = bool(snapshot.get("quota_exhausted", False))
+        self.quota_message = str(snapshot.get("quota_message", ""))
+        if previous_state != self.run_state:
+            self._safe_emit_run_state_event(previous_state, self.run_state)
 
     def _active_staging_path(self):
         if self._active_run_handle is not None:
@@ -1539,9 +1558,14 @@ class InvoiceAppAPI:
         )
 
     def _begin_run(self, status_text):
-        self._prepare_run_lifecycle()
-        if self._active_run_handle.state is RunState.CREATED:
-            self._active_run_handle.advance(RunState.SCANNING)
+        handle = self._active_run_handle
+        if handle is not None and handle.state in {RunState.COMPLETED, RunState.FAILED}:
+            self._active_run_handle = None
+            handle = None
+        if handle is None:
+            handle = self._prepare_run_lifecycle()
+        if handle.state is RunState.CREATED:
+            handle.advance(RunState.SCANNING)
         self.progress = 0
         self.logs = []
         self._stop_requested = False
@@ -1615,6 +1639,7 @@ class InvoiceAppAPI:
         self._stop_requested = True
         self.status_text = message
         self._append_log("停止", message, "text-amber-600")
+        self._sync_run_state_store_from_legacy()
 
     def _resolve_quota_message(self, error_text):
         normalized = str(error_text or "").lower()
@@ -1927,12 +1952,12 @@ class InvoiceAppAPI:
             mail.login(email_address, auth_code)
             mail.logout()
             return {"success": True, "message": "邮箱授权验证成功"}
-        except Exception as e:
-            return {"success": False, "message": f"验证失败，错误详情: {str(e)}"}
+        except Exception:
+            return {"success": False, "message": "邮箱授权验证失败，请检查授权码、IMAP 设置或网络"}
 
 
 
-    def _processing_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
+    def _processing_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None, run_handle=None):
         try:
             return self._run_coordinator_worker(
                 rules_text,
@@ -1942,6 +1967,7 @@ class InvoiceAppAPI:
                 email_address,
                 auth_code,
                 api_key,
+                run_handle,
             )
         except Exception as exc:
             self._packaged_diag_write(
@@ -1950,21 +1976,27 @@ class InvoiceAppAPI:
                 "exception",
                 exc=exc,
             )
-            handle = self._active_run_handle
+            handle = run_handle
             if handle is not None and handle.state in {RunState.COMPLETED, RunState.FAILED}:
                 return None
-            self._fail_run(
-                "处理失败",
-                str(exc) or "COORDINATOR_START_FAILED",
-                reason_code="COORDINATOR_START_FAILED",
-                user_message="后台任务启动失败，请重试。",
-            )
+            if handle is not None:
+                self._finalize_admission_failure(
+                    handle,
+                    exc,
+                    reason_code="COORDINATOR_START_FAILED",
+                )
             return None
+        finally:
+            current = threading.current_thread()
+            with self._admission_lock:
+                if self._worker_thread is current:
+                    self._worker_thread = None
 
-    def _run_coordinator_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        self._begin_run("正在初始化任务...")
+    def _run_coordinator_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None, run_handle=None):
+        if run_handle is None or run_handle is not self._active_run_handle:
+            raise RuntimeError("reserved run handle ownership is required")
         request = RunRequest(
-            run_id=self._active_run_handle.run_id,
+            run_id=run_handle.run_id,
             date_from=str(date_from or ""),
             date_to=str(date_to or ""),
             save_path=str(save_path or ""),
@@ -1972,33 +2004,34 @@ class InvoiceAppAPI:
             account_id=stable_hash(str(email_address or ""))[:12],
             channel_id=str(email_address or "").rsplit("@", 1)[-1].split(".", 1)[0].lower(),
         )
-        dependencies = self._build_run_dependencies(
-            request,
-            email_address=email_address,
-            auth_code=auth_code,
-            api_key=api_key,
-        )
+        try:
+            dependencies = self._build_run_dependencies(
+                request,
+                email_address=email_address,
+                auth_code=auth_code,
+                api_key=api_key,
+            )
+        except Exception as setup_exc:
+            def fail_setup(_request, failure=setup_exc):
+                raise failure
+
+            dependencies = RunDependencies(
+                connect=fail_setup,
+                report_service=ReportService(
+                    report_callback=lambda _context, _result: self._await_truth_audit(),
+                    cleanup_callback=lambda context: self._cleanup_temp_folders(
+                        staging_dir=context.staging_dir,
+                        temp_dir=self._active_temp_dir,
+                    ),
+                    timeout_seconds=self._truth_audit_timeout_seconds + 1.0,
+                ),
+            )
         coordinator = RunCoordinator(
             self._run_lifecycle,
             self._run_state_store,
             dependencies,
         )
-        result = coordinator.run(request, handle=self._active_run_handle)
-        self._sync_run_state_store_from_legacy()
-        if result.state is RunState.COMPLETED:
-            self._append_log(
-                "完成",
-                "已完成安全停止。" if result.cancelled else "处理循环已完成。",
-                "text-amber-600" if result.cancelled else "text-emerald-400",
-            )
-            self._finish_run(True, "已安全停止" if result.cancelled else "处理完成")
-        else:
-            self._append_log("ERROR", f"System exception: {result.error}", "text-error")
-            failed_status = {
-                "IMAP_LOGIN_FAILED": "邮箱登录失败",
-                "QUOTA_EXHAUSTED": "GLM API 额度不足",
-            }.get(result.reason_code, "处理失败")
-            self._finish_run(False, failed_status, last_error=result.error)
+        return coordinator.run(request, handle=run_handle)
 
     def _build_run_dependencies(
         self,
@@ -2016,6 +2049,20 @@ class InvoiceAppAPI:
 
         resources = {"fetcher": None, "pipeline": None}
 
+        account_label = f"{request.channel_id}:{request.account_id}"
+
+        def sanitize_runtime_message(message):
+            text = str(message or "")
+            replacements = {
+                str(email_address or ""): account_label,
+                str(auth_code or ""): "[redacted-auth]",
+                str(api_key or ""): "[redacted-api-key]",
+            }
+            for sensitive, replacement in replacements.items():
+                if sensitive:
+                    text = re.sub(re.escape(sensitive), replacement, text, flags=re.IGNORECASE)
+            return text
+
         def connect(_request):
             channel = resolve_channel(email_address)
             fetcher = EmailFetcher(
@@ -2024,10 +2071,16 @@ class InvoiceAppAPI:
                 imap_server=channel["imap_host"],
                 staging_dir=self._active_staging_path(),
                 monitoring_dir=self._run_context.get("monitoring_dir"),
-                progress_callback=self._on_email_fetcher_progress,
+                progress_callback=lambda message: self._on_email_fetcher_progress(
+                    sanitize_runtime_message(message)
+                ),
             )
             resources["fetcher"] = fetcher
-            self._append_log("运行", f"正在连接邮箱 {email_address}...", "text-blue-400")
+            self._append_log(
+                "运行",
+                f"正在连接邮箱通道 {request.channel_id}（账户 {request.account_id}）...",
+                "text-blue-400",
+            )
             if not fetcher.connect():
                 raise ImapLoginError("IMAP_LOGIN_FAILED")
             return fetcher
@@ -2053,6 +2106,8 @@ class InvoiceAppAPI:
             )
             self.stats["emails"] = len(email_ids)
             self._append_log("信息", f"共匹配到 {len(email_ids)} 封邮件。", "text-emerald-400")
+            if self._stop_requested:
+                self._sync_run_state_store_from_legacy()
             return email_ids
 
         def candidate(fetcher_email_ids, _request):
@@ -2073,6 +2128,7 @@ class InvoiceAppAPI:
                     getattr(self, "_coordinator_before_date", request.date_to),
                     request.rules_text,
                 )
+                self._sync_run_state_store_from_legacy()
                 return [resources["compatibility_report"]]
             extractor_parameters = inspect.signature(InvoiceExtractor).parameters.values()
             supports_glm_settings = any(
@@ -2126,12 +2182,14 @@ class InvoiceAppAPI:
             return report
 
         def report_callback(_context, _result):
+            self._await_truth_audit()
+
+        def pipeline_close():
             try:
-                self._await_truth_audit()
-            finally:
                 pipeline = resources.get("pipeline")
                 if pipeline is not None:
                     pipeline.close()
+            finally:
                 self._sync_run_state_store_from_legacy()
 
         def disconnect_callback(_context, fetcher):
@@ -2142,16 +2200,6 @@ class InvoiceAppAPI:
                 staging_dir=context.staging_dir,
                 temp_dir=self._active_temp_dir,
             )
-
-        def stage_callback(state, _payload):
-            status = {
-                RunState.SCANNING: (10, "正在扫描邮件..."),
-                RunState.RECOVERING: (30, "正在提取附件..."),
-                RunState.EXTRACTING: (45, "正在识别发票..."),
-                RunState.ARCHIVING: (90, "正在归档发票..."),
-                RunState.REPORTING: (95, "正在生成运行报告..."),
-            }[state]
-            self._set_run_state("running", status_text=status[1], progress=status[0])
 
         return RunDependencies(
             connect=connect,
@@ -2167,8 +2215,9 @@ class InvoiceAppAPI:
             ),
             cancel_requested=lambda: bool(self._stop_requested),
             secrets={"auth_code": auth_code, "api_key": api_key},
-            stage_callback=stage_callback,
             finalizer_session=lambda: resources.get("fetcher"),
+            pipeline_close=pipeline_close,
+            state_flush=self._sync_run_state_store_from_legacy,
         )
 
 
@@ -2746,31 +2795,6 @@ class InvoiceAppAPI:
         self._last_export_path = export_file
         return {"success": True, "message": "结果明细已导出", "path": export_file}
 
-    def _legacy_start_processing_pre_release_prep(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        '''
-        """前端点击执行时调用：新开线程防止卡死界面"""
-        import os
-        print(f"Start processing with rules: {rules_text}, save to: {save_path}, date range: {date_from} to {date_to}")
-        if self._is_running or (self._worker_thread and self._worker_thread.is_alive()):
-            return {"success": False, "message": "任务已在运行中"}
-            
-        # 目录保护：启动前先确保保存路径存在
-        try:
-            if not os.path.exists(save_path):
-                os.makedirs(save_path, exist_ok=True)
-        except Exception as e:
-            return {"success": False, "message": f"无法创建保存目录: {e}"}
-            
-        self._set_run_state("running", status_text="鍑嗗涓?", progress=5, last_error="")
-        self.status_text = "准备中"
-        
-        thread = threading.Thread(target=self._processing_worker, args=(rules_text, save_path, date_from, date_to, email_address, auth_code, api_key))
-        thread.daemon = True
-        thread.start()
-        self._worker_thread = thread
-        return {"success": True, "message": "任务已启动"}
-
-        '''
 
     def _start_async_finalizers(self, fetcher=None):
         handle = self._active_run_handle or self._prepare_run_lifecycle()
@@ -2819,7 +2843,9 @@ class InvoiceAppAPI:
             summary={"include_traceback": bool(include_traceback)},
             exc=active_exc,
         )
-        handle = self._prepare_run_lifecycle()
+        handle = self._active_run_handle
+        if handle is None:
+            handle = self._prepare_run_lifecycle()
         if not reason_code or not user_message:
             inferred_code, inferred_message = self._safe_failure_contract(status_text, error_message)
             reason_code = reason_code or inferred_code
@@ -3083,6 +3109,168 @@ class InvoiceAppAPI:
         self._last_export_path = export_file
         return {"success": True, "message": "运行摘要已导出", "path": export_file}
 
+    def _finalize_admission_failure(self, handle, exc, *, reason_code="WORKER_START_FAILED"):
+        if handle.state in {RunState.COMPLETED, RunState.FAILED}:
+            return handle.state
+        handle.fail(
+            exc,
+            reason_code=reason_code,
+            user_message="后台任务启动失败，请重试。",
+        )
+        self._run_state_store.update(
+            run_state="finalizing",
+            progress=99,
+            status_text="正在收尾...",
+        )
+        staging_dir = handle.staging_dir
+        temp_dir = self._active_temp_dir
+        state = handle.finalize(
+            [
+                ("report", self._await_truth_audit),
+                (
+                    "cleanup",
+                    lambda: self._cleanup_temp_folders(
+                        staging_dir=staging_dir,
+                        temp_dir=temp_dir,
+                    ),
+                ),
+            ]
+        )
+        error = handle.error
+        self._run_state_store.terminalize(
+            "failed",
+            status_text="启动失败",
+            last_error=error,
+            reason_code=reason_code,
+            logs=[
+                {
+                    "time": time.strftime("[%H:%M:%S]"),
+                    "type": "ERROR",
+                    "color": "text-error",
+                    "msg": f"System exception: {error}",
+                }
+            ],
+        )
+        self._worker_thread = None
+        return state
+
+    def _admit_processing_run(
+        self,
+        *,
+        rules_text,
+        requested_save_path,
+        effective_save_path,
+        email_address,
+        auth_code,
+        api_key,
+    ):
+        with self._admission_lock:
+            worker_active = bool(self._worker_thread and self._worker_thread.is_alive())
+            active_handle = self._active_run_handle
+            handle_active = bool(
+                active_handle
+                and active_handle.state not in {RunState.COMPLETED, RunState.FAILED}
+            )
+            if worker_active or handle_active or not self._run_lifecycle.can_begin:
+                return {"success": False, "message": "任务已在运行中"}
+            if active_handle is not None:
+                self._active_run_handle = None
+
+            try:
+                handle = self._prepare_run_lifecycle()
+            except Exception as exc:
+                return {"success": False, "message": f"无法创建运行临时目录: {type(exc).__name__}"}
+
+            self._run_state_store.reset(handle.run_id)
+            self._run_state_store.update(
+                run_state="running",
+                status_text="正在准备运行...",
+                progress=5,
+            )
+            self._run_state_store.append_log(
+                "信息",
+                "前端请求已接收，后台任务正在启动。",
+                "text-blue-400",
+            )
+            self._packaged_diag_reset(
+                {
+                    "requested_save_path": requested_save_path,
+                    "effective_save_path": effective_save_path,
+                    "date_from": self._effective_date_from,
+                    "date_to": self._effective_date_to,
+                    "email_domain": self._packaged_diag_email_domain(email_address),
+                    "has_auth_code": bool(auth_code),
+                    "has_api_key": bool(api_key),
+                }
+            )
+            self._packaged_diag_write(
+                "progress_5_written",
+                "start_processing",
+                "success",
+                summary={
+                    "requested_save_path": requested_save_path,
+                    "effective_save_path": effective_save_path,
+                    "date_from": self._effective_date_from,
+                    "date_to": self._effective_date_to,
+                    "email_domain": self._packaged_diag_email_domain(email_address),
+                    "has_auth_code": bool(auth_code),
+                    "has_api_key": bool(api_key),
+                },
+            )
+            self._safe_emit_stage_event(
+                "start_processing",
+                "enter",
+                {
+                    "requested_save_path": requested_save_path,
+                    "effective_save_path": effective_save_path,
+                    "date_from": self._effective_date_from,
+                    "date_to": self._effective_date_to,
+                    **self._sensitive_summary(email_address, auth_code, api_key),
+                },
+            )
+            self._safe_write_run_config(email_address, auth_code=auth_code, api_key=api_key)
+            try:
+                self._start_truth_audit_async(email_address, auth_code)
+            except Exception as exc:
+                self._safe_emit_stage_event(
+                    "start_processing",
+                    "exit",
+                    {"result": "failed", "reason": "WORKER_START_FAILED"},
+                )
+                self._finalize_admission_failure(handle, exc)
+                return {"success": False, "message": "后台任务启动失败"}
+
+            thread = threading.Thread(
+                target=self._processing_worker,
+                args=(
+                    rules_text,
+                    effective_save_path,
+                    self._effective_date_from,
+                    self._effective_date_to,
+                    email_address,
+                    auth_code,
+                    api_key,
+                    handle,
+                ),
+                name="InvoiceFlowWorker",
+                daemon=True,
+            )
+            self._worker_thread = thread
+            self._packaged_diag_write("worker_thread_created", "start_processing", "success")
+            try:
+                thread.start()
+            except Exception as exc:
+                self._finalize_admission_failure(handle, exc)
+                return {"success": False, "message": "后台任务启动失败"}
+            self._packaged_diag_write(
+                "worker_thread_started",
+                "start_processing",
+                "success",
+                summary={"thread_is_alive": bool(thread.is_alive())},
+            )
+            self._safe_emit_stage_event("start_processing", "exit", {"result": "started"})
+            return {"success": True, "message": "任务已启动"}
+
     def start_processing(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
         import os
 
@@ -3150,96 +3338,14 @@ class InvoiceAppAPI:
         else:
             self.save_user_settings({"remember_settings": False})
 
-        self._packaged_diag_reset(
-            {
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "date_from": self._effective_date_from,
-                "date_to": self._effective_date_to,
-                "email_domain": self._packaged_diag_email_domain(email_address),
-                "has_auth_code": bool(auth_code),
-                "has_api_key": bool(api_key),
-            }
+        return self._admit_processing_run(
+            rules_text=rules_text,
+            requested_save_path=requested_save_path,
+            effective_save_path=effective_save_path,
+            email_address=email_address,
+            auth_code=auth_code,
+            api_key=api_key,
         )
-        try:
-            self._prepare_run_lifecycle()
-        except Exception as exc:
-            return {"success": False, "message": f"无法创建运行临时目录: {type(exc).__name__}"}
-        self._set_run_state("running", status_text="正在准备运行...", progress=5, last_error="")
-        self._packaged_diag_write(
-            "progress_5_written",
-            "start_processing",
-            "success",
-            summary={
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "date_from": self._effective_date_from,
-                "date_to": self._effective_date_to,
-                "email_domain": self._packaged_diag_email_domain(email_address),
-                "has_auth_code": bool(auth_code),
-                "has_api_key": bool(api_key),
-            },
-        )
-        self._safe_emit_stage_event(
-            "start_processing",
-            "enter",
-            {
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "date_from": self._effective_date_from,
-                "date_to": self._effective_date_to,
-                **self._sensitive_summary(email_address, auth_code, api_key),
-            },
-        )
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "信息",
-            "color": "text-blue-400",
-            "msg": "前端请求已接收，后台任务正在启动。",
-        })
-        self._safe_write_run_config(email_address, auth_code=auth_code, api_key=api_key)
-        try:
-            self._start_truth_audit_async(email_address, auth_code)
-        except Exception as exc:
-            self._safe_emit_stage_event(
-                "start_processing",
-                "exit",
-                {"result": "failed", "reason": "WORKER_START_FAILED"},
-            )
-            self._fail_run(
-                "启动失败",
-                str(exc) or "WORKER_START_FAILED",
-                reason_code="WORKER_START_FAILED",
-                user_message="后台任务启动失败，请重试。",
-            )
-            return {"success": False, "message": "后台任务启动失败"}
-
-        thread = threading.Thread(
-            target=self._processing_worker,
-            args=(rules_text, effective_save_path, self._effective_date_from, self._effective_date_to, email_address, auth_code, api_key),
-            name="InvoiceFlowWorker",
-            daemon=True,
-        )
-        self._packaged_diag_write("worker_thread_created", "start_processing", "success")
-        self._worker_thread = thread
-        try:
-            thread.start()
-        except Exception as exc:
-            self._fail_run(
-                "启动失败",
-                str(exc) or "WORKER_START_FAILED",
-                reason_code="WORKER_START_FAILED",
-                user_message="后台任务启动失败，请重试。",
-            )
-            return {"success": False, "message": "后台任务启动失败"}
-        self._packaged_diag_write(
-            "worker_thread_started",
-            "start_processing",
-            "success",
-            summary={"thread_is_alive": bool(thread.is_alive())},
-        )
-        self._safe_emit_stage_event("start_processing", "exit", {"result": "started"})
-        return {"success": True, "message": "任务已启动"}
 
     def get_processed_records(self):
         """前端数据分析页面调用，获取已处理的账单或发票记录"""
