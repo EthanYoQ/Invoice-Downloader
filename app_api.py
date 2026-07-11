@@ -10,13 +10,13 @@ import uuid
 from pathlib import Path
 
 from archive_pairing import (
+    assign_hotel_pairs,
+    assign_ride_pairs,
     build_hotel_pair_renames,
     build_ride_pair_renames,
     is_hotel_folio_filename,
     is_hotel_order_filename,
     is_ride_itinerary_filename,
-    match_hotel_pairs,
-    match_ride_pairs,
     parse_archived_filename,
 )
 from build_identity import load_build_identity
@@ -2168,6 +2168,10 @@ class InvoiceAppAPI:
                         source_path=info.get("filepath"),
                         document_id=document_id,
                     )
+                    trace_store.set_fields(
+                        document_id,
+                        source_message_uid=str(info.get("email_id") or info.get("source_email_id") or "").strip(),
+                    )
                     prefilter_reason_code = info.get("prefilter_reason_code")
                     prefilter_metadata = self._attachment_diag_metadata(
                         info,
@@ -3742,6 +3746,23 @@ class InvoiceAppAPI:
                         
             # --- PHASE 2: 票据撮合与交替重命名 ---
             self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": "开始执行发票↔行程单/水单撮合..."})
+
+            def _enrich_pairing_meta(meta):
+                record = trace_store.get_record(meta.get("document_id")) or {}
+                normalized_fields = record.get("normalized_fields") or {}
+                if normalized_fields.get("Seller"):
+                    meta["seller"] = normalized_fields["Seller"]
+                meta["source_message_uid"] = str(record.get("source_message_uid") or "").strip()
+                return meta
+
+            def _pairing_meta_id(meta):
+                return str(
+                    meta.get("document_id")
+                    or meta.get("id")
+                    or meta.get("path")
+                    or meta.get("filename")
+                    or ""
+                )
             
             def _reconcile_ride_documents(ride_folder_path):
                 """打车文件夹内的发票↔行程单撮合 + 交替重命名"""
@@ -3759,6 +3780,7 @@ class InvoiceAppAPI:
                     meta["path"] = fpath
                     meta["filename"] = fname
                     meta["document_id"] = trace_store.get_document_id_by_archive_target(fpath)
+                    _enrich_pairing_meta(meta)
                     
                     # 判断是发票还是行程单
                     if is_ride_itinerary_filename(fname):
@@ -3781,7 +3803,8 @@ class InvoiceAppAPI:
                     return
                 
                 # 金额匹配: 精确匹配或 1.03 税务容差；打车月末集中开票，不做日期约束。
-                matched = match_ride_pairs(invoices, itineraries)
+                assignment = assign_ride_pairs(invoices, itineraries)
+                matched = list(assignment.pairs)
                 
                 # 交替重命名
                 for idx, (inv, itn) in enumerate(matched, 1):
@@ -3849,21 +3872,30 @@ class InvoiceAppAPI:
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"重命名失败: {e}"})
                 
                 # 报告未匹配
-                unmatched_inv = [inv for inv in invoices if inv not in [m[0] for m in matched]]
-                unmatched_itn = [itn for itn in itineraries if itn not in [m[1] for m in matched]]
+                ambiguous_ids = {
+                    document_id
+                    for ambiguity in assignment.ambiguities
+                    for document_id in ambiguity.document_ids
+                }
+                unmatched_inv = list(assignment.unmatched_invoices)
+                unmatched_itn = list(assignment.unmatched_companions)
                 for inv in unmatched_inv:
+                    is_ambiguous = _pairing_meta_id(inv) in ambiguous_ids
                     _record_combine_result(
                         inv.get("document_id"),
-                        "not_matched",
-                        "RIDE_COMBINE_NO_MATCH",
-                        "未找到可匹配的打车行程单。",
+                        "ambiguous" if is_ambiguous else "not_matched",
+                        "RIDE_COMBINE_AMBIGUOUS_ASSIGNMENT" if is_ambiguous else "RIDE_COMBINE_NO_MATCH",
+                        "存在多个同分最优打车撮合，未自动配对。" if is_ambiguous else "未找到可匹配的打车行程单。",
+                        ambiguity_reason="multiple_optimal_pair_memberships" if is_ambiguous else None,
                     )
                 for itn in unmatched_itn:
+                    is_ambiguous = _pairing_meta_id(itn) in ambiguous_ids
                     _record_combine_result(
                         itn.get("document_id"),
-                        "not_matched",
-                        "RIDE_COMBINE_NO_MATCH",
-                        "未找到可匹配的打车发票。",
+                        "ambiguous" if is_ambiguous else "not_matched",
+                        "RIDE_COMBINE_AMBIGUOUS_ASSIGNMENT" if is_ambiguous else "RIDE_COMBINE_NO_MATCH",
+                        "存在多个同分最优打车撮合，未自动配对。" if is_ambiguous else "未找到可匹配的打车发票。",
+                        ambiguity_reason="multiple_optimal_pair_memberships" if is_ambiguous else None,
                     )
                 if unmatched_inv:
                     self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-yellow-400", "msg": f"未匹配发票 {len(unmatched_inv)} 张: {', '.join(u['filename'] for u in unmatched_inv)}"})
@@ -3888,6 +3920,7 @@ class InvoiceAppAPI:
                     meta["path"] = fpath
                     meta["filename"] = fname
                     meta["document_id"] = trace_store.get_document_id_by_archive_target(fpath)
+                    _enrich_pairing_meta(meta)
                     
                     # 住宿确认单/航班行程单不参与发票↔水单撮合
                     if is_hotel_order_filename(fname):
@@ -3918,7 +3951,8 @@ class InvoiceAppAPI:
                     return
                 
                 # 联合主键匹配: 金额精确 + 日期 0-3 天容差；日期解析失败时仅凭金额。
-                matched = match_hotel_pairs(invoices, folios)
+                assignment = assign_hotel_pairs(invoices, folios)
+                matched = list(assignment.pairs)
                 
                 # 交替重命名
                 for idx, (inv, fol) in enumerate(matched, 1):
@@ -3985,21 +4019,30 @@ class InvoiceAppAPI:
                         )
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"重命名失败: {e}"})
                 
-                unmatched_inv = [inv for inv in invoices if inv not in [m[0] for m in matched]]
-                unmatched_fol = [fol for fol in folios if fol not in [m[1] for m in matched]]
+                ambiguous_ids = {
+                    document_id
+                    for ambiguity in assignment.ambiguities
+                    for document_id in ambiguity.document_ids
+                }
+                unmatched_inv = list(assignment.unmatched_invoices)
+                unmatched_fol = list(assignment.unmatched_companions)
                 for inv in unmatched_inv:
+                    is_ambiguous = _pairing_meta_id(inv) in ambiguous_ids
                     _record_combine_result(
                         inv.get("document_id"),
-                        "not_matched",
-                        "HOTEL_COMBINE_NO_MATCH",
-                        "未找到可匹配的住宿水单。",
+                        "ambiguous" if is_ambiguous else "not_matched",
+                        "HOTEL_COMBINE_AMBIGUOUS_ASSIGNMENT" if is_ambiguous else "HOTEL_COMBINE_NO_MATCH",
+                        "存在多个同分最优住宿撮合，未自动配对。" if is_ambiguous else "未找到可匹配的住宿水单。",
+                        ambiguity_reason="multiple_optimal_pair_memberships" if is_ambiguous else None,
                     )
                 for fol in unmatched_fol:
+                    is_ambiguous = _pairing_meta_id(fol) in ambiguous_ids
                     _record_combine_result(
                         fol.get("document_id"),
-                        "not_matched",
-                        "HOTEL_COMBINE_NO_MATCH",
-                        "未找到可匹配的住宿发票。",
+                        "ambiguous" if is_ambiguous else "not_matched",
+                        "HOTEL_COMBINE_AMBIGUOUS_ASSIGNMENT" if is_ambiguous else "HOTEL_COMBINE_NO_MATCH",
+                        "存在多个同分最优住宿撮合，未自动配对。" if is_ambiguous else "未找到可匹配的住宿发票。",
+                        ambiguity_reason="multiple_optimal_pair_memberships" if is_ambiguous else None,
                     )
 
                 self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": f"住宿撮合完成: 成功配对 {len(matched)} 组"})
