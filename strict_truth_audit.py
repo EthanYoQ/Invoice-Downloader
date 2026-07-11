@@ -341,7 +341,40 @@ def _maximum_matching(adjacency: dict[int, list[int]], rows: list[int], excluded
     return {row_index: artifact_index for artifact_index, row_index in artifact_to_row.items()}
 
 
+def _possible_artifact_memberships(
+    adjacency: dict[int, list[int]],
+    rows: list[int],
+    excluded_artifacts=frozenset(),
+) -> dict[int, list[int]]:
+    maximum_size = len(_maximum_matching(adjacency, rows, excluded_artifacts))
+    possible = {}
+    for row_index in rows:
+        other_rows = [index for index in rows if index != row_index]
+        possible[row_index] = [
+            artifact_index
+            for artifact_index in adjacency.get(row_index, [])
+            if len(_maximum_matching(
+                adjacency,
+                other_rows,
+                excluded_artifacts | {artifact_index},
+            )) + 1 == maximum_size
+        ]
+    return possible
+
+
+def validate_truth_ids(rows: list[dict]) -> None:
+    seen = set()
+    for index, row in enumerate(rows):
+        truth_id = str(row.get("truth_id") or "")
+        if not truth_id.strip():
+            raise ValueError(f"included truth row at index {index} must have a nonempty truth_id")
+        if truth_id in seen:
+            raise ValueError(f"duplicate truth_id '{truth_id}' in included truth rows")
+        seen.add(truth_id)
+
+
 def assign_truth_matches(rows: list[dict], artifacts: list[dict], output_hashes: dict) -> dict[str, tuple[dict | None, str]]:
+    validate_truth_ids(rows)
     assignment_artifacts = list(artifacts)
     known_paths = {
         str(Path(artifact.get("path", "")).resolve()).lower()
@@ -385,28 +418,46 @@ def assign_truth_matches(rows: list[dict], artifacts: list[dict], output_hashes:
         for row in rows
     }
     used_artifacts = set()
-    strong_edges = []
-    for row_index, indexes in candidates.items():
-        method = methods[row_index]
-        if method not in {"invoice_number", "sha256"}:
-            continue
-        for artifact_index in indexes:
-            strong_edges.append((
-                MATCH_METHODS.index(method),
-                is_retention_artifact(assignment_artifacts[artifact_index]),
-                str(assignment_artifacts[artifact_index].get("path", "")),
-                str(rows[row_index].get("truth_id", "")),
-                row_index,
-                artifact_index,
-            ))
     assigned_rows = set()
-    for *_, row_index, artifact_index in sorted(strong_edges):
-        if row_index in assigned_rows or artifact_index in used_artifacts:
-            continue
-        truth_id = str(rows[row_index].get("truth_id", ""))
-        assigned[truth_id] = (assignment_artifacts[artifact_index], methods[row_index])
-        assigned_rows.add(row_index)
-        used_artifacts.add(artifact_index)
+    for method in ("invoice_number", "sha256"):
+        method_rows = sorted(
+            (row_index for row_index in range(len(rows)) if methods[row_index] == method),
+            key=lambda index: str(rows[index].get("truth_id", "")),
+        )
+        adjacency = {}
+        for row_index in method_rows:
+            available = [index for index in candidates[row_index] if index not in used_artifacts]
+            best_retention_rank = min(
+                (is_retention_artifact(assignment_artifacts[index]) for index in available),
+                default=False,
+            )
+            adjacency[row_index] = [
+                index for index in available
+                if is_retention_artifact(assignment_artifacts[index]) == best_retention_rank
+            ]
+        possible_by_row = _possible_artifact_memberships(adjacency, method_rows, used_artifacts)
+        strong_edges = []
+        for row_index, possible_artifacts in possible_by_row.items():
+            truth_id = str(rows[row_index].get("truth_id", ""))
+            if len(possible_artifacts) > 1:
+                assigned[truth_id] = (None, "ambiguous_match")
+                continue
+            for artifact_index in possible_artifacts:
+                strong_edges.append((
+                    MATCH_METHODS.index(method),
+                    is_retention_artifact(assignment_artifacts[artifact_index]),
+                    str(assignment_artifacts[artifact_index].get("path", "")),
+                    truth_id,
+                    row_index,
+                    artifact_index,
+                ))
+        for *_, row_index, artifact_index in sorted(strong_edges):
+            if row_index in assigned_rows or artifact_index in used_artifacts:
+                continue
+            truth_id = str(rows[row_index].get("truth_id", ""))
+            assigned[truth_id] = (assignment_artifacts[artifact_index], method)
+            assigned_rows.add(row_index)
+            used_artifacts.add(artifact_index)
 
     composite_rows = [
         row_index for row_index in range(len(rows))
@@ -659,8 +710,10 @@ def evaluate_p2_pairs(manifest: dict, matched_by_truth_id: dict[str, dict]) -> d
 
 
 def compare(manifest: dict, run_root: Path) -> dict:
+    included_rows = manifest.get("included", [])
+    validate_truth_ids(included_rows)
     artifacts, output_hashes = load_artifacts(run_root)
-    assignments = assign_truth_matches(manifest.get("included", []), artifacts, output_hashes)
+    assignments = assign_truth_matches(included_rows, artifacts, output_hashes)
     p0_rows = []
     matched_rows = []
     manual_check_rows = []
@@ -668,7 +721,7 @@ def compare(manifest: dict, run_root: Path) -> dict:
     field_mismatch_rows = []
     matched_by_truth_id = {}
 
-    for row in manifest.get("included", []):
+    for row in included_rows:
         artifact, method = assignments[str(row.get("truth_id", ""))]
         if not artifact:
             p0_rows.append({
@@ -798,7 +851,10 @@ def main():
     manifest = json.loads(Path(args.truth_manifest).read_text(encoding="utf-8"))
     if manifest.get("summary", {}).get("finalized") is not True or manifest.get("summary", {}).get("pending_review_count") != 0:
         raise SystemExit("truth manifest is not finalized or pending_review_count is not 0")
-    result = compare(manifest, Path(args.run_root))
+    try:
+        result = compare(manifest, Path(args.run_root))
+    except ValueError as exc:
+        raise SystemExit(f"invalid truth manifest: {exc}") from None
     output = Path(args.output) if args.output else Path(args.truth_manifest).with_name("strict_truth_audit_result.json")
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     markdown_output = output.with_suffix(".md")
