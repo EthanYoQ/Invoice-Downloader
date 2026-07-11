@@ -171,3 +171,16 @@ Ruff, py_compile, git diff --check: passed
 Strict output: tmp/strict_truth_audit_task9_reviewfix_precommit_20260711T194001Z.json
 Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
 ```
+
+Post-remediation-commit evidence:
+
+```text
+Commit: 66cc1f1
+Focused: 337 passed, 33 subtests passed
+Full pytest: 528 passed, 109 subtests passed
+Ruff, py_compile, git diff --check: passed
+Strict output: tmp/strict_truth_audit_66cc1f1_20260711T194111Z.json
+Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
+Worktree: clean
+Stash: stash@{0} preserved and untouched
+```
