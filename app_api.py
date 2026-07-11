@@ -26,8 +26,10 @@ from email_channel import resolve_channel
 from frontend_run_context import ensure_run_context_dirs, load_run_context, serialize_run_context
 from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
 from url_trace_sanitizer import (
+    build_url_history_key,
     build_url_evidence,
     sanitize_persistence_payload,
+    sanitize_url_trace_record,
     stable_hash,
 )
 from user_settings import (
@@ -53,16 +55,12 @@ def build_processing_history_key(info, file_name, pdf_path):
         provider_family = str(info.get("provider_family") or "").strip()
         email_id = str(info.get("email_id") or "").strip()
         source_url = str(info.get("source_url") or pdf_path or file_name or "").strip()
-        if provider_family or invoice_number or email_id or source_url:
-            parts = [
-                "url",
-                provider_family or "generic",
-                email_id,
-                invoice_number,
-                source_url,
-            ]
-            return ":".join(parts)
-        return f"url:{legacy_key}"
+        return build_url_history_key(
+            provider_family=provider_family,
+            email_id=email_id,
+            invoice_number=invoice_number,
+            source_url=source_url or legacy_key,
+        )
 
     try:
         with open(pdf_path, "rb") as source_file:
@@ -250,8 +248,15 @@ class _FallbackDocumentTraceStore:
         self._records = {}
         self._order = []
         self._archive_index = {}
+        self._url_document_ids = set()
 
-    def start_document(self, source_filename, source_path=None, document_id=None):
+    def start_document(
+        self,
+        source_filename,
+        source_path=None,
+        document_id=None,
+        persistence_is_url=False,
+    ):
         doc_id = document_id or uuid.uuid4().hex
         if doc_id not in self._records:
             self._records[doc_id] = {
@@ -269,6 +274,8 @@ class _FallbackDocumentTraceStore:
             if source_path:
                 self._records[doc_id]["source_path"] = source_path
             self._order.append(doc_id)
+        if persistence_is_url:
+            self._url_document_ids.add(doc_id)
         return doc_id
 
     def get_record(self, document_id):
@@ -351,8 +358,11 @@ class _FallbackDocumentTraceStore:
         temp_path = f"{self.output_path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
             for document_id in self._order:
+                record = self._records[document_id]
+                if document_id in self._url_document_ids:
+                    record = sanitize_url_trace_record(record)
                 json.dump(
-                    self._records[document_id],
+                    record,
                     handle,
                     ensure_ascii=False,
                     default=str,
@@ -580,17 +590,18 @@ class InvoiceAppAPI:
             "extract_result_count",
             "url_result_count",
         }
-        return {key: value for key, value in summary.items() if key in allowed_keys}
+        allowed = {key: value for key, value in summary.items() if key in allowed_keys}
+        return sanitize_persistence_payload(allowed)
 
     def _packaged_diag_write(self, stage, function_name, outcome, summary=None, exc=None):
         if not self._packaged_diag_enabled:
             return
 
         exc_type = ""
-        exc_message = ""
+        exc_message_hash = ""
         if exc is not None:
             exc_type = getattr(getattr(exc, "__class__", None), "__name__", "") or type(exc).__name__
-            exc_message = str(exc)
+            exc_message_hash = stable_hash(str(exc))
 
         self._diag_append_jsonl(
             self._packaged_diag_file(),
@@ -604,10 +615,10 @@ class InvoiceAppAPI:
                 "pid": os.getpid(),
                 "run_state": self.run_state,
                 "progress": self.progress,
-                "status_text": self.status_text,
+                "status_hash": stable_hash(self.status_text),
                 "summary": self._packaged_diag_summary(summary),
                 "exc_type": exc_type,
-                "exc_message": exc_message,
+                "exc_message_hash": exc_message_hash,
             },
         )
 
@@ -711,11 +722,11 @@ class InvoiceAppAPI:
             "event": event,
             "run_state": self.run_state,
             "progress": self.progress,
-            "status_text": self.status_text,
+            "status_hash": stable_hash(self.status_text),
             **self._snapshot_counts(),
         }
         if extra:
-            payload.update(extra)
+            payload.update(sanitize_persistence_payload(dict(extra)))
         self._diag_append_jsonl(self._monitoring_path("stage_events.jsonl"), payload)
 
     def _safe_emit_artifact_event(self, kind, path, document_id=None, source_kind=None, reason_code=None, category=None, extra=None):
@@ -1277,6 +1288,22 @@ class InvoiceAppAPI:
             "color": color,
             "msg": message,
         })
+
+    @staticmethod
+    def _url_candidate_label(info):
+        info = info or {}
+        identity = {
+            "source_url": info.get("source_url") or info.get("filepath") or "",
+            "email_id": info.get("email_id") or info.get("source_email_id") or "",
+            "provider_family": info.get("provider_family") or "",
+        }
+        return f"URL-candidate-{stable_hash(identity)[:12]}"
+
+    def _sanitize_url_candidate_logs(self, start_index, info):
+        label = self._url_candidate_label(info)
+        for entry in self.logs[max(0, int(start_index or 0)):]:
+            if isinstance(entry, dict):
+                entry["msg"] = f"URL candidate processing event [{label}]"
 
     def _on_email_fetcher_progress(self, message):
         message = str(message or "").strip()
@@ -2239,19 +2266,33 @@ class InvoiceAppAPI:
                 file_name = source_filename
                 pdf_path = info['filepath']
                 tier_info = info.get('tier', '未知')
+                is_url_candidate = bool(info.get("is_url", False))
+                item_log_start = len(self.logs)
+                console_source_name = (
+                    self._url_candidate_label(info)
+                    if is_url_candidate
+                    else file_name
+                )
                 
                 try:
                     time.sleep(0.2) # 确保磁盘 IO 已完成
-                    print(f">>> [{i+1}/{total_attachments}] 开始处理文件: {file_name}")
+                    print(f">>> [{i+1}/{total_attachments}] 开始处理文件: {console_source_name}")
                     document_id = build_document_trace_id(info, file_name, pdf_path)
                     trace_store.start_document(
                         source_filename=source_filename,
                         source_path=info.get("filepath"),
                         document_id=document_id,
+                        persistence_is_url=is_url_candidate,
                     )
                     trace_store.set_fields(
                         document_id,
-                        source_message_uid=str(info.get("email_id") or info.get("source_email_id") or "").strip(),
+                        source_message_uid=(
+                            stable_hash(
+                                str(info.get("email_id") or info.get("source_email_id") or "").strip()
+                            )
+                            if is_url_candidate
+                            else str(info.get("email_id") or info.get("source_email_id") or "").strip()
+                        ),
                     )
                     prefilter_reason_code = info.get("prefilter_reason_code")
                     prefilter_metadata = self._attachment_diag_metadata(
@@ -2848,7 +2889,12 @@ class InvoiceAppAPI:
                     if not base64_img:
                         self.stats["errors"] += 1
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"无法读取附件图像: {file_name}"})
-                        self._record_error_log(save_path, info.get('subject', file_name), "PDF损坏或不是标准发票格式")
+                        self._record_error_log(
+                            save_path,
+                            info.get('subject', file_name),
+                            "PDF损坏或不是标准发票格式",
+                            url_candidate_info=info if is_url_candidate else None,
+                        )
                         retained_path = self._retain_artifact(
                             save_path,
                             pdf_path,
@@ -2969,7 +3015,12 @@ class InvoiceAppAPI:
                     if not info_json:
                         self.stats["errors"] += 1
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"大模型全部引擎提取失败，移入人工区: {file_name}"})
-                        self._record_error_log(save_path, info.get('subject', file_name), "大模型未能识别出标准的 JSON 数据")
+                        self._record_error_log(
+                            save_path,
+                            info.get('subject', file_name),
+                            "大模型未能识别出标准的 JSON 数据",
+                            url_candidate_info=info if is_url_candidate else None,
+                        )
                         
                         # 直接抛给 route_and_rename_file 进行 Manual_Check 兜底保存
                         manual_success, result_path = extractor.route_and_rename_file(pdf_path, None)
@@ -3174,7 +3225,7 @@ class InvoiceAppAPI:
                             year = int(clean_date[:4])
                             # 允许范围: 2000 ~ 搜索结束年份
                             max_year = int(before_date[:4]) if before_date and len(before_date) >= 4 else 2025
-                            print(f">>> [年份校验] file={file_name}, date={clean_date}, year={year}, before_date={before_date}, max_year={max_year}")
+                            print(f">>> [年份校验] file={console_source_name}, date={clean_date}, year={year}, before_date={before_date}, max_year={max_year}")
                             if year > max_year or year < 2000:
                                 self.logs.append({
                                     "time": time.strftime("[%H:%M:%S]"),
@@ -3598,7 +3649,12 @@ class InvoiceAppAPI:
                     else:
                         self.stats["errors"] += 1
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "跳过:", "color": "text-yellow-400", "msg": f"未归档或放入人工分类: {file_name} ({result_path})"})
-                        self._record_error_log(save_path, info.get('subject', file_name), result_path)
+                        self._record_error_log(
+                            save_path,
+                            info.get('subject', file_name),
+                            result_path,
+                            url_candidate_info=info if is_url_candidate else None,
+                        )
                         original_error = result_path
                         if MANUAL_REVIEW_FOLDER not in result_path:
                             result_path = self._retain_artifact(
@@ -3762,9 +3818,16 @@ class InvoiceAppAPI:
                         severity="failure",
                     )
                     import traceback
-                    self._record_error_log(save_path, info.get('subject', file_name), f"代码执行异常: {err_msg} - {traceback.format_exc().splitlines()[-1] if traceback.format_exc().splitlines() else ''}")
+                    self._record_error_log(
+                        save_path,
+                        info.get('subject', file_name),
+                        f"代码执行异常: {err_msg} - {traceback.format_exc().splitlines()[-1] if traceback.format_exc().splitlines() else ''}",
+                        url_candidate_info=info if is_url_candidate else None,
+                    )
                     processed_filepaths.add(pdf_path) # [Fix] Always mark as processed when exception hits
                 finally:
+                    if is_url_candidate:
+                        self._sanitize_url_candidate_logs(item_log_start, info)
                     time.sleep(0.5)
 
             # --- PHASE 1: EXECUTE RECONCILIATION ---
@@ -4166,8 +4229,19 @@ class InvoiceAppAPI:
 
         except Exception as main_loop_err:
             loop_result = "failed"
-            print(f">>> [错误] 核心处理循环发生异常: {main_loop_err}")
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"批量处理异常: {main_loop_err}"})
+            print(
+                f">>> [错误] 核心处理循环发生异常: "
+                f"{type(main_loop_err).__name__} [{stable_hash(str(main_loop_err))[:12]}]"
+            )
+            self.logs.append({
+                "time": time.strftime("[%H:%M:%S]"),
+                "type": "错误:",
+                "color": "text-red-400",
+                "msg": (
+                    f"批量处理异常: {type(main_loop_err).__name__} "
+                    f"[{stable_hash(str(main_loop_err))[:12]}]"
+                ),
+            })
             self._safe_emit_stage_event("_run_processing_loop", "exit", {"result": "failed", "reason": str(main_loop_err)})
         finally:
             _finalize_trace_defaults()
@@ -4244,9 +4318,6 @@ class InvoiceAppAPI:
                 return source_path
 
             original_name = os.path.basename(source_path)
-            _, extension = os.path.splitext(original_name)
-            evidence_name = stable_hash(self._user_safe_source_reference(source_path))[:20]
-            original_name = f"Retained_{evidence_name}{extension.lower()}"
             target_name = original_name
             target_path = os.path.join(retention_dir, target_name)
             while os.path.exists(target_path):
@@ -4332,9 +4403,7 @@ class InvoiceAppAPI:
             prefix = "P0_Review"
             if runtime_metadata.get("file_name"):
                 original_name = os.path.basename(str(runtime_metadata["file_name"]))
-            _, extension = os.path.splitext(original_name)
-            evidence_name = stable_hash(self._user_safe_source_reference(source_path))[:20]
-            target_path = _unique_path(f"{prefix}_{evidence_name}{extension.lower()}")
+            target_path = _unique_path(f"{prefix}_{original_name}")
             shutil.copy2(source_path, target_path)
 
         sidecar = f"{target_path}.json"
@@ -4431,7 +4500,14 @@ class InvoiceAppAPI:
                         pass
                     self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-amber-400", "msg": f"匹配到取消对应的预订: {fn} ↔ {cancel_fn}"})
 
-    def _record_error_log(self, save_path, email_title, error_reason):
+    def _record_error_log(
+        self,
+        save_path,
+        email_title,
+        error_reason,
+        *,
+        url_candidate_info=None,
+    ):
         """记录错误日志到对应的 csv 文件中"""
         import os
         import csv
@@ -4441,6 +4517,10 @@ class InvoiceAppAPI:
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
             
+        if url_candidate_info:
+            email_title = self._url_candidate_label(url_candidate_info)
+            error_reason = f"URL_CANDIDATE_ERROR:{stable_hash(error_reason)[:16]}"
+
         log_file = os.path.join(save_path, "异常发票处理日志.csv")
         file_exists = os.path.exists(log_file)
         

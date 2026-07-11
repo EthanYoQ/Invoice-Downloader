@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 from url_security import PublicUrlPolicy
 
@@ -80,6 +81,7 @@ _HASH_FIELD_NAMES = {
     "document_id": "document_hash",
     "email_id": "email_hash",
     "source_email_id": "email_hash",
+    "source_message_uid": "email_hash",
     "sender": "sender_hash",
     "subject": "subject_hash",
     "file_name": "file_hash",
@@ -149,6 +151,39 @@ def sanitize_url_for_log(url):
     return PublicUrlPolicy.sanitize(str(url or ""))
 
 
+def build_url_history_key(
+    *,
+    provider_family="",
+    email_id="",
+    invoice_number="",
+    source_url="",
+):
+    raw_url = str(source_url or "").strip()
+    try:
+        parsed = urlsplit(raw_url)
+        host = (parsed.hostname or "").rstrip(".").encode("idna").decode("ascii").lower()
+        scheme = parsed.scheme.lower()
+        default_port = {"http": 80, "https": 443}.get(scheme)
+        port = parsed.port
+        authority = host
+        if port is not None and port != default_port:
+            authority = f"{authority}:{port}"
+        canonical_url = urlunsplit(
+            (scheme, authority, parsed.path or "/", parsed.query, "")
+        )
+    except Exception:
+        canonical_url = raw_url
+
+    components = {
+        "kind": "url",
+        "provider_family": str(provider_family or "generic").strip().lower(),
+        "email_id": str(email_id or "").strip(),
+        "invoice_number": str(invoice_number or "").strip(),
+        "source_url": canonical_url,
+    }
+    return f"url:{stable_hash(components)}"
+
+
 def _safe_scalar(key, value):
     if key in _SAFE_BOOL_FIELDS and isinstance(value, bool):
         return value
@@ -196,6 +231,57 @@ def sanitize_persistence_payload(value):
             continue
         if key in _SAFE_LIST_FIELDS and isinstance(item, (list, tuple)):
             sanitized[f"{key}_count"] = len(item)
+    return sanitized
+
+
+def sanitize_url_trace_record(record):
+    if not isinstance(record, dict):
+        return {}
+
+    sanitized = {
+        "kind": "url_trace",
+        "document_hash": stable_hash(record.get("document_id", "")),
+    }
+    for source_key, hash_key in (
+        ("source_filename", "source_filename_hash"),
+        ("source_path", "source_path_hash"),
+        ("source_message_uid", "email_hash"),
+        ("archive_target", "archive_target_hash"),
+    ):
+        value = record.get(source_key)
+        if value not in (None, ""):
+            sanitized[hash_key] = stable_hash(value)
+
+    source_path = str(record.get("source_path") or "")
+    if source_path.startswith(("http://", "https://")):
+        sanitized["source_authority"] = sanitize_url_for_log(source_path)
+
+    for key in (
+        "source_download_result",
+        "naming_result",
+        "combine_keys",
+        "combine_result",
+        "pdf_health",
+    ):
+        value = record.get(key)
+        if isinstance(value, dict):
+            nested = sanitize_persistence_payload(value)
+            if nested:
+                sanitized[key] = nested
+
+    for key in ("extractor_raw_result", "normalized_fields", "classification_result"):
+        value = record.get(key)
+        if value not in (None, {}, ""):
+            sanitized[f"{key}_hash"] = stable_hash(value)
+
+    failure_reason = record.get("failure_reason")
+    if isinstance(failure_reason, dict):
+        failure = sanitize_persistence_payload(failure_reason)
+        history = failure_reason.get("history")
+        if isinstance(history, (list, tuple)):
+            failure["history_count"] = len(history)
+        if failure:
+            sanitized["failure_reason"] = failure
     return sanitized
 
 

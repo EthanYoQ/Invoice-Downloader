@@ -1368,8 +1368,11 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         )
 
         self.assertNotEqual(first, second)
-        self.assertIn("2446", first)
-        self.assertIn("26112000000474524341", first)
+        self.assertRegex(first, r"^url:[0-9a-f]{64}$")
+        self.assertRegex(second, r"^url:[0-9a-f]{64}$")
+        self.assertNotIn("www.baiwang.com", first)
+        self.assertNotIn("2446", first)
+        self.assertNotIn("26112000000474524341", first)
 
     def test_direct_invoice_recovery_downloads_fpyun_pdf_without_chromium(self):
         original_requests = pdf_converter.requests

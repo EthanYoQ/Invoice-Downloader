@@ -34,6 +34,8 @@ from provider_direct_invoice import (
     infer_direct_invoice_family,
     is_direct_invoice_family_url,
 )
+from pinned_http import PinnedHttpTransport
+from url_security import PublicUrlPolicy
 from url_trace_sanitizer import sanitize_url_for_log, stable_hash
 try:
     from pyzbar.pyzbar import decode
@@ -333,33 +335,74 @@ def _match_shadow_noise_page_type(url):
     return False, ""
 
 
-def _expand_bwjf_shortlink(url, timeout=5):
+_SHORTLINK_URL_POLICY = None
+_SHORTLINK_PINNED_TRANSPORT = None
+
+
+def _shortlink_security_stack():
+    global _SHORTLINK_URL_POLICY, _SHORTLINK_PINNED_TRANSPORT
+    if _SHORTLINK_URL_POLICY is None:
+        _SHORTLINK_URL_POLICY = PublicUrlPolicy()
+    if _SHORTLINK_PINNED_TRANSPORT is None:
+        _SHORTLINK_PINNED_TRANSPORT = PinnedHttpTransport()
+    return _SHORTLINK_URL_POLICY, _SHORTLINK_PINNED_TRANSPORT
+
+
+def _expand_bwjf_shortlink(
+    url,
+    timeout=5,
+    *,
+    url_policy=None,
+    pinned_transport=None,
+    session=None,
+    max_redirects=5,
+    max_response_bytes=64 * 1024,
+):
     parsed = urlparse(url.strip())
     host = parsed.netloc.lower()
     path_parts = [part for part in parsed.path.split('/') if part]
     if host != "fp.bwjf.cn" or len(path_parts) != 2 or path_parts[0].lower() != "u" or not path_parts[1]:
         return None
 
+    owns_session = session is None
     try:
         import requests
-    except ImportError:
-        logging.warning("requests unavailable, skipping bwjf shortlink expansion")
-        return None
 
-    try:
-        response = requests.get(
-            url.strip(),
-            allow_redirects=False,
-            timeout=timeout,
-            stream=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        response.close()
+        if url_policy is None or pinned_transport is None:
+            default_policy, default_transport = _shortlink_security_stack()
+        policy = url_policy or default_policy
+        transport = pinned_transport or default_transport
+        request_session = session or requests.Session()
+        target = policy.validate(url.strip())
+        redirected = False
+        redirect_limit = max(0, min(int(max_redirects), 5))
+        response_limit = max(1, min(int(max_response_bytes), 64 * 1024))
+
+        for redirect_count in range(redirect_limit + 1):
+            response = transport.request(
+                request_session,
+                "GET",
+                target,
+                timeout=timeout,
+                max_response_bytes=response_limit,
+                read_body=False,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            location = str((getattr(response, "headers", {}) or {}).get("Location", "")).strip()
+            if status_code not in {301, 302, 303, 307, 308} or not location:
+                break
+            if redirect_count >= redirect_limit:
+                return None
+            target = policy.resolve_redirect(target, location)
+            redirected = True
+        else:
+            return None
     except Exception as exc:
         logging.warning(
             "Failed to expand bwjf shortlink %s (%s)",
@@ -367,15 +410,14 @@ def _expand_bwjf_shortlink(url, timeout=5):
             type(exc).__name__,
         )
         return None
+    finally:
+        if owns_session and "request_session" in locals():
+            request_session.close()
 
-    if response.status_code not in {301, 302, 303, 307, 308}:
+    if not redirected:
         return None
 
-    location = response.headers.get("Location", "").strip()
-    if not location:
-        return None
-
-    resolved_location = urljoin(url.strip(), location)
+    resolved_location = target.url
     nested_invoice_url = _extract_nested_invoice_url(resolved_location)
     if nested_invoice_url:
         return nested_invoice_url

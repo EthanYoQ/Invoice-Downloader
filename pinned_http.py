@@ -276,6 +276,7 @@ class PinnedHttpTransport:
         suppress_auth=False,
         decode_content=True,
         max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
+        read_body=True,
     ):
         prepared = self._prepare_request(
             session,
@@ -321,13 +322,16 @@ class PinnedHttpTransport:
                 response_headers = CaseInsensitiveDict(raw.headers.items())
                 set_cookie_headers = tuple(raw.headers.getlist("Set-Cookie"))
                 status = int(raw.status)
-                content = self._buffer_response(
-                    raw,
-                    max_response_bytes=max_response_bytes,
-                    decode_content=decode_content,
-                )
-                body_consumed = True
-                if decode_content and "Content-Encoding" in response_headers:
+                if read_body:
+                    content = self._buffer_response(
+                        raw,
+                        max_response_bytes=max_response_bytes,
+                        decode_content=decode_content,
+                    )
+                    body_consumed = True
+                else:
+                    content = b""
+                if read_body and decode_content and "Content-Encoding" in response_headers:
                     response_headers.pop("Content-Encoding", None)
                     response_headers.pop("Content-Length", None)
 

@@ -220,6 +220,29 @@ def test_transport_reuses_origin_ip_pool_and_closes_each_raw_response():
     assert second_raw.closed == second_raw.released == 1
 
 
+def test_header_only_request_never_reads_or_releases_unconsumed_body():
+    raw = FakeRawResponse(
+        status=302,
+        data=b"large-provider-body-that-is-not-needed",
+        headers={"Location": "https://invoice.example/final"},
+    )
+    manager = FakeManager(raw)
+    transport = PinnedHttpTransport(pool_manager_factory=lambda **kwargs: manager)
+
+    response = transport.request(
+        requests.Session(),
+        "GET",
+        single_ip_target(),
+        read_body=False,
+        max_response_bytes=64 * 1024,
+    )
+
+    assert response.status_code == 302
+    assert response.content == b""
+    assert raw.read_calls == 0
+    assert raw.lifecycle == ["close"]
+
+
 def test_transport_can_suppress_session_auth_after_cross_origin_redirect():
     raw = FakeRawResponse()
     manager = FakeManager(raw)
