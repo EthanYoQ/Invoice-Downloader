@@ -237,3 +237,39 @@ Strict: finalized 215/215, pending 0, artifacts 1259,
         P0/P1/P2/manual all zero
 Stash: stash@{0} preserved and untouched
 ```
+
+## Final Important Store Reset Remediation
+
+The final Important review found that a new handle was reserved before startup
+work, but `RunStateStore.reset` still happened after settings and dependency
+construction. A startup failure in that interval attempted to terminalize the
+previous run's terminal store and was ignored by its terminal guard.
+
+- `RunStateStore.reset` now atomically accepts the new run id, initial status,
+  run state, and progress while clearing the previous terminal guard.
+- AppAPI calls that reset immediately after reserving the new `RunHandle`,
+  before settings load/save, active config persistence, dependency construction,
+  output-directory creation, diagnostics, truth audit, or `Thread.start`.
+- If reset itself raises, AppAPI replaces the stale store with a fresh store,
+  initializes the new run when possible, and routes the same reserved handle
+  through sanitized startup failure finalization. Prior success is never revived.
+- TDD covers prior completed -> settings-load, dependency-build, and thread-start
+  failures; prior failed -> dependency-build failure; and reset failure itself.
+  Every case asserts a distinct failed handle, released lifecycle/staging,
+  current run id, exact startup status/error/log, and store/legacy/frontend parity.
+- The deterministic A/B race now also asserts exactly one store reset belonging
+  to the accepted handle; the busy loser performs no reset.
+
+Pre-commit verification:
+
+```text
+Coordinator/lifecycle: 73 passed
+Coordinator/lifecycle/pipeline/refactor plus GLM/email/provider/security:
+  322 passed, 20 subtests passed
+Full pytest: 536 passed, 109 subtests passed
+Ruff, py_compile, git diff --check: passed
+Strict output: tmp/strict_truth_audit_task9_store_reset_precommit_20260712T063913Z.json
+Strict: finalized 215/215, pending 0, artifacts 1259,
+        P0/P1/P2/manual all zero
+Stash: stash@{0} preserved and untouched
+```

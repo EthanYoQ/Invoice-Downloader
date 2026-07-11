@@ -67,9 +67,21 @@ class RunStateStore:
         with self._lock:
             return self._terminal_reason
 
-    def reset(self, run_id: str) -> None:
+    def reset(
+        self,
+        run_id: str,
+        *,
+        status_text: str = "等待任务开始...",
+        run_state: str = "idle",
+        progress: int = 0,
+    ) -> None:
         with self._lock:
             self._state = self._initial_state(run_id)
+            self._state["status_text"] = str(status_text)
+            self._state["run_state"] = str(run_state)
+            self._state["progress"] = max(0, min(100, int(progress)))
+            self._state["is_running"] = self._state["run_state"] in {"running", "finalizing"}
+            self._state["can_stop"] = self._state["run_state"] == "running"
             self._terminal = False
             self._terminal_reason = ""
             snapshot = copy.deepcopy(self._state)

@@ -540,6 +540,166 @@ def test_settings_load_failure_releases_reserved_handle_and_restores_config(tmp_
     assert "SETTINGS-LOAD-SECRET" not in api.last_error
 
 
+@pytest.mark.parametrize(
+    ("prior_state", "failure_stage"),
+    [
+        ("completed", "settings_load"),
+        ("completed", "dependency_build"),
+        ("completed", "thread_start"),
+        ("failed", "dependency_build"),
+    ],
+)
+def test_new_startup_failure_replaces_prior_terminal_state_everywhere(
+    tmp_path: Path,
+    monkeypatch,
+    prior_state: str,
+    failure_stage: str,
+):
+    from app_api import InvoiceAppAPI
+    from run_lifecycle import RunState
+
+    api = InvoiceAppAPI()
+    prior_handle = api._prepare_run_lifecycle()
+    api._run_state_store.reset(prior_handle.run_id)
+    if prior_state == "failed":
+        prior_handle.fail(
+            RuntimeError("prior failure"),
+            reason_code="PRIOR_FAILED",
+            user_message="上一轮失败。",
+        )
+        prior_handle.finalize([])
+        api._run_state_store.terminalize(
+            "failed",
+            status_text="上一轮失败",
+            last_error="上一轮失败。 [PRIOR_FAILED]",
+            reason_code="PRIOR_FAILED",
+            logs=[{"time": "[00:00:00]", "type": "ERROR", "color": "text-error", "msg": "PRIOR FAILED"}],
+        )
+    else:
+        prior_handle.finalize([])
+        api._run_state_store.terminalize(
+            "completed",
+            status_text="上一轮完成",
+            reason_code="COMPLETED",
+            logs=[{"time": "[00:00:00]", "type": "完成", "color": "text-green", "msg": "PRIOR COMPLETED"}],
+        )
+
+    class SettingsStore:
+        settings_path = str(tmp_path / "settings.json")
+
+        def load(self):
+            if failure_stage == "settings_load":
+                raise RuntimeError("CURRENT-SETTINGS-SECRET")
+            return {"remember_settings": True}
+
+        def save(self, _settings):
+            return self.settings_path
+
+        def clear(self):
+            return None
+
+    api._settings_store = SettingsStore()
+    monkeypatch.setattr(api, "save_user_settings", lambda _settings: {"success": True})
+    monkeypatch.setattr(api, "_start_truth_audit_async", lambda *_args: None)
+    monkeypatch.setattr(api, "_safe_write_run_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **_kwargs: None)
+    if failure_stage == "dependency_build":
+        monkeypatch.setattr(
+            api,
+            "_build_run_dependencies",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("CURRENT-DEPENDENCY-SECRET")),
+        )
+    elif failure_stage == "thread_start":
+        monkeypatch.setattr(
+            threading.Thread,
+            "start",
+            lambda _thread: (_ for _ in ()).throw(RuntimeError("CURRENT-THREAD-SECRET")),
+        )
+
+    result = api.start_processing(
+        "CURRENT-RULE",
+        str(tmp_path / f"output-{prior_state}-{failure_stage}"),
+        "2026-04-01",
+        "2026-04-02",
+        "current-user@qq.com",
+        "CURRENT-AUTH-SECRET",
+        "CURRENT-API-SECRET",
+    )
+
+    current_handle = api._active_run_handle
+    store = api._run_state_store.snapshot()
+    frontend = api.get_progress()
+    expected_error = "后台任务启动失败，请重试。 [WORKER_START_FAILED]"
+    assert result == {"success": False, "message": "后台任务启动失败"}
+    assert current_handle is not prior_handle
+    assert current_handle.run_id != prior_handle.run_id
+    assert current_handle.state is RunState.FAILED
+    assert api._run_lifecycle.can_begin is True
+    assert api._run_lifecycle.owned_staging_count == 0
+    assert store["run_id"] == current_handle.run_id
+    assert store["run_state"] == api.run_state == frontend["run_state"] == "failed"
+    assert store["status_text"] == api.status_text == frontend["status_text"] == "启动失败"
+    assert store["last_error"] == api.last_error == frontend["last_error"] == expected_error
+    assert store["logs"] == api.logs
+    assert frontend["logs"] == store["logs"][-20:]
+    assert store["logs"][-1]["msg"] == f"System exception: {expected_error}"
+    rendered = json.dumps({"store": store, "frontend": frontend, "legacy": api.logs}, ensure_ascii=False)
+    assert "PRIOR COMPLETED" not in rendered
+    assert "PRIOR FAILED" not in rendered
+    assert "CURRENT-SETTINGS-SECRET" not in rendered
+    assert "CURRENT-DEPENDENCY-SECRET" not in rendered
+    assert "CURRENT-THREAD-SECRET" not in rendered
+
+
+def test_run_state_reset_failure_uses_fresh_visible_startup_failure(tmp_path: Path, monkeypatch):
+    from app_api import InvoiceAppAPI
+    from run_lifecycle import RunState
+
+    api = InvoiceAppAPI()
+    prior_handle = api._prepare_run_lifecycle()
+    api._run_state_store.reset(prior_handle.run_id)
+    prior_handle.finalize([])
+    api._run_state_store.terminalize(
+        "completed",
+        status_text="上一轮完成",
+        reason_code="COMPLETED",
+        logs=[{"time": "[00:00:00]", "type": "完成", "color": "text-green", "msg": "PRIOR COMPLETED"}],
+    )
+    prior_store = api._run_state_store
+    monkeypatch.setattr(
+        prior_store,
+        "reset",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("RESET-SECRET")),
+    )
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **_kwargs: None)
+
+    result = api.start_processing(
+        "",
+        str(tmp_path / "output-reset-failure"),
+        "2026-05-01",
+        "2026-05-02",
+        "reset-user@qq.com",
+        "RESET-AUTH-SECRET",
+        "RESET-API-SECRET",
+    )
+
+    current_handle = api._active_run_handle
+    store = api._run_state_store.snapshot()
+    frontend = api.get_progress()
+    expected_error = "后台任务启动失败，请重试。 [WORKER_START_FAILED]"
+    assert result == {"success": False, "message": "后台任务启动失败"}
+    assert api._run_state_store is not prior_store
+    assert current_handle is not prior_handle
+    assert current_handle.state is RunState.FAILED
+    assert api._run_lifecycle.can_begin is True
+    assert store["run_id"] == current_handle.run_id
+    assert store["run_state"] == api.run_state == frontend["run_state"] == "failed"
+    assert store["status_text"] == api.status_text == frontend["status_text"] == "启动失败"
+    assert store["last_error"] == api.last_error == frontend["last_error"] == expected_error
+    assert "PRIOR COMPLETED" not in json.dumps(store, ensure_ascii=False)
+    assert "RESET-SECRET" not in json.dumps(store, ensure_ascii=False)
+
+
 def test_prepare_run_lifecycle_rejects_any_existing_handle(tmp_path: Path, monkeypatch):
     from app_api import InvoiceAppAPI
 
@@ -641,8 +801,10 @@ def test_pre_admission_interleaving_commits_only_winner_request(
     worker_calls = []
     settings_writes = []
     diagnostics = []
+    state_resets = []
     results = {}
     original_validate = api._validate_date_range
+    original_reset = api._run_state_store.reset
 
     def interleaved_validate(date_from, date_to):
         name = "A" if date_from == requests["A"]["date_from"] else "B"
@@ -656,7 +818,12 @@ def test_pre_admission_interleaving_commits_only_winner_request(
         winner_started.set()
         release_worker.wait(2)
 
+    def tracked_reset(run_id, **kwargs):
+        state_resets.append(run_id)
+        return original_reset(run_id, **kwargs)
+
     monkeypatch.setattr(api, "_validate_date_range", interleaved_validate)
+    monkeypatch.setattr(api._run_state_store, "reset", tracked_reset)
     monkeypatch.setattr(api, "_processing_worker", blocked_worker)
     monkeypatch.setattr(api, "_start_truth_audit_async", lambda *_args: None)
     monkeypatch.setattr(api, "_safe_write_run_config", lambda *_args, **_kwargs: None)
@@ -694,6 +861,7 @@ def test_pre_admission_interleaving_commits_only_winner_request(
     assert results[loser] == {"success": False, "message": "任务已在运行中"}
     assert len(worker_calls) == 1
     run_request, run_handle, _dependencies = worker_calls[0]
+    assert state_resets == [run_handle.run_id]
     assert isinstance(run_request, RunRequest)
     assert run_request.rules_text == accepted["rules"]
     assert run_request.save_path == accepted["path"]

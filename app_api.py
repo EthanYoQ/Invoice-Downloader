@@ -3208,6 +3208,27 @@ class InvoiceAppAPI:
         for name, value in previous.items():
             setattr(self, name, value)
 
+    def _reset_run_state_for_admission(self, run_id):
+        reset_kwargs = {
+            "status_text": "正在准备运行...",
+            "run_state": "running",
+            "progress": 5,
+        }
+        try:
+            self._run_state_store.reset(run_id, **reset_kwargs)
+            return
+        except Exception:
+            previous_store = self._run_state_store
+            self._run_state_store = RunStateStore(
+                event_sink=getattr(previous_store, "_event_sink", None),
+                state_sink=self._apply_run_state_snapshot,
+            )
+            try:
+                self._run_state_store.reset(run_id, **reset_kwargs)
+            except Exception:
+                pass
+            raise RuntimeError("run state initialization failed") from None
+
     def _admit_processing_run(
         self,
         *,
@@ -3247,6 +3268,7 @@ class InvoiceAppAPI:
                 ensure_run_context_dirs(self._run_context)
                 self._current_run_id = str(self._run_context.get("run_id", "") or "")
                 handle = self._prepare_run_lifecycle()
+                self._reset_run_state_for_admission(handle.run_id)
                 previous_settings = self._settings_store.load() or {}
                 self._requested_save_path = candidate.requested_save_path
                 self._effective_save_path = candidate.effective_save_path
@@ -3309,12 +3331,6 @@ class InvoiceAppAPI:
                 )
                 return {"success": False, "message": "后台任务启动失败"}
 
-            self._run_state_store.reset(handle.run_id)
-            self._run_state_store.update(
-                run_state="running",
-                status_text="正在准备运行...",
-                progress=5,
-            )
             self._run_state_store.append_log(
                 "信息",
                 "前端请求已接收，后台任务正在启动。",
