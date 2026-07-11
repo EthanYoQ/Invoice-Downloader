@@ -23,7 +23,6 @@ from glm_runtime import GlmRequestError, GlmRuntime
 from run_lifecycle import RunLifecycle, RunState
 from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
 from url_trace_sanitizer import (
-    build_url_history_key,
     build_url_evidence,
     sanitize_persistence_payload,
     sanitize_url_trace_record,
@@ -83,31 +82,9 @@ class TruthAuditJob:
 
 
 def build_processing_history_key(info, file_name, pdf_path):
-    import hashlib
+    from candidate_pipeline import build_compatibility_history_key
 
-    info = info or {}
-    legacy_key = hashlib.md5(
-        f"{info.get('subject', '')}_{file_name}_{info.get('tier', 0)}".encode("utf-8")
-    ).hexdigest()
-    if info.get("is_url", False):
-        expected = info.get("provider_expected_fields") or {}
-        invoice_number = str(expected.get("invoice_number") or expected.get("InvoiceNumber") or "").strip()
-        provider_family = str(info.get("provider_family") or "").strip()
-        email_id = str(info.get("email_id") or "").strip()
-        source_url = str(info.get("source_url") or pdf_path or file_name or "").strip()
-        return build_url_history_key(
-            provider_family=provider_family,
-            email_id=email_id,
-            invoice_number=invoice_number,
-            source_url=source_url or legacy_key,
-        )
-
-    try:
-        with open(pdf_path, "rb") as source_file:
-            file_digest = hashlib.sha256(source_file.read()).hexdigest()
-        return f"att:{file_digest}"
-    except Exception:
-        return f"att-legacy:{legacy_key}"
+    return build_compatibility_history_key(info, file_name, pdf_path)
 
 
 def build_document_trace_id(info, file_name, pdf_path):
@@ -1727,10 +1704,17 @@ class InvoiceAppAPI:
         return self._read_json_file(self._run_state_file_path(output_state_dir), {})
 
     def _load_committed_history(self, output_state_dir):
-        # P0 stop-loss: by default do not inherit cross-run history.
-        # We only de-duplicate within the current run unless an explicit
-        # cross-run mode is introduced later.
-        return set()
+        run_state = self._load_output_run_state(output_state_dir)
+        if str(run_state.get("status") or "").strip().lower() != "completed":
+            return set()
+        history = self._read_json_file(self._history_file_path(output_state_dir), [])
+        if not isinstance(history, list):
+            return set()
+        return {
+            str(item).strip()
+            for item in history
+            if isinstance(item, str) and str(item).strip()
+        }
 
     def _commit_output_state(self, output_state_dir, history_keys, business_records):
         committed_history = sorted({str(item).strip() for item in (history_keys or set()) if str(item).strip()})
@@ -2459,7 +2443,8 @@ class InvoiceAppAPI:
         _archive_operation=None,
         _pairing_finalizer=None,
     ):
-        from archive_service import AppArchiveAdapter, ArchiveService
+        from app_archive_adapter import AppArchiveAdapter
+        from archive_service import ArchiveService
         from candidate_pipeline import CandidatePipeline, CandidatePreflight
         from extraction_pipeline import ExtractionPipeline, SharedRuntimeRemoteExtractor
         from invoice_extractor import InvoiceExtractor

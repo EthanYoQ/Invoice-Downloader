@@ -561,7 +561,7 @@ def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_p
 
 
 def test_archive_pairing_finalizer_renames_hotel_pair_adjacent_and_reports_count(tmp_path: Path):
-    from archive_service import reconcile_archive_pairs
+    from archive_pairing_service import reconcile_archive_pairs
 
     hotel = tmp_path / "住宿发票"
     hotel.mkdir()
@@ -581,7 +581,7 @@ def test_archive_pairing_finalizer_renames_hotel_pair_adjacent_and_reports_count
 
 
 def test_archive_pairing_updates_trace_targets_and_combine_results(tmp_path: Path):
-    from archive_service import reconcile_archive_pairs
+    from archive_pairing_service import reconcile_archive_pairs
 
     hotel = tmp_path / "住宿发票"
     hotel.mkdir()
@@ -613,7 +613,7 @@ def test_archive_pairing_updates_trace_targets_and_combine_results(tmp_path: Pat
 
 
 def test_archive_pairing_fails_closed_before_overwriting_existing_target(tmp_path: Path):
-    from archive_service import reconcile_archive_pairs
+    from archive_pairing_service import reconcile_archive_pairs
 
     hotel = tmp_path / "住宿发票"
     hotel.mkdir()

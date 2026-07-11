@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 from invoice_domain import DocumentIdentity
+from url_trace_sanitizer import build_url_history_key
 
 
 class _FrozenList(tuple):
@@ -73,6 +74,36 @@ def _normalized_url_digest(value: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def build_compatibility_history_key(
+    info: Mapping[str, Any] | None, file_name: str, source_path: str
+) -> str:
+    """Produce the exact pre-canonical processing-history key."""
+    metadata = dict(info or {})
+    legacy_key = hashlib.md5(
+        f"{metadata.get('subject', '')}_{file_name}_{metadata.get('tier', 0)}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if metadata.get("is_url", False):
+        expected = metadata.get("provider_expected_fields") or {}
+        invoice_number = str(
+            expected.get("invoice_number") or expected.get("InvoiceNumber") or ""
+        ).strip()
+        return build_url_history_key(
+            provider_family=str(metadata.get("provider_family") or "").strip(),
+            email_id=str(metadata.get("email_id") or "").strip(),
+            invoice_number=invoice_number,
+            source_url=str(
+                metadata.get("source_url") or source_path or file_name or legacy_key
+            ).strip()
+            or legacy_key,
+        )
+    try:
+        return f"att:{_stream_sha256(source_path)}"
+    except Exception:
+        return f"att-legacy:{legacy_key}"
+
+
 @dataclass(frozen=True)
 class DocumentCandidate:
     identity: DocumentIdentity
@@ -81,12 +112,23 @@ class DocumentCandidate:
     source_url: str = ""
     channel: str = ""
     source_filename: str = ""
+    compatibility_history_key: str = ""
     trace_context: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.sequence < 0:
             raise ValueError("DocumentCandidate.sequence must be non-negative")
+        if not self.compatibility_history_key:
+            object.__setattr__(
+                self,
+                "compatibility_history_key",
+                build_compatibility_history_key(
+                    self.metadata,
+                    self.source_filename,
+                    self.source_url or self.source_path,
+                ),
+            )
         object.__setattr__(self, "trace_context", _freeze_mapping(self.trace_context))
         object.__setattr__(self, "metadata", _freeze_mapping(self.metadata))
 
@@ -134,6 +176,7 @@ class CandidatePipeline:
                             source_url=source.source_url,
                             channel=source.channel,
                             source_filename=source.source_filename,
+                            compatibility_history_key=source.compatibility_history_key,
                             trace_context=source.trace_context,
                             metadata=source.metadata,
                         )
@@ -233,6 +276,9 @@ class CandidatePipeline:
                 "legacy_document_id": legacy_document_id,
                 "tier": metadata.get("tier", 0),
                 "provider_family": metadata.get("provider_family", ""),
+                "compatibility_history_key": build_compatibility_history_key(
+                    metadata, filename, source_path
+                ),
             }
             candidates.append(
                 DocumentCandidate(
@@ -242,6 +288,9 @@ class CandidatePipeline:
                     source_url=source_url,
                     channel=str(metadata.get("channel") or self._channel),
                     source_filename=filename,
+                    compatibility_history_key=trace_context[
+                        "compatibility_history_key"
+                    ],
                     trace_context=trace_context,
                     metadata=metadata,
                 )
@@ -269,6 +318,7 @@ class CandidatePreflight:
         self.sidecar_lock = sidecar_lock
         self.converter_factory = converter_factory
         self.seen_identities: set[str] = set()
+        self.seen_history_keys: set[str] = set()
         self.seen_provider_groups: set[str] = set()
 
     @staticmethod
@@ -339,12 +389,18 @@ class CandidatePreflight:
 
         legacy = candidate.to_legacy()
         canonical_id = candidate.identity.document_id
-        if canonical_id in self.seen_identities:
+        compatibility_key = candidate.compatibility_history_key
+        if (
+            canonical_id in self.seen_identities
+            or compatibility_key in self.seen_history_keys
+        ):
             return self.terminal(candidate, "CURRENT_RUN_DUPLICATE_SKIP", status="duplicate")
-        if canonical_id in self.working_history:
+        if canonical_id in self.working_history or compatibility_key in self.working_history:
             return self.terminal(candidate, "HISTORY_DUPLICATE_SKIP", status="duplicate")
         self.seen_identities.add(canonical_id)
+        self.seen_history_keys.add(compatibility_key)
         self.working_history.add(canonical_id)
+        self.working_history.add(compatibility_key)
 
         action = str(legacy.get("candidate_action") or "")
         if action == "retain_only":
