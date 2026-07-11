@@ -1611,6 +1611,8 @@ class InvoiceAppAPI:
             return "QUOTA_EXHAUSTED", "GLM API 额度已耗尽，请充值或更换可用的 API Key。"
         if "UNRESOLVED_MAILBOX_INPUT" in normalized:
             return "UNRESOLVED_MAILBOX_INPUT", "部分邮件在重试后仍无法读取，本次任务已失败；已读取产物保留供诊断。"
+        if "MAILBOX_SCAN_FAILED" in normalized:
+            return "MAILBOX_SCAN_FAILED", "邮箱扫描响应异常，本次任务已失败；请重试并查看诊断报告。"
         if "WORKER_START_FAILED" in normalized or "启动失败" in status:
             return "WORKER_START_FAILED", "后台任务启动失败，请重试。"
         return "PROCESSING_FAILED", "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
@@ -2128,7 +2130,7 @@ class InvoiceAppAPI:
         )
         from datetime import datetime, timedelta
         from email_fetcher import EmailFetcher
-        from mailbox_scanner import UnresolvedMailboxInputError
+        from mailbox_scanner import MailboxScanError, UnresolvedMailboxInputError
         self._packaged_diag_write("worker_imports_ready", "_processing_worker", "success")
 
         fetcher = None
@@ -2366,6 +2368,37 @@ class InvoiceAppAPI:
             self._fail_run(
                 "邮件读取不完整",
                 str(exc),
+                fetcher=fetcher,
+                reason_code=exc.reason_code,
+                user_message=exc.user_message,
+            )
+        except MailboxScanError as exc:
+            exception_fingerprint = stable_hash(
+                {"exception_type": type(exc).__name__, "message": str(exc)}
+            )[:12]
+            self._packaged_diag_write(
+                "worker_mailbox_scan_failed",
+                "_processing_worker",
+                "failure",
+                summary={
+                    "reason_code": exc.reason_code,
+                    "exception_type": type(exc).__name__,
+                    "exception_fingerprint": exception_fingerprint,
+                },
+            )
+            self._safe_emit_stage_event(
+                "frontend_processing_worker",
+                "exit",
+                {
+                    "result": "failed",
+                    "reason": exc.reason_code,
+                    "exception_type": type(exc).__name__,
+                    "exception_fingerprint": exception_fingerprint,
+                },
+            )
+            self._fail_run(
+                "邮箱扫描失败",
+                exc.reason_code,
                 fetcher=fetcher,
                 reason_code=exc.reason_code,
                 user_message=exc.user_message,

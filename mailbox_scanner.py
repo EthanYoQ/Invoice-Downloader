@@ -20,6 +20,9 @@ _INTERNALDATE_PATTERN = re.compile(
 class MailboxScanError(RuntimeError):
     """Raised when mailbox scope cannot be established without risking P0."""
 
+    reason_code = "MAILBOX_SCAN_FAILED"
+    user_message = "邮箱扫描响应异常，本次任务已失败；请重试并查看诊断报告。"
+
 
 class UnresolvedMailboxInputError(RuntimeError):
     reason_code = "UNRESOLVED_MAILBOX_INPUT"
@@ -162,9 +165,12 @@ class MailboxScanner:
         tokens = []
         malformed = False
         for item in response if isinstance(response, (list, tuple)) else [response]:
+            if item is None:
+                continue
             if isinstance(item, bytearray):
                 item = bytes(item)
             if not isinstance(item, bytes):
+                malformed = True
                 continue
             stripped = item.strip()
             if not stripped:

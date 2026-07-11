@@ -1,8 +1,10 @@
 import tempfile
 import unittest
 from email.message import EmailMessage
+from pathlib import Path
 import pytest
 
+import email_fetcher as email_fetcher_module
 from email_fetcher import EmailFetcher
 from mailbox_scanner import MailboxScanError, UnresolvedMailboxInputError
 
@@ -258,6 +260,221 @@ def test_readable_inputs_are_staged_then_unreadable_uid_raises_safe_aggregate(tm
     assert list((tmp_path / "staging").rglob("invoice-1.pdf"))
     diagnostics = (monitoring / "extract_attachments_diagnostics.jsonl").read_text(encoding="utf-8")
     assert "fetch_no_usable_bytes" in diagnostics
+
+
+def test_post_fetch_message_exception_processes_remaining_uid_then_raises_safe_aggregate(
+    tmp_path, monkeypatch, caplog
+):
+    messages = {
+        b"1": build_attachment_message(
+            sender="billing@example.com",
+            subject="Boom private subject",
+            body="private body",
+            filename="invoice-1.pdf",
+        ),
+        b"2": build_attachment_message(
+            sender="billing@example.com",
+            subject="Invoice 2",
+            body="Attached",
+            filename="invoice-2.pdf",
+        ),
+    }
+    secret_error = "https://private.example/?token=credential-secret"
+    original_classifier = email_fetcher_module._classify_email_tier
+
+    def classifier(sender, subject, body_text):
+        if "Boom" in subject:
+            raise RuntimeError(secret_error)
+        return original_classifier(sender, subject, body_text)
+
+    monkeypatch.setattr(email_fetcher_module, "_classify_email_tier", classifier)
+    monitoring = tmp_path / "monitoring"
+    fetcher = EmailFetcher(
+        "invoice-user@example.com",
+        "auth-code",
+        staging_dir=str(tmp_path / "staging"),
+        monitoring_dir=str(monitoring),
+    )
+    fetcher.mail = FakeUidMail(messages)
+
+    with pytest.raises(UnresolvedMailboxInputError) as caught:
+        fetcher.extract_attachments([b"1", b"2"])
+
+    assert caught.value.unresolved_count == 1
+    assert list((tmp_path / "staging").rglob("invoice-2.pdf"))
+    diagnostic_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in monitoring.glob("*.jsonl")
+    )
+    assert "message_processing_exception" in diagnostic_text
+    assert "RuntimeError" in diagnostic_text
+    assert "exception_fingerprint" in diagnostic_text
+    assert "Boom private subject" not in diagnostic_text
+    assert "private body" not in diagnostic_text
+    assert "private.example" not in diagnostic_text
+    assert "credential-secret" not in diagnostic_text
+    assert "private.example" not in caplog.text
+    assert "credential-secret" not in caplog.text
+
+
+def test_post_fetch_exception_with_broken_string_representation_is_still_aggregated(
+    tmp_path, monkeypatch
+):
+    class UnprintableProcessingError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("credential-secret")
+
+    messages = {
+        b"1": build_attachment_message(
+            sender="billing@example.com",
+            subject="Boom",
+            body="private body",
+            filename="invoice-1.pdf",
+        ),
+        b"2": build_attachment_message(
+            sender="billing@example.com",
+            subject="Invoice 2",
+            body="Attached",
+            filename="invoice-2.pdf",
+        ),
+    }
+    original_classifier = email_fetcher_module._classify_email_tier
+
+    def classifier(sender, subject, body_text):
+        if subject == "Boom":
+            raise UnprintableProcessingError()
+        return original_classifier(sender, subject, body_text)
+
+    monkeypatch.setattr(email_fetcher_module, "_classify_email_tier", classifier)
+    monitoring = tmp_path / "monitoring"
+    fetcher = EmailFetcher(
+        "invoice-user@example.com",
+        "auth-code",
+        staging_dir=str(tmp_path / "staging"),
+        monitoring_dir=str(monitoring),
+    )
+    fetcher.mail = FakeUidMail(messages)
+
+    with pytest.raises(UnresolvedMailboxInputError) as caught:
+        fetcher.extract_attachments([b"1", b"2"])
+
+    assert caught.value.unresolved_count == 1
+    assert list((tmp_path / "staging").rglob("invoice-2.pdf"))
+    diagnostic_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in monitoring.glob("*.jsonl")
+    )
+    assert "UnprintableProcessingError" in diagnostic_text
+    assert "exception_fingerprint" in diagnostic_text
+    assert "credential-secret" not in diagnostic_text
+
+
+@pytest.mark.parametrize("failure_stage", ["parse", "walk"])
+def test_post_fetch_mime_exception_is_sanitized_and_aggregated(
+    tmp_path, monkeypatch, caplog, failure_stage
+):
+    secret_error = "private subject https://private.example/?token=credential-secret"
+
+    if failure_stage == "parse":
+        def fail_after_fetch(_raw):
+            raise ValueError(secret_error)
+
+        monkeypatch.setattr(email_fetcher_module.email, "message_from_bytes", fail_after_fetch)
+    else:
+        class UnwalkableMessage:
+            def get(self, _name, default=""):
+                return default
+
+            def walk(self):
+                raise LookupError(secret_error)
+
+        monkeypatch.setattr(
+            email_fetcher_module.email,
+            "message_from_bytes",
+            lambda _raw: UnwalkableMessage(),
+        )
+
+    monitoring = tmp_path / "monitoring"
+    fetcher = EmailFetcher(
+        "invoice-user@example.com",
+        "auth-code",
+        staging_dir=str(tmp_path / "staging"),
+        monitoring_dir=str(monitoring),
+    )
+    fetcher.mail = FakeUidMail({b"1": b"valid-fetched-payload"})
+
+    with pytest.raises(UnresolvedMailboxInputError) as caught:
+        fetcher.extract_attachments([b"1"])
+
+    assert caught.value.unresolved_count == 1
+    diagnostic_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in monitoring.glob("*.jsonl")
+    )
+    expected_type = "ValueError" if failure_stage == "parse" else "LookupError"
+    assert "message_processing_exception" in diagnostic_text
+    assert expected_type in diagnostic_text
+    assert "exception_fingerprint" in diagnostic_text
+    assert "private subject" not in diagnostic_text
+    assert "private.example" not in diagnostic_text
+    assert "credential-secret" not in diagnostic_text
+    assert "private.example" not in caplog.text
+    assert "credential-secret" not in caplog.text
+
+
+def test_tolerated_empty_text_part_cannot_hide_valid_attachment(tmp_path, monkeypatch):
+    class EmptyTextPart:
+        def get_content_type(self):
+            return "text/plain"
+
+        def get(self, _name, default=""):
+            return default
+
+        def get_payload(self, decode=False):
+            return None
+
+        def get_filename(self):
+            return None
+
+    message = EmailMessage()
+    message["From"] = "billing@example.com"
+    message["Subject"] = "Invoice with empty text part"
+    message.set_content("fallback")
+    message.add_attachment(
+        b"%PDF-1.4\n",
+        maintype="application",
+        subtype="pdf",
+        filename="still-visible.pdf",
+    )
+    original_walk = list(message.walk())
+    message.walk = lambda: iter([original_walk[0], EmptyTextPart(), *original_walk[1:]])
+    monkeypatch.setattr(email_fetcher_module.email, "message_from_bytes", lambda _raw: message)
+    fetcher = EmailFetcher(
+        "invoice-user@example.com", "auth-code", staging_dir=str(tmp_path / "staging")
+    )
+    fetcher.mail = FakeUidMail({b"1": b"raw"})
+
+    result = fetcher.extract_attachments([b"1"])
+
+    assert len(result) == 1
+    assert result[0]["original_filename"] == "still-visible.pdf"
+
+
+def test_invalid_zip_exception_retains_original_container_as_candidate(tmp_path):
+    raw = build_attachment_message(
+        sender="billing@example.com",
+        subject="Invoice archive",
+        body="Attached archive",
+        filename="invoice-container.zip",
+        payload=b"not-a-valid-zip-but-original-evidence",
+    )
+    fetcher = EmailFetcher(
+        "invoice-user@example.com", "auth-code", staging_dir=str(tmp_path / "staging")
+    )
+    fetcher.mail = FakeUidMail({b"1": raw})
+
+    result = fetcher.extract_attachments([b"1"])
+
+    assert len(result) == 1
+    assert result[0]["original_filename"] == "invoice-container.zip"
+    assert Path(result[0]["filepath"]).read_bytes() == b"not-a-valid-zip-but-original-evidence"
 
 
 if __name__ == "__main__":

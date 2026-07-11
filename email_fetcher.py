@@ -3,6 +3,7 @@ import email
 import email.utils
 from email.header import decode_header
 import json
+import hashlib
 import logging
 import os
 import re
@@ -44,6 +45,19 @@ except ImportError:
     decode = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _safe_exception_identity(exc):
+    exception_type = type(exc).__name__
+    try:
+        exception_detail = str(exc)
+    except Exception:
+        exception_detail = "<unprintable>"
+    fingerprint = hashlib.sha256(
+        f"{exception_type}:{exception_detail}".encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    return exception_type, fingerprint
+
 
 try:
     from zoneinfo import ZoneInfo
@@ -1324,6 +1338,8 @@ class EmailFetcher:
 
     def _legacy_extract_attachments_pre_release_prep(self, email_ids, mailbox="INBOX"):
         """1.3 Extract direct file attachments via 4-tier funnel filtering"""
+        return self.extract_attachments(email_ids, mailbox=mailbox)
+
         if not self.mail:
             return []
             
@@ -1755,6 +1771,7 @@ class EmailFetcher:
                     "entered_main_chain": False,
                     "terminal_status": "uninitialized",
                 }
+                processing_failure_diag = None
 
                 try:
                     selected_msg = None
@@ -1803,22 +1820,13 @@ class EmailFetcher:
                             email_diag["mime_parse_success"] = True
                             email_diag["subject"] = decode_str(msg_candidate.get("Subject"))
                             email_diag["sender"] = decode_str(msg_candidate.get("From", ""))
-                        except Exception as exc:
-                            last_terminal_status = "mime_parse_failed"
-                            email_diag["fetch_attempts"][-1]["error"] = str(exc)
-                            if attempt_index < 2:
-                                continue
-                            break
+                        except Exception:
+                            raise
 
                         try:
                             parts_candidate = list(msg_candidate.walk())
-                        except Exception as exc:
-                            parts_candidate = []
-                            last_terminal_status = "mime_structure_unusable"
-                            email_diag["fetch_attempts"][-1]["error"] = str(exc)
-                            if attempt_index < 2:
-                                continue
-                            break
+                        except Exception:
+                            raise
 
                         email_diag["mime_part_count"] = len(parts_candidate)
                         if not parts_candidate:
@@ -1863,35 +1871,29 @@ class EmailFetcher:
                         content_disposition = str(part.get("Content-Disposition"))
 
                         if content_type == "text/plain" and "attachment" not in content_disposition:
-                            try:
-                                payload = part.get_payload(decode=True)
-                                if payload:
-                                    charset = part.get_content_charset() or 'utf-8'
-                                    body_text += payload.decode(charset, errors='ignore')
-                            except Exception:
-                                pass
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                body_text += payload.decode(charset, errors='ignore')
                         elif content_type == "text/html" and "attachment" not in content_disposition:
-                            try:
-                                payload = part.get_payload(decode=True)
-                                if payload:
-                                    charset = part.get_content_charset() or 'utf-8'
-                                    html_content = payload.decode(charset, errors='ignore')
-                                    soup = BeautifulSoup(html_content, 'html.parser')
-                                    body_text += soup.get_text()
-                                    for a in soup.find_all('a', href=True):
-                                        url = a['href']
-                                        text = a.get_text().strip().lower()
-                                        if url:
-                                            normalized_url = normalize_invoice_link_candidate(url)
-                                            if normalized_url != url.strip():
-                                                logging.info(
-                                                    "Normalized embedded invoice link: %s -> %s",
-                                                    sanitize_url_for_log(url),
-                                                    sanitize_url_for_log(normalized_url),
-                                                )
-                                            links_found.append((normalized_url, text))
-                            except Exception:
-                                pass
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                html_content = payload.decode(charset, errors='ignore')
+                                soup = BeautifulSoup(html_content, 'html.parser')
+                                body_text += soup.get_text()
+                                for a in soup.find_all('a', href=True):
+                                    url = a['href']
+                                    text = a.get_text().strip().lower()
+                                    if url:
+                                        normalized_url = normalize_invoice_link_candidate(url)
+                                        if normalized_url != url.strip():
+                                            logging.info(
+                                                "Normalized embedded invoice link: %s -> %s",
+                                                sanitize_url_for_log(url),
+                                                sanitize_url_for_log(normalized_url),
+                                            )
+                                        links_found.append((normalized_url, text))
 
                         filename = part.get_filename()
                         if not filename:
@@ -1998,9 +2000,9 @@ class EmailFetcher:
                                 "source_kind": "email_body_receipt",
                                 "body_receipt_fields": body_receipt_fields,
                             })
-                        except Exception as stage_exc:
+                        except Exception:
                             email_diag["staging_write_failures"] += 1
-                            logging.error(f"Failed to stage email body receipt {body_receipt_filename}: {stage_exc}")
+                            raise
 
                     while process_queue:
                         attachment_info = process_queue.pop(0)
@@ -2182,26 +2184,9 @@ class EmailFetcher:
 
                         try:
                             filepath = stage_candidate_file(email_staging_path, filename, payload)
-                        except Exception as stage_exc:
+                        except Exception:
                             email_diag["staging_write_failures"] += 1
-                            record_staging_result(
-                                email_diag,
-                                raw_attachment_indices,
-                                filename,
-                                attachment_info.get("content_type", ""),
-                                attachment_info.get("content_disposition", ""),
-                                attachment_info.get("payload_size", len(payload)),
-                                False,
-                                str(stage_exc),
-                            )
-                            self._emit_input_inventory_event({
-                                **inventory_payload,
-                                "inventory_status": "staging_write_failed",
-                                "entered_main_chain": False,
-                                "staging_error": str(stage_exc),
-                            })
-                            logging.error(f"Failed to stage attachment {filename}: {stage_exc}")
-                            continue
+                            raise
 
                         email_diag["staging_write_count"] += 1
                         email_diag["entered_main_chain"] = True
@@ -2390,23 +2375,40 @@ class EmailFetcher:
                         email_diag["terminal_status"] = "no_attachment_parts_detected"
 
                 except Exception as exc:
-                    email_diag["terminal_status"] = "processing_exception"
-                    logging.error(f"Error processing email {email_id_str}: {exc}")
+                    exception_type, exception_fingerprint = _safe_exception_identity(exc)
+                    uid_hash = hashlib.sha256(e_id).hexdigest()[:12]
+                    processing_failure_diag = {
+                        "event": "message_processing_exception",
+                        "terminal_status": "processing_exception",
+                        "exception_type": exception_type,
+                        "exception_fingerprint": exception_fingerprint,
+                        "uid_hash": uid_hash,
+                    }
+                    unresolved_email_ids.append(e_id)
+                    logging.error(
+                        "Message processing failed [%s:%s]",
+                        exception_type,
+                        exception_fingerprint,
+                    )
                 finally:
-                    sanitized_attachments = []
-                    for attachment_diag in email_diag["attachments"]:
-                        sanitized_attachments.append({
-                            "filename": attachment_diag.get("filename", ""),
-                            "content_type": attachment_diag.get("content_type", ""),
-                            "content_disposition": attachment_diag.get("content_disposition", ""),
-                            "payload_bytes_len": int(attachment_diag.get("payload_bytes_len", 0) or 0),
-                            "staged": bool(attachment_diag.get("staged")),
-                            "staging_error": attachment_diag.get("staging_error", ""),
-                        })
-                    email_diag["attachments"] = sanitized_attachments
-                    if email_diag["terminal_status"] == "uninitialized":
-                        email_diag["terminal_status"] = "processing_exception"
-                    self._emit_extract_attachments_diagnostic(email_diag)
+                    if processing_failure_diag is not None:
+                        self._emit_mailbox_scan_diagnostic(processing_failure_diag)
+                        self._emit_extract_attachments_diagnostic(processing_failure_diag)
+                    else:
+                        sanitized_attachments = []
+                        for attachment_diag in email_diag["attachments"]:
+                            sanitized_attachments.append({
+                                "filename": attachment_diag.get("filename", ""),
+                                "content_type": attachment_diag.get("content_type", ""),
+                                "content_disposition": attachment_diag.get("content_disposition", ""),
+                                "payload_bytes_len": int(attachment_diag.get("payload_bytes_len", 0) or 0),
+                                "staged": bool(attachment_diag.get("staged")),
+                                "staging_error": attachment_diag.get("staging_error", ""),
+                            })
+                        email_diag["attachments"] = sanitized_attachments
+                        if email_diag["terminal_status"] == "uninitialized":
+                            email_diag["terminal_status"] = "processing_exception"
+                        self._emit_extract_attachments_diagnostic(email_diag)
                     selected_msg = None
                     last_parsed_msg = None
                     msg_candidate = None

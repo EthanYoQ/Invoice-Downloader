@@ -837,6 +837,153 @@ def test_unresolved_mailbox_input_reaches_one_failed_terminal_after_readable_wor
     assert all(entry.get("type") != "完成" for entry in api.logs)
 
 
+def test_malformed_uid_search_reaches_one_sanitized_failed_terminal(
+    tmp_path, monkeypatch
+):
+    from mailbox_scanner import MailboxScanError
+
+    monkeypatch.chdir(tmp_path)
+    api = InvoiceAppAPI()
+    terminal_events = []
+    finalizers = []
+
+    class Fetcher:
+        def __init__(self, *args, staging_dir, **kwargs):
+            self.staging_dir = Path(staging_dir)
+            self.staging_dir.mkdir(parents=True, exist_ok=True)
+
+        def connect(self):
+            return True
+
+        def fetch_emails_by_date(self, **kwargs):
+            raise MailboxScanError("malformed UID SEARCH ALL response")
+
+        def disconnect(self):
+            finalizers.append("disconnect")
+
+    monkeypatch.setattr("email_fetcher.EmailFetcher", Fetcher)
+    monkeypatch.setattr(api, "_start_truth_audit_async", lambda *args: None)
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: finalizers.append("cleanup"))
+    monkeypatch.setattr(
+        api,
+        "_safe_emit_run_state_event",
+        lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
+    )
+
+    api._processing_worker(
+        "",
+        str(tmp_path / "output"),
+        email_address="a@qq.com",
+        auth_code="x",
+        api_key="y",
+    )
+
+    assert api.run_state == "failed"
+    assert terminal_events == ["failed"]
+    assert finalizers == ["disconnect", "cleanup"]
+    assert "MAILBOX_SCAN_FAILED" in api.last_error
+    assert all(entry.get("type") != "完成" for entry in api.logs)
+
+
+def test_actual_post_fetch_processing_exception_reaches_unresolved_failed_terminal(
+    tmp_path, monkeypatch
+):
+    import email_fetcher as email_fetcher_module
+    from email.message import EmailMessage
+    from email_fetcher import EmailFetcher
+
+    def raw_message(subject, filename):
+        message = EmailMessage()
+        message["From"] = "billing@example.com"
+        message["Subject"] = subject
+        message.set_content("private message body")
+        message.add_attachment(
+            b"%PDF-1.4\n",
+            maintype="application",
+            subtype="pdf",
+            filename=filename,
+        )
+        return message.as_bytes()
+
+    messages = {
+        b"1": raw_message("Boom confidential subject", "one.pdf"),
+        b"2": raw_message("Invoice 2", "two.pdf"),
+    }
+
+    class Mail:
+        def select(self, _mailbox, readonly=True):
+            assert readonly is True
+            return "ok", [b""]
+
+        def uid(self, command, uid_set, query):
+            assert command == "FETCH"
+            return "ok", [
+                (f"{index} (UID {uid.decode()} RFC822".encode(), messages[uid])
+                for index, uid in enumerate(uid_set.split(b","), 1)
+            ]
+
+    finalizers = []
+
+    class WorkerFetcher(EmailFetcher):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.mail = Mail()
+
+        def connect(self):
+            return True
+
+        def fetch_emails_by_date(self, **_kwargs):
+            return [b"1", b"2"]
+
+        def disconnect(self):
+            finalizers.append("disconnect")
+
+    secret = "https://private.example/?token=worker-secret"
+    original_classifier = email_fetcher_module._classify_email_tier
+
+    def classifier(sender, subject, body_text):
+        if "Boom" in subject:
+            raise RuntimeError(secret)
+        return original_classifier(sender, subject, body_text)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(email_fetcher_module, "EmailFetcher", WorkerFetcher)
+    monkeypatch.setattr(email_fetcher_module, "_classify_email_tier", classifier)
+    api = InvoiceAppAPI()
+    terminal_events = []
+    monkeypatch.setattr(api, "_start_truth_audit_async", lambda *args: None)
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: finalizers.append("cleanup"))
+    monkeypatch.setattr(
+        api,
+        "_run_processing_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("processing loop must not run after unresolved mailbox input")
+        ),
+    )
+    monkeypatch.setattr(
+        api,
+        "_safe_emit_run_state_event",
+        lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
+    )
+
+    api._processing_worker(
+        "",
+        str(tmp_path / "output"),
+        email_address="a@qq.com",
+        auth_code="x",
+        api_key="y",
+    )
+
+    assert api.run_state == "failed"
+    assert terminal_events == ["failed"]
+    assert finalizers == ["disconnect", "cleanup"]
+    assert "UNRESOLVED_MAILBOX_INPUT" in api.last_error
+    assert "private.example" not in api.last_error
+    assert "worker-secret" not in api.last_error
+    assert not any("private.example" in str(entry) for entry in api.logs)
+    assert all(entry.get("type") != "完成" for entry in api.logs)
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_state", "expected_status", "error_code", "actionable_text"),
     [

@@ -129,7 +129,7 @@ def test_scan_raises_on_search_failure_instead_of_claiming_empty_mailbox():
         MailboxScanner(SearchFailureMail(b"", None)).scan(dt.date(2026, 6, 1), None)
 
 
-def test_search_accepts_multiple_chunks_none_and_interleaved_entries_stably():
+def test_search_accepts_multiple_chunks_none_and_empty_entries_stably():
     def fetch(uid_set, _query):
         return "ok", [
             _header_part(index, int(uid))
@@ -141,13 +141,50 @@ def test_search_accepts_multiple_chunks_none_and_interleaved_entries_stably():
     def uid(command, *args):
         mail.uid_calls.append((command, args))
         if command.upper() == "SEARCH":
-            return "ok", [b"91 7", None, (b"ignored",), bytearray(b"91 105"), b""]
+            return "ok", [b"91 7", None, b"", bytearray(b"91 105")]
         return fetch(*args)
 
     mail.uid = uid
     refs = MailboxScanner(mail).scan(dt.date(2026, 6, 1), dt.date(2026, 6, 14))
 
     assert [ref.uid for ref in refs] == [b"91", b"7", b"105"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        ["91 92"],
+        [b"90", "91 92"],
+        [b"90", [b"91"]],
+        [b"90", {"uid": 91}],
+        [b"90", object()],
+    ],
+)
+def test_search_rejects_every_unsupported_nonempty_response_item(response):
+    mail = FakeUidMail(b"unused", lambda *_args: (_ for _ in ()).throw(AssertionError("no FETCH")))
+
+    def uid(command, *args):
+        mail.uid_calls.append((command, args))
+        if command.upper() == "SEARCH":
+            return "ok", response
+        raise AssertionError("FETCH must not run for untrusted SEARCH response")
+
+    mail.uid = uid
+    with pytest.raises(MailboxScanError, match="malformed UID SEARCH"):
+        MailboxScanner(mail).scan(dt.date(2026, 6, 1), None)
+
+
+@pytest.mark.parametrize("response", [[], [None], [b""], [bytearray(b"")], [None, b""]])
+def test_search_allows_only_documented_empty_response_entries(response):
+    mail = FakeUidMail(b"unused", lambda *_args: (_ for _ in ()).throw(AssertionError("no FETCH")))
+
+    def uid(command, *args):
+        if command.upper() == "SEARCH":
+            return "ok", response
+        raise AssertionError("FETCH must not run for empty mailbox")
+
+    mail.uid = uid
+    assert MailboxScanner(mail).scan(dt.date(2026, 6, 1), None) == []
 
 
 def test_empty_search_is_empty_but_nonempty_malformed_ok_response_fails_closed():
