@@ -93,4 +93,3 @@ the hardened audit still reports the finalized 215-row truth consistently, but
 does not prove this coordinator code produced those artifacts. The fresh clean
 mailbox run remains a later whole-project release gate and is not part of Task
 9 acceptance.
-
