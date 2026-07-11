@@ -120,11 +120,22 @@ class CandidatePipeline:
                     )
                 continue
             if not isinstance(source, Mapping):
-                source = {"candidate_action": "manual_review", "raw_type": type(source).__name__}
+                source = {
+                    "filepath": "",
+                    "candidate_action": "manual_review",
+                    "prefilter_reason_code": "MALFORMED_DOCUMENT_CANDIDATE",
+                    "raw_type": type(source).__name__,
+                }
 
             metadata = dict(source)
-            source_path = str(metadata.get("filepath") or "")
             source_url = str(metadata.get("source_url") or "")
+            source_path = str(metadata.get("filepath") or source_url or "")
+            metadata["filepath"] = source_path
+            if not source_path:
+                metadata.setdefault("candidate_action", "manual_review")
+                metadata.setdefault(
+                    "prefilter_reason_code", "MALFORMED_DOCUMENT_CANDIDATE"
+                )
             filename = os.path.basename(source_path) or str(metadata.get("filename") or "")
             message_uid = str(
                 metadata.get("message_uid")
@@ -133,7 +144,7 @@ class CandidatePipeline:
                 or ""
             )
             provider_group_key = str(metadata.get("provider_group_key") or "")
-            document_seed = "|".join(
+            legacy_document_seed = "|".join(
                 (
                     source_path,
                     str(metadata.get("subject") or ""),
@@ -142,8 +153,21 @@ class CandidatePipeline:
                     str(sequence),
                 )
             )
+            stable_document_seed = "|".join(
+                (
+                    message_uid,
+                    source_url or source_path,
+                    filename,
+                    provider_group_key,
+                    str(metadata.get("subject") or ""),
+                    str(metadata.get("tier", 0)),
+                )
+            )
             document_id = str(metadata.get("document_id") or "") or hashlib.md5(
-                document_seed.encode("utf-8")
+                stable_document_seed.encode("utf-8")
+            ).hexdigest()
+            legacy_document_id = hashlib.md5(
+                legacy_document_seed.encode("utf-8")
             ).hexdigest()
             source_locator = source_url or source_path
             source_kind = "url" if metadata.get("is_url") or source_url else "attachment"
@@ -157,6 +181,7 @@ class CandidatePipeline:
             )
             trace_context = {
                 "candidate_index": sequence + 1,
+                "legacy_document_id": legacy_document_id,
                 "tier": metadata.get("tier", 0),
                 "provider_family": metadata.get("provider_family", ""),
             }

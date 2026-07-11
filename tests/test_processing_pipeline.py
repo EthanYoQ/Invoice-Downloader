@@ -57,6 +57,32 @@ def test_candidate_nested_metadata_cannot_be_mutated_and_thaws_for_legacy():
         candidate.metadata["nested"]["values"] += (3,)  # type: ignore[index,operator]
 
 
+def test_candidate_document_identity_is_stable_when_input_order_changes():
+    rows = [
+        {"filepath": "C:/staging/a.pdf", "message_uid": "11"},
+        {"filepath": "C:/staging/b.pdf", "message_uid": "12"},
+    ]
+
+    forward = CandidatePipeline().collect(rows)
+    reverse = CandidatePipeline().collect(list(reversed(rows)))
+
+    forward_ids = {candidate.source_path: candidate.identity.document_id for candidate in forward}
+    reverse_ids = {candidate.source_path: candidate.identity.document_id for candidate in reverse}
+    assert forward_ids == reverse_ids
+    assert [candidate.sequence for candidate in reverse] == [0, 1]
+
+
+def test_malformed_candidate_is_retained_as_explicit_manual_legacy_row():
+    candidates = CandidatePipeline().collect([None, {"subject": "missing path"}])
+
+    assert len(candidates) == 2
+    for candidate in candidates:
+        legacy = candidate.to_legacy()
+        assert legacy["filepath"] == ""
+        assert legacy["candidate_action"] == "manual_review"
+        assert legacy["prefilter_reason_code"] == "MALFORMED_DOCUMENT_CANDIDATE"
+
+
 def test_local_result_bypasses_remote_runtime():
     remote_calls: list[str] = []
     candidate = _candidate(0)

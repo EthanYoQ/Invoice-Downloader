@@ -2482,6 +2482,12 @@ class InvoiceAppAPI:
         prepared_extractions = {}
         prepared_lock = threading.Lock()
 
+        def _prepared_key(candidate):
+            return str(
+                candidate.trace_context.get("legacy_document_id")
+                or candidate.identity.document_id
+            )
+
         def _verified_worker_ceiling():
             runtime = getattr(_extractor, "glm_runtime", None)
             profiles = getattr(runtime, "profiles", {}) or {}
@@ -2504,18 +2510,18 @@ class InvoiceAppAPI:
                 base64_img = _extractor.pdf_to_base64_image(candidate.source_path)
             except Exception as exc:
                 with prepared_lock:
-                    prepared_extractions[candidate.identity.document_id] = {
+                    prepared_extractions[_prepared_key(candidate)] = {
                         "base64_img": None,
                         "preprocess_error_type": type(exc).__name__,
                     }
                 return legacy
             if not base64_img:
                 return legacy
-            prepared_inputs[candidate.identity.document_id] = (legacy, base64_img)
+            prepared_inputs[_prepared_key(candidate)] = (legacy, base64_img)
             return None
 
         def _extract_remote(candidate):
-            legacy, base64_img = prepared_inputs[candidate.identity.document_id]
+            legacy, base64_img = prepared_inputs[_prepared_key(candidate)]
             worker_factory = _worker_extractor_factory
             if worker_factory is None:
                 def worker_factory(runtime):
@@ -2581,7 +2587,7 @@ class InvoiceAppAPI:
             if worker_close_error_type:
                 prepared["worker_close_error_type"] = worker_close_error_type
             with prepared_lock:
-                prepared_extractions[candidate.identity.document_id] = prepared
+                prepared_extractions[_prepared_key(candidate)] = prepared
             return legacy
 
         outcomes = ExtractionPipeline(
