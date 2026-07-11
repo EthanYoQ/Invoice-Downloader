@@ -99,6 +99,35 @@ class TruthAuditJob:
     result: dict
 
 
+@dataclass(frozen=True)
+class _RunAdmissionCandidate:
+    rules_text: str
+    requested_save_path: str
+    effective_save_path: str
+    date_from: str
+    date_to: str
+    account_id: str
+    channel_id: str
+    email_domain: str
+    run_context_json: str
+    started_at: str
+
+    def run_context(self):
+        return json.loads(self.run_context_json)
+
+
+class _RunAdmissionSecrets:
+    __slots__ = ("email_address", "auth_code", "api_key")
+
+    def __init__(self, email_address, auth_code, api_key):
+        self.email_address = str(email_address or "")
+        self.auth_code = str(auth_code or "")
+        self.api_key = str(api_key or "")
+
+    def __repr__(self):
+        return "_RunAdmissionSecrets(<process-only redacted>)"
+
+
 class _ProcessingPipelineSession:
     def __init__(
         self,
@@ -1957,18 +1986,18 @@ class InvoiceAppAPI:
 
 
 
-    def _processing_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None, run_handle=None):
+    def _processing_worker(self, request, run_handle, dependencies):
         try:
-            return self._run_coordinator_worker(
-                rules_text,
-                save_path,
-                date_from,
-                date_to,
-                email_address,
-                auth_code,
-                api_key,
-                run_handle,
+            if run_handle is None or run_handle is not self._active_run_handle:
+                raise RuntimeError("reserved run handle ownership is required")
+            if request.run_id != run_handle.run_id:
+                raise RuntimeError("run request does not match reserved handle")
+            coordinator = RunCoordinator(
+                self._run_lifecycle,
+                self._run_state_store,
+                dependencies,
             )
+            return coordinator.run(request, handle=run_handle)
         except Exception as exc:
             self._packaged_diag_write(
                 "coordinator_worker_exception",
@@ -1976,12 +2005,11 @@ class InvoiceAppAPI:
                 "exception",
                 exc=exc,
             )
-            handle = run_handle
-            if handle is not None and handle.state in {RunState.COMPLETED, RunState.FAILED}:
+            if run_handle is not None and run_handle.state in {RunState.COMPLETED, RunState.FAILED}:
                 return None
-            if handle is not None:
+            if run_handle is not None:
                 self._finalize_admission_failure(
-                    handle,
+                    run_handle,
                     exc,
                     reason_code="COORDINATOR_START_FAILED",
                 )
@@ -1991,47 +2019,6 @@ class InvoiceAppAPI:
             with self._admission_lock:
                 if self._worker_thread is current:
                     self._worker_thread = None
-
-    def _run_coordinator_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None, run_handle=None):
-        if run_handle is None or run_handle is not self._active_run_handle:
-            raise RuntimeError("reserved run handle ownership is required")
-        request = RunRequest(
-            run_id=run_handle.run_id,
-            date_from=str(date_from or ""),
-            date_to=str(date_to or ""),
-            save_path=str(save_path or ""),
-            rules_text=str(rules_text or ""),
-            account_id=stable_hash(str(email_address or ""))[:12],
-            channel_id=str(email_address or "").rsplit("@", 1)[-1].split(".", 1)[0].lower(),
-        )
-        try:
-            dependencies = self._build_run_dependencies(
-                request,
-                email_address=email_address,
-                auth_code=auth_code,
-                api_key=api_key,
-            )
-        except Exception as setup_exc:
-            def fail_setup(_request, failure=setup_exc):
-                raise failure
-
-            dependencies = RunDependencies(
-                connect=fail_setup,
-                report_service=ReportService(
-                    report_callback=lambda _context, _result: self._await_truth_audit(),
-                    cleanup_callback=lambda context: self._cleanup_temp_folders(
-                        staging_dir=context.staging_dir,
-                        temp_dir=self._active_temp_dir,
-                    ),
-                    timeout_seconds=self._truth_audit_timeout_seconds + 1.0,
-                ),
-            )
-        coordinator = RunCoordinator(
-            self._run_lifecycle,
-            self._run_state_store,
-            dependencies,
-        )
-        return coordinator.run(request, handle=run_handle)
 
     def _build_run_dependencies(
         self,
@@ -3154,15 +3141,78 @@ class InvoiceAppAPI:
         self._worker_thread = None
         return state
 
-    def _admit_processing_run(
+    def _build_admission_candidate(
         self,
         *,
         rules_text,
-        requested_save_path,
-        effective_save_path,
+        save_path,
+        date_from,
+        date_to,
         email_address,
         auth_code,
         api_key,
+    ):
+        run_context = dict(load_run_context() or {})
+        requested_save_path = str(
+            save_path
+            or (
+                run_context.get("output_dir", "")
+                if run_context.get("enabled")
+                else resolve_default_save_path()
+            )
+        )
+        effective_save_path = str(
+            run_context.get("output_dir", requested_save_path)
+            if run_context.get("enabled")
+            else requested_save_path
+        )
+        effective_date_from = str(
+            (run_context.get("locked_date_from", "") if run_context.get("enabled") else "")
+            or date_from
+            or ""
+        )
+        effective_date_to = str(
+            (run_context.get("locked_date_to", "") if run_context.get("enabled") else "")
+            or date_to
+            or ""
+        )
+        date_error = self._validate_date_range(effective_date_from, effective_date_to)
+        if date_error:
+            return None, None, date_error
+
+        email_text = str(email_address or "")
+        email_domain = email_text.rsplit("@", 1)[-1].lower() if "@" in email_text else ""
+        candidate = _RunAdmissionCandidate(
+            rules_text=str(rules_text or ""),
+            requested_save_path=requested_save_path,
+            effective_save_path=effective_save_path,
+            date_from=effective_date_from,
+            date_to=effective_date_to,
+            account_id=stable_hash(email_text)[:12],
+            channel_id=email_domain.split(".", 1)[0] or "email",
+            email_domain=email_domain,
+            run_context_json=json.dumps(run_context, ensure_ascii=False, sort_keys=True),
+            started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return candidate, _RunAdmissionSecrets(email_text, auth_code, api_key), ""
+
+    def _restore_failed_admission(self, previous, previous_settings, settings_existed, settings_touched):
+        if settings_touched:
+            try:
+                if settings_existed:
+                    self._settings_store.save(previous_settings)
+                else:
+                    self._settings_store.clear()
+            except Exception:
+                pass
+        for name, value in previous.items():
+            setattr(self, name, value)
+
+    def _admit_processing_run(
+        self,
+        *,
+        candidate,
+        secrets,
     ):
         with self._admission_lock:
             worker_active = bool(self._worker_thread and self._worker_thread.is_alive())
@@ -3176,10 +3226,88 @@ class InvoiceAppAPI:
             if active_handle is not None:
                 self._active_run_handle = None
 
+            previous = {
+                "_run_context": self._run_context,
+                "_current_run_id": self._current_run_id,
+                "_requested_save_path": self._requested_save_path,
+                "_effective_save_path": self._effective_save_path,
+                "_effective_date_from": self._effective_date_from,
+                "_effective_date_to": self._effective_date_to,
+                "_active_run_config": self._active_run_config,
+                "_active_temp_dir": self._active_temp_dir,
+                "_truth_audit_thread": self._truth_audit_thread,
+                "_truth_audit_job": self._truth_audit_job,
+            }
+            previous_settings = {}
+            settings_existed = os.path.exists(self._settings_store.settings_path)
+            settings_touched = False
+            handle = None
             try:
+                self._run_context = candidate.run_context()
+                ensure_run_context_dirs(self._run_context)
+                self._current_run_id = str(self._run_context.get("run_id", "") or "")
                 handle = self._prepare_run_lifecycle()
+                previous_settings = self._settings_store.load() or {}
+                self._requested_save_path = candidate.requested_save_path
+                self._effective_save_path = candidate.effective_save_path
+                self._effective_date_from = candidate.date_from
+                self._effective_date_to = candidate.date_to
+
+                active_company = str(previous_settings.get("company") or "").strip()
+                remember_settings = bool(previous_settings.get("remember_settings", True))
+                self._active_run_config = {
+                    "company": active_company,
+                    "save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    "started_at": candidate.started_at,
+                }
+
+                os.makedirs(candidate.effective_save_path, exist_ok=True)
+                settings_payload = (
+                    {
+                        "email": secrets.email_address,
+                        "auth_code": secrets.auth_code,
+                        "api_key": secrets.api_key,
+                        "save_path": candidate.effective_save_path,
+                        "date_from": candidate.date_from,
+                        "date_to": candidate.date_to,
+                        "company": active_company,
+                        "remember_settings": True,
+                    }
+                    if remember_settings
+                    else {"remember_settings": False}
+                )
+                settings_touched = True
+                save_result = self.save_user_settings(settings_payload)
+                if not bool((save_result or {}).get("success")):
+                    raise RuntimeError("settings persistence failed")
+
+                request = RunRequest(
+                    run_id=handle.run_id,
+                    date_from=candidate.date_from,
+                    date_to=candidate.date_to,
+                    save_path=candidate.effective_save_path,
+                    rules_text=candidate.rules_text,
+                    account_id=candidate.account_id,
+                    channel_id=candidate.channel_id,
+                )
+                dependencies = self._build_run_dependencies(
+                    request,
+                    email_address=secrets.email_address,
+                    auth_code=secrets.auth_code,
+                    api_key=secrets.api_key,
+                )
             except Exception as exc:
-                return {"success": False, "message": f"无法创建运行临时目录: {type(exc).__name__}"}
+                if handle is not None:
+                    self._finalize_admission_failure(handle, exc)
+                self._restore_failed_admission(
+                    previous,
+                    previous_settings,
+                    settings_existed,
+                    settings_touched,
+                )
+                return {"success": False, "message": "后台任务启动失败"}
 
             self._run_state_store.reset(handle.run_id)
             self._run_state_store.update(
@@ -3194,13 +3322,13 @@ class InvoiceAppAPI:
             )
             self._packaged_diag_reset(
                 {
-                    "requested_save_path": requested_save_path,
-                    "effective_save_path": effective_save_path,
-                    "date_from": self._effective_date_from,
-                    "date_to": self._effective_date_to,
-                    "email_domain": self._packaged_diag_email_domain(email_address),
-                    "has_auth_code": bool(auth_code),
-                    "has_api_key": bool(api_key),
+                    "requested_save_path": candidate.requested_save_path,
+                    "effective_save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    "email_domain": candidate.email_domain,
+                    "has_auth_code": bool(secrets.auth_code),
+                    "has_api_key": bool(secrets.api_key),
                 }
             )
             self._packaged_diag_write(
@@ -3208,29 +3336,37 @@ class InvoiceAppAPI:
                 "start_processing",
                 "success",
                 summary={
-                    "requested_save_path": requested_save_path,
-                    "effective_save_path": effective_save_path,
-                    "date_from": self._effective_date_from,
-                    "date_to": self._effective_date_to,
-                    "email_domain": self._packaged_diag_email_domain(email_address),
-                    "has_auth_code": bool(auth_code),
-                    "has_api_key": bool(api_key),
+                    "requested_save_path": candidate.requested_save_path,
+                    "effective_save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    "email_domain": candidate.email_domain,
+                    "has_auth_code": bool(secrets.auth_code),
+                    "has_api_key": bool(secrets.api_key),
                 },
             )
             self._safe_emit_stage_event(
                 "start_processing",
                 "enter",
                 {
-                    "requested_save_path": requested_save_path,
-                    "effective_save_path": effective_save_path,
-                    "date_from": self._effective_date_from,
-                    "date_to": self._effective_date_to,
-                    **self._sensitive_summary(email_address, auth_code, api_key),
+                    "requested_save_path": candidate.requested_save_path,
+                    "effective_save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    **self._sensitive_summary(
+                        secrets.email_address,
+                        secrets.auth_code,
+                        secrets.api_key,
+                    ),
                 },
             )
-            self._safe_write_run_config(email_address, auth_code=auth_code, api_key=api_key)
+            self._safe_write_run_config(
+                secrets.email_address,
+                auth_code=secrets.auth_code,
+                api_key=secrets.api_key,
+            )
             try:
-                self._start_truth_audit_async(email_address, auth_code)
+                self._start_truth_audit_async(secrets.email_address, secrets.auth_code)
             except Exception as exc:
                 self._safe_emit_stage_event(
                     "start_processing",
@@ -3238,20 +3374,17 @@ class InvoiceAppAPI:
                     {"result": "failed", "reason": "WORKER_START_FAILED"},
                 )
                 self._finalize_admission_failure(handle, exc)
+                self._restore_failed_admission(
+                    previous,
+                    previous_settings,
+                    settings_existed,
+                    settings_touched,
+                )
                 return {"success": False, "message": "后台任务启动失败"}
 
             thread = threading.Thread(
                 target=self._processing_worker,
-                args=(
-                    rules_text,
-                    effective_save_path,
-                    self._effective_date_from,
-                    self._effective_date_to,
-                    email_address,
-                    auth_code,
-                    api_key,
-                    handle,
-                ),
+                args=(request, handle, dependencies),
                 name="InvoiceFlowWorker",
                 daemon=True,
             )
@@ -3261,6 +3394,12 @@ class InvoiceAppAPI:
                 thread.start()
             except Exception as exc:
                 self._finalize_admission_failure(handle, exc)
+                self._restore_failed_admission(
+                    previous,
+                    previous_settings,
+                    settings_existed,
+                    settings_touched,
+                )
                 return {"success": False, "message": "后台任务启动失败"}
             self._packaged_diag_write(
                 "worker_thread_started",
@@ -3272,79 +3411,27 @@ class InvoiceAppAPI:
             return {"success": True, "message": "任务已启动"}
 
     def start_processing(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        import os
-
         if not self._run_lifecycle.can_begin or self._is_running or (self._worker_thread and self._worker_thread.is_alive()):
             return {"success": False, "message": "任务已在运行中"}
 
         if not email_address or not auth_code or not api_key:
             return {"success": False, "message": "缺少必要凭证，请填写邮箱、授权码和 API Key"}
 
-        run_context = self._refresh_run_context()
-        requested_save_path = save_path or self.get_default_save_path()
-        effective_save_path = self._effective_save_dir(requested_save_path)
-        effective_date_from, effective_date_to = self._effective_date_range(date_from, date_to)
-        date_error = self._validate_date_range(effective_date_from, effective_date_to)
-        if date_error:
-            return {"success": False, "message": date_error}
-
-        print(
-            "Start processing",
-            {
-                "run_context_enabled": bool(run_context.get("enabled")),
-                "run_id": run_context.get("run_id", ""),
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "requested_date_from": date_from,
-                "requested_date_to": date_to,
-                "effective_date_from": effective_date_from,
-                "effective_date_to": effective_date_to,
-            },
-        )
-        self._requested_save_path = requested_save_path
-        self._effective_save_path = effective_save_path
-        self._effective_date_from = effective_date_from or ""
-        self._effective_date_to = effective_date_to or ""
-        self._current_run_id = run_context.get("run_id", "")
-        ensure_run_context_dirs(run_context)
-
-        try:
-            if effective_save_path and not os.path.exists(effective_save_path):
-                os.makedirs(effective_save_path, exist_ok=True)
-        except Exception as exc:
-            return {"success": False, "message": f"无法创建输出目录: {exc}"}
-
-        current_settings = self._settings_store.load() or {}
-        remember_settings = bool(current_settings.get("remember_settings", True))
-        active_company = str(current_settings.get("company") or "").strip()
-        self._active_run_config = {
-            "company": active_company,
-            "save_path": effective_save_path,
-            "date_from": self._effective_date_from,
-            "date_to": self._effective_date_to,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        if remember_settings:
-            self.save_user_settings({
-                "email": email_address,
-                "auth_code": auth_code,
-                "api_key": api_key,
-                "save_path": effective_save_path,
-                "date_from": effective_date_from or "",
-                "date_to": effective_date_to or "",
-                "company": active_company,
-                "remember_settings": True,
-            })
-        else:
-            self.save_user_settings({"remember_settings": False})
-
-        return self._admit_processing_run(
+        candidate, secrets, date_error = self._build_admission_candidate(
             rules_text=rules_text,
-            requested_save_path=requested_save_path,
-            effective_save_path=effective_save_path,
+            save_path=save_path,
+            date_from=date_from,
+            date_to=date_to,
             email_address=email_address,
             auth_code=auth_code,
             api_key=api_key,
+        )
+        if date_error:
+            return {"success": False, "message": date_error}
+
+        return self._admit_processing_run(
+            candidate=candidate,
+            secrets=secrets,
         )
 
     def get_processed_records(self):

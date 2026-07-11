@@ -9,9 +9,34 @@ from app_api import InvoiceAppAPI
 
 
 def run_reserved_worker(api, *args, **kwargs):
+    from run_coordinator import RunRequest
+
+    rules_text = args[0] if args else kwargs.pop("rules_text", "")
+    save_path = args[1] if len(args) > 1 else kwargs.pop("save_path", "")
+    date_from = kwargs.pop("date_from", "") or ""
+    date_to = kwargs.pop("date_to", "") or ""
+    email_address = kwargs.pop("email_address", "")
+    auth_code = kwargs.pop("auth_code", "")
+    api_key = kwargs.pop("api_key", "")
+    assert not kwargs
     handle = api._prepare_run_lifecycle()
     api._run_state_store.reset(handle.run_id)
-    return api._processing_worker(*args, **kwargs, run_handle=handle)
+    request = RunRequest(
+        run_id=handle.run_id,
+        date_from=date_from,
+        date_to=date_to,
+        save_path=str(save_path),
+        rules_text=str(rules_text),
+        account_id="test-account",
+        channel_id="qq",
+    )
+    dependencies = api._build_run_dependencies(
+        request,
+        email_address=email_address,
+        auth_code=auth_code,
+        api_key=api_key,
+    )
+    return api._processing_worker(request, handle, dependencies)
 
 
 def lifecycle_types():

@@ -457,14 +457,14 @@ def test_app_api_progress_snapshot_is_independent_and_keeps_exact_frontend_shape
 def test_app_api_worker_delegates_to_coordinator_not_legacy_whole_run():
     from app_api import InvoiceAppAPI
 
-    facade_source = inspect.getsource(InvoiceAppAPI._processing_worker)
-    source = inspect.getsource(InvoiceAppAPI._run_coordinator_worker)
-    assert "_run_coordinator_worker" in facade_source
+    source = inspect.getsource(InvoiceAppAPI._processing_worker)
     assert "RunCoordinator" in source
     assert ".run(" in source
     assert "fetch_emails_by_date" not in source
     assert "extract_attachments" not in source
     assert "_run_processing_loop(" not in source
+    assert "_effective_date_from" not in source
+    assert "_active_run_config" not in source
 
 
 def test_app_api_coordinator_setup_failure_releases_run_without_secret(tmp_path: Path, monkeypatch):
@@ -478,22 +478,66 @@ def test_app_api_coordinator_setup_failure_releases_run_without_secret(tmp_path:
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("SETUP-SECRET")),
     )
     monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **_kwargs: None)
-    handle = api._prepare_run_lifecycle()
-    api._run_state_store.reset(handle.run_id)
+    monkeypatch.setattr(api, "_start_truth_audit_async", lambda *_args: None)
+    monkeypatch.setattr(api, "save_user_settings", lambda *_args: {"success": True})
 
-    api._processing_worker(
+    result = api.start_processing(
         "",
         str(tmp_path / "output"),
         email_address="a@qq.com",
         auth_code="auth",
         api_key="key",
-        run_handle=handle,
     )
 
+    assert result == {"success": False, "message": "后台任务启动失败"}
     assert api._active_run_handle.state is RunState.FAILED
     assert api._run_lifecycle.can_begin is True
     assert api.run_state == "failed"
     assert "SETUP-SECRET" not in api.last_error
+
+
+def test_settings_load_failure_releases_reserved_handle_and_restores_config(tmp_path: Path, monkeypatch):
+    from app_api import InvoiceAppAPI
+    from run_lifecycle import RunState
+
+    api = InvoiceAppAPI()
+    prior_config = {"save_path": "prior-output", "date_from": "prior-from"}
+    api._active_run_config = prior_config
+    api._requested_save_path = "prior-requested"
+    api._effective_save_path = "prior-effective"
+
+    class FailingSettingsStore:
+        settings_path = str(tmp_path / "settings.json")
+
+        def load(self):
+            raise RuntimeError("SETTINGS-LOAD-SECRET")
+
+        def save(self, _settings):
+            raise AssertionError("settings rollback must not save when load failed")
+
+        def clear(self):
+            raise AssertionError("settings rollback must not clear when load failed")
+
+    api._settings_store = FailingSettingsStore()
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **_kwargs: None)
+
+    result = api.start_processing(
+        "RULE-NEW",
+        str(tmp_path / "new-output"),
+        "2026-03-01",
+        "2026-03-02",
+        "settings-user@qq.com",
+        "AUTH-SETTINGS-SECRET",
+        "API-SETTINGS-SECRET",
+    )
+
+    assert result == {"success": False, "message": "后台任务启动失败"}
+    assert api._active_run_handle.state is RunState.FAILED
+    assert api._run_lifecycle.can_begin is True
+    assert api._active_run_config is prior_config
+    assert api._requested_save_path == "prior-requested"
+    assert api._effective_save_path == "prior-effective"
+    assert "SETTINGS-LOAD-SECRET" not in api.last_error
 
 
 def test_prepare_run_lifecycle_rejects_any_existing_handle(tmp_path: Path, monkeypatch):
@@ -558,6 +602,136 @@ def test_start_processing_admission_is_atomic_under_real_thread_race(tmp_path: P
     assert sum(result.get("message") == "任务已在运行中" for result in results) == 1
     assert len(worker_calls) == 1
     assert api._run_lifecycle.owned_staging_count == 1
+
+
+@pytest.mark.parametrize("winner", ["A", "B"])
+def test_pre_admission_interleaving_commits_only_winner_request(
+    tmp_path: Path,
+    monkeypatch,
+    winner: str,
+):
+    from app_api import InvoiceAppAPI
+    from run_coordinator import RunRequest
+
+    requests = {
+        "A": {
+            "rules": "RULE-A-ONLY",
+            "path": str(tmp_path / "output-A"),
+            "date_from": "2026-01-01",
+            "date_to": "2026-01-11",
+            "email": "winner-a@qq.com",
+            "auth": "AUTH-A-SECRET",
+            "api": "API-A-SECRET",
+        },
+        "B": {
+            "rules": "RULE-B-ONLY",
+            "path": str(tmp_path / "output-B"),
+            "date_from": "2026-02-02",
+            "date_to": "2026-02-22",
+            "email": "winner-b@qq.com",
+            "auth": "AUTH-B-SECRET",
+            "api": "API-B-SECRET",
+        },
+    }
+    loser = "B" if winner == "A" else "A"
+    api = InvoiceAppAPI()
+    validation_barrier = threading.Barrier(2)
+    winner_started = threading.Event()
+    release_worker = threading.Event()
+    worker_calls = []
+    settings_writes = []
+    diagnostics = []
+    results = {}
+    original_validate = api._validate_date_range
+
+    def interleaved_validate(date_from, date_to):
+        name = "A" if date_from == requests["A"]["date_from"] else "B"
+        validation_barrier.wait(timeout=2)
+        if name == loser:
+            assert winner_started.wait(2)
+        return original_validate(date_from, date_to)
+
+    def blocked_worker(*args):
+        worker_calls.append(args)
+        winner_started.set()
+        release_worker.wait(2)
+
+    monkeypatch.setattr(api, "_validate_date_range", interleaved_validate)
+    monkeypatch.setattr(api, "_processing_worker", blocked_worker)
+    monkeypatch.setattr(api, "_start_truth_audit_async", lambda *_args: None)
+    monkeypatch.setattr(api, "_safe_write_run_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(api, "save_user_settings", lambda payload: settings_writes.append(dict(payload)) or {"success": True})
+    monkeypatch.setattr(api, "_packaged_diag_reset", lambda summary=None: diagnostics.append(("reset", dict(summary or {}))))
+    monkeypatch.setattr(api, "_packaged_diag_write", lambda *args, **kwargs: diagnostics.append((args, kwargs)))
+
+    def caller(name):
+        item = requests[name]
+        results[name] = api.start_processing(
+            item["rules"],
+            item["path"],
+            item["date_from"],
+            item["date_to"],
+            item["email"],
+            item["auth"],
+            item["api"],
+        )
+
+    threads = {
+        name: threading.Thread(target=caller, args=(name,))
+        for name in ("A", "B")
+    }
+    threads[winner].start()
+    threads[loser].start()
+    for thread in threads.values():
+        thread.join(3)
+    release_worker.set()
+    if api._worker_thread is not None:
+        api._worker_thread.join(1)
+
+    accepted = requests[winner]
+    rejected = requests[loser]
+    assert results[winner] == {"success": True, "message": "任务已启动"}
+    assert results[loser] == {"success": False, "message": "任务已在运行中"}
+    assert len(worker_calls) == 1
+    run_request, run_handle, _dependencies = worker_calls[0]
+    assert isinstance(run_request, RunRequest)
+    assert run_request.rules_text == accepted["rules"]
+    assert run_request.save_path == accepted["path"]
+    assert (run_request.date_from, run_request.date_to) == (
+        accepted["date_from"],
+        accepted["date_to"],
+    )
+    assert run_handle is api._active_run_handle
+    assert run_handle.run_id == run_request.run_id
+    assert run_handle.staging_dir.exists()
+    assert run_handle.run_id in str(api._active_temp_dir)
+    assert not Path(rejected["path"]).exists()
+    assert api._requested_save_path == accepted["path"]
+    assert api._effective_save_path == accepted["path"]
+    assert (api._effective_date_from, api._effective_date_to) == (
+        accepted["date_from"],
+        accepted["date_to"],
+    )
+    assert api._active_run_config["save_path"] == accepted["path"]
+    assert api._active_run_config["date_from"] == accepted["date_from"]
+    assert api._active_run_config["date_to"] == accepted["date_to"]
+    assert len(settings_writes) == 1
+    assert settings_writes[0]["save_path"] == accepted["path"]
+    assert settings_writes[0]["date_from"] == accepted["date_from"]
+    assert settings_writes[0]["date_to"] == accepted["date_to"]
+    diagnostic_payloads = [
+        item[1]
+        for item in diagnostics
+        if item[0] == "reset"
+    ] + [
+        item[1].get("summary", {})
+        for item in diagnostics
+        if item[0] != "reset" and isinstance(item[1], dict)
+    ]
+    assert any(payload.get("effective_save_path") == accepted["path"] for payload in diagnostic_payloads)
+    assert any(payload.get("date_from") == accepted["date_from"] for payload in diagnostic_payloads)
+    assert all(payload.get("effective_save_path") != rejected["path"] for payload in diagnostic_payloads)
+    assert all(payload.get("date_from") != rejected["date_from"] for payload in diagnostic_payloads)
 
 
 def test_state_store_terminalize_commits_reason_log_and_status_in_one_event():

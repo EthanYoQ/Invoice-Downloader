@@ -184,3 +184,43 @@ Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
 Worktree: clean
 Stash: stash@{0} preserved and untouched
 ```
+
+## Final Critical Admission Remediation
+
+The final review found that pre-admission validation was request-local but its
+derived dates, paths, active config, and settings persistence still mutated the
+AppAPI facade before the admission lock. Two concurrent callers could therefore
+start only one worker while the rejected caller overwrote the accepted run's
+configuration.
+
+- Added a deterministic two-party barrier test with distinct A/B dates, paths,
+  rules, account credentials, settings, and diagnostics. It runs with A as the
+  forced winner and again with B as the forced winner.
+- Validation now produces a frozen, credential-free admission candidate plus a
+  process-only redacted secret container without mutating AppAPI state.
+- The single admission lock now owns the active-run recheck, terminal-handle
+  retirement, new handle and run-directory reservation, winner-only settings
+  persistence, exact `RunRequest` construction, dependency construction,
+  diagnostics, truth-audit startup, worker ownership, and `Thread.start`.
+- The worker receives only the exact frozen `RunRequest`, reserved `RunHandle`,
+  and process-only `RunDependencies`; it cannot reread facade effective dates,
+  requested output, or active config for run behavior.
+- Settings-load, dependency-build, truth-audit-start, and thread-start failures
+  finalize the same reserved handle once, release the lifecycle, sanitize the
+  terminal failure, and restore prior compatibility config. A dedicated RED
+  test covers settings-load failure before any settings write.
+- The rejected request writes no settings or diagnostics, creates no output
+  directory, owns no staging directory, and changes no compatibility fields.
+
+Pre-commit verification:
+
+```text
+Coordinator/lifecycle: 68 passed
+Coordinator/lifecycle/pipeline/refactor plus GLM/email/provider/security:
+  317 passed, 20 subtests passed
+Full pytest: 531 passed, 109 subtests passed
+Ruff, py_compile, git diff --check: passed
+Strict output: tmp/strict_truth_audit_task9_finalcritical_precommit_20260712T063021Z.json
+Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
+Stash: stash@{0} preserved and untouched
+```
