@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 
 _EXPLICIT_RUN_CONTEXT_PATH = ""
@@ -155,6 +156,14 @@ def ensure_run_context_dirs(context):
             os.makedirs(target, exist_ok=True)
 
 
+def make_run_staging_dir(context, run_id):
+    base_dir = str(context.get("staging_dir", "") or "").strip()
+    if not base_dir:
+        base_dir = os.path.join(os.getcwd(), "staging")
+    safe_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run_id or "run")).strip("-.") or "run"
+    return Path(base_dir).resolve() / safe_run_id
+
+
 def serialize_run_context(context):
     return {
         "enabled": bool(context.get("enabled", False)),
@@ -163,6 +172,7 @@ def serialize_run_context(context):
         "run_id": context.get("run_id", ""),
         "run_root": context.get("run_root", ""),
         "locked_output_path": context.get("output_dir", ""),
+        "staging_dir": context.get("staging_dir", ""),
         "locked_email": context.get("locked_email", ""),
         "locked_date_from": context.get("locked_date_from", ""),
         "locked_date_to": context.get("locked_date_to", ""),

@@ -23,7 +23,8 @@ from build_identity import load_build_identity
 from company_rules import DEFAULT_COMPANY, classify_purchaser_relation
 from document_types import MANUAL_REVIEW_FOLDER, get_archive_folder, is_exempt_type
 from email_channel import resolve_channel
-from frontend_run_context import ensure_run_context_dirs, load_run_context, serialize_run_context
+from frontend_run_context import ensure_run_context_dirs, load_run_context, make_run_staging_dir, serialize_run_context
+from run_lifecycle import RunLifecycle, RunState
 from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
 from url_trace_sanitizer import (
     build_url_history_key,
@@ -404,6 +405,11 @@ class InvoiceAppAPI:
         self.quota_exhausted = False
         self.quota_message = ""
         self._worker_thread = None
+        self._truth_audit_thread = None
+        self._run_lifecycle = RunLifecycle()
+        self._active_run_handle = None
+        self._active_temp_dir = None
+        self._terminal_frontend_run_id = ""
         self._settings_store = UserSettingsStore()
         self._requested_save_path = ""
         self._effective_save_path = ""
@@ -433,6 +439,28 @@ class InvoiceAppAPI:
         ensure_run_context_dirs(self._run_context)
         self._current_run_id = self._run_context.get("run_id", "")
         return self._run_context
+
+    def _prepare_run_lifecycle(self):
+        active = self._active_run_handle
+        if active is not None and active.state not in {RunState.COMPLETED, RunState.FAILED}:
+            return active
+
+        run_token = uuid.uuid4().hex
+        external_run_id = str(self._current_run_id or self._run_context.get("run_id", "") or "run")
+        lifecycle_run_id = f"{external_run_id}-{run_token}"
+        staging_dir = make_run_staging_dir(self._run_context, lifecycle_run_id)
+        handle = self._run_lifecycle.begin(lifecycle_run_id, staging_dir)
+        run_root = str(self._run_context.get("run_root", "") or "").strip()
+        temp_root = Path(run_root).resolve() / "temp" if run_root else Path.cwd() / "temp"
+        self._active_temp_dir = temp_root / lifecycle_run_id
+        self._active_run_handle = handle
+        self._terminal_frontend_run_id = ""
+        return handle
+
+    def _active_staging_path(self):
+        if self._active_run_handle is not None:
+            return str(self._active_run_handle.staging_dir)
+        return str(self._run_context.get("staging_dir") or "staging")
 
     def _monitoring_path(self, filename):
         run_context = self._refresh_run_context()
@@ -726,7 +754,16 @@ class InvoiceAppAPI:
             **self._snapshot_counts(),
         }
         if extra:
-            payload.update(sanitize_persistence_payload(dict(extra)))
+            safe_extra = sanitize_persistence_payload(dict(extra))
+            handle = self._active_run_handle
+            if (
+                handle is not None
+                and handle.state is RunState.FAILED
+                and safe_extra.get("result") in {"completed", "stopped", "stopped_before_extract", "stopped_after_extract"}
+            ):
+                safe_extra["result"] = "failed"
+                safe_extra["reason"] = handle.error
+            payload.update(safe_extra)
         self._diag_append_jsonl(self._monitoring_path("stage_events.jsonl"), payload)
 
     def _safe_emit_artifact_event(self, kind, path, document_id=None, source_kind=None, reason_code=None, category=None, extra=None):
@@ -914,6 +951,7 @@ class InvoiceAppAPI:
             {
                 **serialize_run_context(self._run_context),
                 "run_id": self._current_run_id,
+                "staging_dir": self._active_staging_path(),
                 "email_domain": self._packaged_diag_email_domain(email_address),
                 "has_auth_code": bool(auth_code),
                 "has_api_key": bool(api_key),
@@ -935,6 +973,7 @@ class InvoiceAppAPI:
 
     def _start_truth_audit_async(self, email_address, auth_code):
         if not self._run_context.get("enabled") or not email_address or not auth_code:
+            self._truth_audit_thread = None
             return
 
         def _runner():
@@ -968,7 +1007,18 @@ class InvoiceAppAPI:
                     },
                 )
 
-        threading.Thread(target=_runner, daemon=True).start()
+        thread = threading.Thread(target=_runner, name="InvoiceFlowTruthAudit", daemon=True)
+        self._truth_audit_thread = thread
+        thread.start()
+
+    def _await_truth_audit(self):
+        thread = self._truth_audit_thread
+        if thread is None:
+            return
+        if thread is threading.current_thread():
+            raise RuntimeError("truth audit cannot join its own thread")
+        thread.join()
+        self._truth_audit_thread = None
 
     def _inspect_pdf_health(self, pdf_path):
         if not pdf_path or not str(pdf_path).lower().endswith(".pdf"):
@@ -1301,6 +1351,9 @@ class InvoiceAppAPI:
         self._safe_emit_run_state_event(previous_state, run_state)
 
     def _begin_run(self, status_text):
+        self._prepare_run_lifecycle()
+        if self._active_run_handle.state is RunState.CREATED:
+            self._active_run_handle.advance(RunState.SCANNING)
         self.progress = 0
         self.logs = []
         self._stop_requested = False
@@ -1401,31 +1454,30 @@ class InvoiceAppAPI:
         self._append_log("额度", self.quota_message, "text-rose-600")
 
     def _finish_run(self, success, status_text, last_error=""):
-        if success:
+        handle = self._active_run_handle or self._prepare_run_lifecycle()
+        if handle.state not in {RunState.COMPLETED, RunState.FAILED}:
+            if not success:
+                handle.fail(RuntimeError(last_error or status_text or "RUN_FAILED"))
+            self._mark_finalizing()
+            self._start_async_finalizers()
+
+        if self._terminal_frontend_run_id == handle.run_id:
+            return
+        self._terminal_frontend_run_id = handle.run_id
+        effective_success = bool(success and handle.state is RunState.COMPLETED)
+        if effective_success:
             self._set_run_state("completed", status_text=status_text, progress=100, last_error="")
         else:
+            if success:
+                self.logs[:] = [entry for entry in self.logs if entry.get("type") != "完成"]
             failed_progress = self.progress if self.progress and self.progress < 100 else 99
-            self._set_run_state("failed", status_text=status_text, progress=failed_progress, last_error=last_error)
+            lifecycle_error = handle.error or last_error
+            failed_status = status_text if not success else "处理失败"
+            self._set_run_state("failed", status_text=failed_status, progress=failed_progress, last_error=lifecycle_error)
         self._worker_thread = None
 
     def _legacy_start_async_finalizers_pre_release_prep(self, fetcher=None):
-        def _runner():
-            self._mark_finalizing()
-            self._cleanup_temp_folders()
-            if fetcher is not None:
-                try:
-                    fetcher.disconnect()
-                except Exception as exc:
-                    self.logs.append({
-                        "time": time.strftime("[%H:%M:%S]"),
-                        "type": "ERROR",
-                        "color": "text-error",
-                        "msg": f"Failed to disconnect mailbox cleanly: {exc}",
-                    })
-
-        cleanup_thread = threading.Thread(target=_runner, daemon=True)
-        cleanup_thread.start()
-        return cleanup_thread
+        return self._start_async_finalizers(fetcher)
 
     def _legacy_mark_finalizing_pre_release_prep(self):
         finalizing_progress = self.progress if self.progress >= 95 else 99
@@ -1965,7 +2017,7 @@ class InvoiceAppAPI:
                 email_address,
                 auth_code,
                 imap_server=channel["imap_host"],
-                staging_dir=self._run_context.get("staging_dir") or "staging",
+                staging_dir=self._active_staging_path(),
                 monitoring_dir=self._run_context.get("monitoring_dir"),
                 progress_callback=self._on_email_fetcher_progress,
             )
@@ -1985,7 +2037,7 @@ class InvoiceAppAPI:
                     "msg": "邮箱登录失败，请检查授权码和 IMAP 设置。",
                 })
                 self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": "imap_login_failed"})
-                self._finish_run(False, "邮箱登录失败", last_error="IMAP_LOGIN_FAILED")
+                self._fail_run("邮箱登录失败", "IMAP_LOGIN_FAILED", fetcher=fetcher)
                 return
 
             self._set_run_state("running", status_text="正在扫描邮件...", progress=20)
@@ -2049,6 +2101,7 @@ class InvoiceAppAPI:
                 return
 
             self._set_run_state("running", status_text="正在提取附件...", progress=30)
+            self._active_run_handle.advance(RunState.EXTRACTING)
             self.logs.append({
                 "time": time.strftime("[%H:%M:%S]"),
                 "type": "运行",
@@ -2079,6 +2132,7 @@ class InvoiceAppAPI:
                 self._finish_run(True, "已安全停止")
                 return
 
+            self._active_run_handle.advance(RunState.ARCHIVING)
             self._run_processing_loop(attachments_info, api_key, save_path, since_date, before_date, rules_text)
 
             if self.quota_exhausted:
@@ -2628,7 +2682,7 @@ class InvoiceAppAPI:
                             )
                         from pdf_converter import PDFConverter
                         converter = PDFConverter(
-                            staging_dir=self._run_context.get("staging_dir") or "staging",
+                            staging_dir=self._active_staging_path(),
                             timeout_ms=30000,
                         )
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "抓取:", "color": "text-blue-400", "msg": f"正在启动无头浏览器抓取网页: {console_source_name}"})
@@ -4599,18 +4653,16 @@ class InvoiceAppAPI:
         except Exception as e:
             print(f"Failed to write error log: {e}")
 
-    def _cleanup_temp_folders(self):
+    def _cleanup_temp_folders(self, staging_dir=None, temp_dir=None):
         """自动清理程序执行过程中产生的临时文件夹"""
-        import os
         import shutil
-        current_dir = os.getcwd()
-        if self._run_context.get("enabled"):
-            temp_paths = [
-                self._run_context.get("staging_dir"),
-                os.path.join(self._run_context.get("run_root", ""), "temp"),
-            ]
-        else:
-            temp_paths = [os.path.join(current_dir, t_dir) for t_dir in ["staging", "temp"]]
+
+        if staging_dir is None and self._active_run_handle is not None:
+            staging_dir = self._active_run_handle.staging_dir
+        if temp_dir is None:
+            temp_dir = self._active_temp_dir
+        temp_paths = [staging_dir, temp_dir]
+        failures = []
 
         for target_path in temp_paths:
             if not target_path or not os.path.exists(target_path) or not os.path.isdir(target_path):
@@ -4619,13 +4671,18 @@ class InvoiceAppAPI:
                 shutil.rmtree(target_path)
                 print(f"Cleaned up temp folder: {target_path}")
             except Exception as e:
-                print(f"Failed to clean up {target_path}: {e}")
+                failure_id = stable_hash(f"{type(e).__name__}:{e}")[:12]
+                print(f"Failed to clean temporary folder [{failure_id}]")
                 self.logs.append({
                     "time": time.strftime("[%H:%M:%S]"),
                     "type": "ERROR",
                     "color": "text-error",
-                    "msg": f"Failed to clean temporary folder {target_path}: {e}",
+                    "msg": f"Failed to clean temporary folder [{failure_id}]",
                 })
+                failures.append((type(e).__name__, failure_id))
+        if failures:
+            exc_type, failure_id = failures[0]
+            raise RuntimeError(f"cleanup failed:{exc_type}:{failure_id}:count={len(failures)}")
 
     def _legacy_export_result_detail_pre_release_prep(self, export_path=""):
         try:
@@ -4725,25 +4782,30 @@ class InvoiceAppAPI:
         '''
 
     def _start_async_finalizers(self, fetcher=None):
-        def _runner():
-            self._safe_emit_stage_event("cleanup_finalize", "enter")
-            self._cleanup_temp_folders()
-
-            if fetcher is not None:
-                try:
-                    fetcher.disconnect()
-                except Exception as exc:
-                    self.logs.append({
-                        "time": time.strftime("[%H:%M:%S]"),
-                        "type": "ERROR",
-                        "color": "text-error",
-                        "msg": f"Failed to disconnect mailbox cleanly: {exc}",
-                    })
-            self._safe_emit_stage_event("cleanup_finalize", "exit")
-
-        cleanup_thread = threading.Thread(target=_runner, daemon=True)
-        cleanup_thread.start()
-        return cleanup_thread
+        handle = self._active_run_handle or self._prepare_run_lifecycle()
+        if handle.state not in {RunState.FINALIZING, RunState.COMPLETED, RunState.FAILED}:
+            handle.advance(RunState.REPORTING)
+        if self.run_state != "finalizing":
+            self._mark_finalizing()
+        self._safe_emit_stage_event("cleanup_finalize", "enter")
+        staging_dir = handle.staging_dir
+        temp_dir = self._active_temp_dir
+        callbacks = [("report", self._await_truth_audit)]
+        if fetcher is not None:
+            callbacks.append(("disconnect", fetcher.disconnect))
+        callbacks.append(
+            (
+                "cleanup",
+                lambda: self._cleanup_temp_folders(staging_dir=staging_dir, temp_dir=temp_dir),
+            )
+        )
+        state = handle.finalize(callbacks)
+        self._safe_emit_stage_event(
+            "cleanup_finalize",
+            "exit",
+            {"result": "failed" if state is RunState.FAILED else "completed"},
+        )
+        return state
 
     def _mark_finalizing(self):
         finalizing_progress = self.progress if self.progress >= 95 else 99
@@ -4758,20 +4820,18 @@ class InvoiceAppAPI:
             summary={"include_traceback": bool(include_traceback)},
             exc=active_exc,
         )
+        handle = self._prepare_run_lifecycle()
+        handle.fail(active_exc or RuntimeError(error_message or "RUN_FAILED"))
         self._mark_finalizing()
         self._start_async_finalizers(fetcher)
-
-        if include_traceback:
-            import traceback
-            error_message = f"{error_message} | {traceback.format_exc()}"
 
         self.logs.append({
             "time": time.strftime("[%H:%M:%S]"),
             "type": "ERROR",
             "color": "text-error",
-            "msg": f"System exception: {error_message}",
+            "msg": f"System exception: {handle.error}",
         })
-        self._finish_run(False, status_text, last_error=error_message)
+        self._finish_run(False, status_text, last_error=handle.error)
 
     def _validate_date_range(self, date_from, date_to):
         date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -5017,7 +5077,7 @@ class InvoiceAppAPI:
     def start_processing(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
         import os
 
-        if self._is_running or (self._worker_thread and self._worker_thread.is_alive()):
+        if not self._run_lifecycle.can_begin or self._is_running or (self._worker_thread and self._worker_thread.is_alive()):
             return {"success": False, "message": "任务已在运行中"}
 
         if not email_address or not auth_code or not api_key:
@@ -5092,6 +5152,10 @@ class InvoiceAppAPI:
                 "has_api_key": bool(api_key),
             }
         )
+        try:
+            self._prepare_run_lifecycle()
+        except Exception as exc:
+            return {"success": False, "message": f"无法创建运行临时目录: {type(exc).__name__}"}
         self._set_run_state("running", status_text="正在准备运行...", progress=5, last_error="")
         self._packaged_diag_write(
             "progress_5_written",
@@ -5135,7 +5199,11 @@ class InvoiceAppAPI:
         )
         self._packaged_diag_write("worker_thread_created", "start_processing", "success")
         self._worker_thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            self._fail_run("启动失败", str(exc) or "WORKER_START_FAILED")
+            return {"success": False, "message": "后台任务启动失败"}
         self._packaged_diag_write(
             "worker_thread_started",
             "start_processing",
