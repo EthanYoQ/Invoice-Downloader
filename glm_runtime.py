@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import math
 import random
@@ -421,11 +422,16 @@ class GlmRuntime:
                 business_code=business_code,
             )
         finally:
-            if response is not None:
-                close_response = getattr(response, "close", None)
-                if callable(close_response):
-                    close_response()
-            limiter.release()
+            try:
+                if response is not None:
+                    try:
+                        close_response = getattr(response, "close", None)
+                        if callable(close_response):
+                            close_response()
+                    except Exception as exc:
+                        self._record_response_close_failure(exc)
+            finally:
+                limiter.release()
 
     @staticmethod
     def _failure(
@@ -491,6 +497,11 @@ class GlmRuntime:
             if self._closing or self._closed:
                 raise GlmRuntimeClosedError("GLM runtime is closing")
             self._active_requests += 1
+
+    @property
+    def active_requests(self):
+        with self._state_condition:
+            return self._active_requests
 
     def _leave_request(self):
         with self._state_condition:
@@ -566,6 +577,27 @@ class GlmRuntime:
                 self.diagnostic_callback(dict(trace))
             except Exception:
                 logging.debug("GLM diagnostic callback failed", exc_info=False)
+
+    def _record_response_close_failure(self, exc):
+        exception_class = type(exc)
+        exception_type = exception_class.__name__
+        type_identity = f"{exception_class.__module__}.{exception_class.__qualname__}"
+        fingerprint = hashlib.sha256(type_identity.encode("utf-8", errors="replace")).hexdigest()[:16]
+        diagnostic = {
+            "event": "response_close_failed",
+            "exception_type": exception_type,
+            "exception_fingerprint": fingerprint,
+        }
+        if self.diagnostic_callback is not None:
+            try:
+                self.diagnostic_callback(dict(diagnostic))
+            except Exception:
+                logging.debug("GLM diagnostic callback failed", exc_info=False)
+        logging.debug(
+            "GLM response close failed; exception_type=%s; exception_fingerprint=%s",
+            exception_type,
+            fingerprint,
+        )
 
 
 def _normalize_code(value):

@@ -40,6 +40,25 @@ class FakeSession:
         return response
 
 
+class CloseFailingResponse(FakeResponse):
+    def __init__(self, *args, close_secret, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.close_secret = close_secret
+
+    def close(self):
+        self.close_count += 1
+        raise RuntimeError(self.close_secret)
+
+
+class ClosableFakeSession(FakeSession):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+
+
 def _runtime_symbols():
     from glm_runtime import (
         DEFAULT_PROFILES,
@@ -370,6 +389,117 @@ def test_every_http_response_is_closed_to_release_adapter_pool_connection():
 
     assert failed_response.close_count == 1
     assert success_response.close_count == 1
+
+
+def _assert_close_failure_is_sanitized(events, caplog, secret):
+    close_events = [event for event in events if event.get("event") == "response_close_failed"]
+    assert len(close_events) == 1
+    close_event = close_events[0]
+    assert set(close_event) == {
+        "event",
+        "exception_type",
+        "exception_fingerprint",
+    }
+    assert close_event["exception_type"] == "RuntimeError"
+    fingerprint = close_event["exception_fingerprint"]
+    assert len(fingerprint) == 16
+    assert all(character in "0123456789abcdef" for character in fingerprint)
+    assert secret not in repr(events)
+    assert secret not in caplog.text
+
+
+def test_response_close_failure_does_not_override_success_or_leak_accounting(caplog):
+    symbols = _runtime_symbols()
+    secret = "SUCCESS-CLOSE-SECRET-MUST-NOT-LEAK"
+    response = CloseFailingResponse(payload={"value": 17}, close_secret=secret)
+    session = ClosableFakeSession([response])
+    events = []
+    runtime = symbols["GlmRuntime"](
+        "test-key",
+        session=session,
+        max_attempts=1,
+        diagnostic_callback=events.append,
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        result = runtime.request("text", {}, lambda body: body["value"])
+
+    assert result == 17
+    assert response.close_count == 1
+    assert runtime.limiters["text"].active == 0
+    assert runtime.active_requests == 0
+    _assert_close_failure_is_sanitized(events, caplog, secret)
+    runtime.close()
+    runtime.close()
+    assert session.close_count == 1
+
+
+def test_response_close_failure_does_not_override_parser_error_or_leak_accounting(caplog):
+    symbols = _runtime_symbols()
+    close_secret = "PARSER-CLOSE-SECRET-MUST-NOT-LEAK"
+    parser_secret = "PARSER-PRIMARY-SECRET-MUST-NOT-LEAK"
+    response = CloseFailingResponse(payload={}, close_secret=close_secret)
+    session = ClosableFakeSession([response])
+    events = []
+    runtime = symbols["GlmRuntime"](
+        "test-key",
+        session=session,
+        max_attempts=1,
+        diagnostic_callback=events.append,
+    )
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(symbols["GlmRequestError"]) as caught:
+        runtime.request(
+            "text",
+            {},
+            lambda _body: (_ for _ in ()).throw(ValueError(parser_secret)),
+        )
+
+    assert caught.value.reason == "parser_error"
+    assert close_secret not in str(caught.value)
+    assert parser_secret not in str(caught.value)
+    assert response.close_count == 1
+    assert runtime.limiters["text"].active == 0
+    assert runtime.active_requests == 0
+    _assert_close_failure_is_sanitized(events, caplog, close_secret)
+    runtime.close()
+    runtime.close()
+    assert session.close_count == 1
+
+
+def test_response_close_failure_does_not_override_http_error_or_leak_accounting(caplog):
+    symbols = _runtime_symbols()
+    close_secret = "HTTP-CLOSE-SECRET-MUST-NOT-LEAK"
+    response_secret = "HTTP-RESPONSE-SECRET-MUST-NOT-LEAK"
+    response = CloseFailingResponse(
+        status_code=503,
+        payload={"message": response_secret},
+        text=response_secret,
+        close_secret=close_secret,
+    )
+    session = ClosableFakeSession([response])
+    events = []
+    runtime = symbols["GlmRuntime"](
+        "test-key",
+        session=session,
+        max_attempts=1,
+        diagnostic_callback=events.append,
+    )
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(symbols["GlmRequestError"]) as caught:
+        runtime.request("text", {}, lambda body: body)
+
+    assert caught.value.reason == "http_error"
+    assert caught.value.http_status == 503
+    assert close_secret not in str(caught.value)
+    assert response_secret not in repr((caught.value, events, runtime.last_trace, caplog.text))
+    assert response.close_count == 1
+    assert runtime.limiters["text"].active == 0
+    assert runtime.active_requests == 0
+    _assert_close_failure_is_sanitized(events, caplog, close_secret)
+    runtime.close()
+    runtime.close()
+    assert session.close_count == 1
 
 
 def test_session_is_reused_and_model_endpoint_timeout_are_profile_owned():
