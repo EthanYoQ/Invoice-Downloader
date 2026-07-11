@@ -35,6 +35,52 @@ class DomainParserTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             parse_amount(False)
 
+    def test_parse_amount_accepts_accounting_parentheses_as_negative(self):
+        self.assertEqual(parse_amount("(1,234.50)"), Decimal("-1234.50"))
+        self.assertEqual(parse_amount("￥(1,234.50)"), Decimal("-1234.50"))
+
+    def test_parse_amount_preserves_valid_forms_and_rejects_non_finite_or_malformed_values(self):
+        valid = {
+            "￥1,234.50元": Decimal("1234.50"),
+            "CNY 1,234.50": Decimal("1234.50"),
+            "-1,234.50": Decimal("-1234.50"),
+            "+12.00": Decimal("12.00"),
+            "1e3": Decimal("1E+3"),
+        }
+        for value, expected in valid.items():
+            with self.subTest(value=value):
+                self.assertEqual(parse_amount(value), expected)
+
+        invalid = (
+            None,
+            "",
+            "   ",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            float("nan"),
+            float("inf"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+            "--1.00",
+            "+-1.00",
+            "-(1.00)",
+            "(-1.00)",
+            "((1.00))",
+            "(1.00",
+            "1.00)",
+            "()",
+            "1.2.3",
+            "amount=1.00",
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                self.assertIsNone(parse_amount(value))
+
+        for value in (True, False):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                parse_amount(value)
+
     def test_parse_local_date_keeps_local_dates_and_normalizes_aware_values(self):
         shanghai = ZoneInfo("Asia/Shanghai")
         self.assertEqual(parse_local_date(date(2026, 6, 1)), date(2026, 6, 1))
@@ -135,6 +181,46 @@ class InvoiceRecordTests(unittest.TestCase):
         restored["provider_context"]["attempts"].append(3)
         self.assertEqual(record.to_legacy(), legacy)
 
+    def test_legacy_snapshot_isolated_from_original_and_repeated_bytearray_outputs(self):
+        original = {
+            "Date": "20260601",
+            "Amount": "441.15",
+            "Type": "住宿发票",
+            "custom": {
+                "blob": bytearray(b"original"),
+                "items": [{"nested_blob": bytearray(b"nested")}],
+            },
+        }
+        record = InvoiceRecord.from_legacy(original, self.identity)
+
+        original["custom"]["blob"][:] = b"mutated!"
+        original["custom"]["items"][0]["nested_blob"][:] = b"changed"
+        first = record.to_legacy()
+        second = record.to_legacy()
+
+        self.assertIsInstance(first["custom"]["blob"], bytearray)
+        self.assertEqual(first["custom"]["blob"], bytearray(b"original"))
+        self.assertEqual(first["custom"]["items"][0]["nested_blob"], bytearray(b"nested"))
+        self.assertIsNot(first["custom"]["blob"], second["custom"]["blob"])
+        self.assertIsNot(
+            first["custom"]["items"][0]["nested_blob"],
+            second["custom"]["items"][0]["nested_blob"],
+        )
+
+        first["custom"]["blob"][:] = b"caller!!"
+        first["custom"]["items"][0]["nested_blob"][:] = b"caller"
+        third = record.to_legacy()
+        self.assertEqual(third["custom"]["blob"], bytearray(b"original"))
+        self.assertEqual(third["custom"]["items"][0]["nested_blob"], bytearray(b"nested"))
+
+    def test_legacy_snapshot_rejects_unsupported_mutable_objects(self):
+        class UnsafeMutable:
+            def __init__(self):
+                self.values = []
+
+        with self.assertRaisesRegex(TypeError, "Unsupported legacy value type: UnsafeMutable"):
+            InvoiceRecord.from_legacy({"custom": UnsafeMutable()}, self.identity)
+
     def test_legacy_unknown_markers_become_none_without_being_lost(self):
         legacy = {
             "Date": "未知日期",
@@ -190,6 +276,38 @@ class InvoiceRecordTests(unittest.TestCase):
     def test_bool_amount_is_rejected_at_legacy_boundary(self):
         with self.assertRaises(TypeError):
             InvoiceRecord.from_legacy({"Amount": True}, self.identity)
+
+    def test_direct_domain_dates_reject_datetime_values(self):
+        with self.assertRaisesRegex(TypeError, "InvoiceRecord.invoice_date must be date or None"):
+            InvoiceRecord(identity=self.identity, invoice_date=datetime(2026, 6, 1, 8, 30))
+
+    def test_archived_artifact_direct_construction_validates_amount_and_date_types(self):
+        for amount in (True, 441, 441.15, "441.15"):
+            with self.subTest(amount=amount), self.assertRaisesRegex(
+                TypeError,
+                "ArchivedArtifact.amount must be Decimal or None",
+            ):
+                ArchivedArtifact(identity=self.identity, role="hotel_invoice", amount=amount)
+
+        for business_date in (True, datetime(2026, 6, 1, 8, 30), "20260601"):
+            with self.subTest(business_date=business_date), self.assertRaisesRegex(
+                TypeError,
+                "ArchivedArtifact.business_date must be date or None",
+            ):
+                ArchivedArtifact(
+                    identity=self.identity,
+                    role="hotel_invoice",
+                    business_date=business_date,
+                )
+
+        artifact = ArchivedArtifact(
+            identity=self.identity,
+            role="hotel_invoice",
+            amount=Decimal("441.15"),
+            business_date=date(2026, 6, 1),
+        )
+        self.assertEqual(artifact.amount, Decimal("441.15"))
+        self.assertEqual(artifact.business_date, date(2026, 6, 1))
 
     def test_extractor_boundary_round_trips_through_invoice_record(self):
         from invoice_extractor import InvoiceExtractor

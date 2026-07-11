@@ -28,21 +28,42 @@ class _FrozenLegacyValue:
     value: Any
 
 
-def _freeze_legacy(value: Any) -> _FrozenLegacyValue:
+def _freeze_legacy(value: Any, active_containers: set[int] | None = None) -> _FrozenLegacyValue:
+    if isinstance(value, bytearray):
+        return _FrozenLegacyValue("bytearray", bytes(value))
+    if isinstance(value, (type(None), bool, int, float, str, bytes, Decimal, date, datetime)):
+        return _FrozenLegacyValue("scalar", value)
+
+    container_kind = None
     if isinstance(value, Mapping):
-        return _FrozenLegacyValue(
-            "mapping",
-            tuple((_freeze_legacy(key), _freeze_legacy(item)) for key, item in value.items()),
-        )
-    if isinstance(value, list):
-        return _FrozenLegacyValue("list", tuple(_freeze_legacy(item) for item in value))
-    if isinstance(value, tuple):
-        return _FrozenLegacyValue("tuple", tuple(_freeze_legacy(item) for item in value))
-    if isinstance(value, set):
-        return _FrozenLegacyValue("set", frozenset(_freeze_legacy(item) for item in value))
-    if isinstance(value, frozenset):
-        return _FrozenLegacyValue("frozenset", frozenset(_freeze_legacy(item) for item in value))
-    return _FrozenLegacyValue("scalar", value)
+        container_kind = "mapping"
+    elif isinstance(value, list):
+        container_kind = "list"
+    elif isinstance(value, tuple):
+        container_kind = "tuple"
+    elif isinstance(value, set):
+        container_kind = "set"
+    elif isinstance(value, frozenset):
+        container_kind = "frozenset"
+    if container_kind is None:
+        raise TypeError(f"Unsupported legacy value type: {type(value).__name__}")
+
+    active = active_containers if active_containers is not None else set()
+    container_id = id(value)
+    if container_id in active:
+        raise TypeError("Cyclic legacy values are not supported")
+    active.add(container_id)
+    try:
+        if container_kind == "mapping":
+            frozen = tuple(
+                (_freeze_legacy(key, active), _freeze_legacy(item, active))
+                for key, item in value.items()
+            )
+        else:
+            frozen = tuple(_freeze_legacy(item, active) for item in value)
+    finally:
+        active.remove(container_id)
+    return _FrozenLegacyValue(container_kind, frozen)
 
 
 def _thaw_legacy(value: _FrozenLegacyValue) -> Any:
@@ -56,6 +77,8 @@ def _thaw_legacy(value: _FrozenLegacyValue) -> Any:
         return {_thaw_legacy(item) for item in value.value}
     if value.kind == "frozenset":
         return frozenset(_thaw_legacy(item) for item in value.value)
+    if value.kind == "bytearray":
+        return bytearray(value.value)
     return value.value
 
 
@@ -81,6 +104,17 @@ def parse_amount(value: Any) -> Decimal | None:
     normalized = normalized.replace(",", "").replace("¥", "").replace("￥", "").replace("元", "")
     normalized = re.sub(r"\s+", "", normalized)
     if not normalized:
+        return None
+    has_opening_parenthesis = normalized.startswith("(")
+    has_closing_parenthesis = normalized.endswith(")")
+    if has_opening_parenthesis or has_closing_parenthesis:
+        if not (has_opening_parenthesis and has_closing_parenthesis):
+            return None
+        inner = normalized[1:-1]
+        if not inner or "(" in inner or ")" in inner or inner.startswith(("+", "-")):
+            return None
+        normalized = f"-{inner}"
+    elif "(" in normalized or ")" in normalized:
         return None
     try:
         amount = Decimal(normalized)
@@ -166,7 +200,9 @@ class InvoiceRecord:
     def __post_init__(self) -> None:
         if self.amount is not None and not isinstance(self.amount, Decimal):
             raise TypeError("InvoiceRecord.amount must be Decimal or None")
-        if self.invoice_date is not None and not isinstance(self.invoice_date, date):
+        if self.invoice_date is not None and (
+            not isinstance(self.invoice_date, date) or isinstance(self.invoice_date, datetime)
+        ):
             raise TypeError("InvoiceRecord.invoice_date must be date or None")
         object.__setattr__(self, "document_type", normalize_document_type(self.document_type))
         object.__setattr__(self, "flags", frozenset(self.flags))
@@ -244,6 +280,12 @@ class ArchivedArtifact:
     _legacy_payload: _FrozenLegacyValue | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.amount is not None and not isinstance(self.amount, Decimal):
+            raise TypeError("ArchivedArtifact.amount must be Decimal or None")
+        if self.business_date is not None and (
+            not isinstance(self.business_date, date) or isinstance(self.business_date, datetime)
+        ):
+            raise TypeError("ArchivedArtifact.business_date must be date or None")
         object.__setattr__(self, "document_type", normalize_document_type(self.document_type))
         object.__setattr__(self, "merchant_tokens", frozenset(self.merchant_tokens))
 
