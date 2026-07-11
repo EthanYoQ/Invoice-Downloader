@@ -224,3 +224,16 @@ Strict output: tmp/strict_truth_audit_task9_finalcritical_precommit_20260712T063
 Strict: finalized 215/215, artifacts 1259, P0/P1/P2/manual all zero
 Stash: stash@{0} preserved and untouched
 ```
+
+Post-commit final Critical evidence:
+
+```text
+Code/report commit: 92e7e4c
+Coordinator/lifecycle: 68 passed
+Full pytest: 531 passed, 109 subtests passed
+Ruff, py_compile, git diff --check: passed
+Strict output: tmp/strict_truth_audit_92e7e4c_20260712T063206Z.json
+Strict: finalized 215/215, pending 0, artifacts 1259,
+        P0/P1/P2/manual all zero
+Stash: stash@{0} preserved and untouched
+```
