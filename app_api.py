@@ -2468,6 +2468,44 @@ class InvoiceAppAPI:
         rules_text="",
         _extractor=None,
     ):
+        from archive_service import ArchiveService
+        from candidate_pipeline import CandidatePipeline
+        from extraction_pipeline import ExtractionPipeline
+
+        candidates = CandidatePipeline().collect(attachments_info)
+        outcomes = ExtractionPipeline(
+            local_parser=lambda candidate: candidate.to_legacy(),
+            remote_extractor=lambda _candidate: None,
+            max_workers=1,
+            stop_requested=lambda: False,
+        ).extract(candidates)
+        archive_service = ArchiveService(
+            writer=lambda _outcome, _root: "",
+        )
+        return archive_service.delegate_batch(
+            outcomes,
+            save_path,
+            lambda ordered_attachments: self._run_processing_loop_legacy_with_extractor(
+                ordered_attachments,
+                api_key,
+                save_path,
+                since_date,
+                before_date,
+                rules_text,
+                _extractor=_extractor,
+            ),
+        )
+
+    def _run_processing_loop_legacy_with_extractor(
+        self,
+        attachments_info,
+        api_key,
+        save_path,
+        since_date=None,
+        before_date=None,
+        rules_text="",
+        _extractor=None,
+    ):
         self._packaged_diag_write(
             "run_loop_enter",
             "_run_processing_loop",
