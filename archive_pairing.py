@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime as dt
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 import hashlib
 import json
 import os
 import re
 
+from invoice_domain import ArchivedArtifact, DocumentIdentity, parse_amount, parse_local_date
 from pairing_engine import PairingAmbiguity, PairingDocument, pair_documents
 
 
@@ -95,23 +96,11 @@ def hotel_dates_match(invoice_date: str, folio_date: str, tolerance_days: int = 
 
 
 def _decimal_amount(value) -> Decimal | None:
-    cleaned = str(value or "").replace(",", "").replace("¥", "").replace("￥", "").replace("元", "").strip()
-    if not cleaned:
-        return None
-    try:
-        return Decimal(cleaned)
-    except InvalidOperation:
-        return None
+    return parse_amount(value)
 
 
 def _business_date(value) -> date | None:
-    cleaned = re.sub(r"[^0-9]", "", str(value or ""))
-    if len(cleaned) != 8:
-        return None
-    try:
-        return dt.strptime(cleaned, "%Y%m%d").date()
-    except ValueError:
-        return None
+    return parse_local_date(value)
 
 
 def _provider(meta: dict) -> str:
@@ -155,17 +144,33 @@ def _archive_document_id(meta: dict, role: str) -> str:
 
 
 def _pairing_document(meta: dict, role: str) -> PairingDocument:
-    return PairingDocument(
-        id=_archive_document_id(meta, role),
-        role=role,
-        amount=_decimal_amount(meta.get("amount")),
-        business_date=_business_date(meta.get("date")),
+    source_message_uid = str(
+        meta.get("source_message_uid") or meta.get("source_email_id") or meta.get("email_id") or ""
+    ).strip()
+    identity = DocumentIdentity(
+        document_id=_archive_document_id(meta, role),
+        source_message_uid=source_message_uid,
+        source_filename=str(meta.get("filename") or ""),
+        source_locator=str(meta.get("path") or ""),
+        source_kind=str(meta.get("source_kind") or "archive"),
+        provider_group_key=str(meta.get("provider_group_key") or ""),
+    )
+    artifact = ArchivedArtifact.from_legacy(
+        meta,
+        identity,
+        role,
         provider=_provider(meta),
         merchant_tokens=_merchant_tokens(meta),
-        source_message_uid=str(
-            meta.get("source_message_uid") or meta.get("source_email_id") or meta.get("email_id") or ""
-        ).strip(),
-        path=str(meta.get("path") or ""),
+    )
+    return PairingDocument(
+        id=artifact.identity.document_id,
+        role=artifact.role,
+        amount=artifact.amount,
+        business_date=artifact.business_date,
+        provider=artifact.provider,
+        merchant_tokens=artifact.merchant_tokens,
+        source_message_uid=artifact.identity.source_message_uid,
+        path=artifact.path,
     )
 
 

@@ -22,7 +22,13 @@ from archive_pairing import (
 )
 from build_identity import load_build_identity
 from company_rules import DEFAULT_COMPANY, classify_purchaser_relation
-from document_types import MANUAL_REVIEW_FOLDER, get_archive_folder, is_exempt_type
+from document_types import (
+    MANUAL_REVIEW_FOLDER,
+    classify_cwt_document_type as _classify_cwt_document_type,
+    get_archive_folder,
+    is_exempt_type,
+    normalize_document_type_for_archive as _normalize_document_type_for_archive,
+)
 from email_channel import resolve_channel
 from frontend_run_context import ensure_run_context_dirs, load_run_context, make_run_staging_dir, serialize_run_context
 from run_lifecycle import RunLifecycle, RunState
@@ -192,92 +198,11 @@ class QuotaExceededError(RuntimeError):
 
 
 def classify_cwt_document_type(info_json, info, file_name, local_cits_fast_path=False):
-    doc_type = str((info_json or {}).get("Type", ""))
-    seller = str((info_json or {}).get("Seller", ""))
-    reason_codes = []
-    file_text = str(file_name or "")
-    file_text_lower = file_text.lower()
-    subject_lower = str((info or {}).get("subject", "")).lower()
-
-    if local_cits_fast_path and doc_type in {"机票", "住宿水单", "非目标公司发票"}:
-        if doc_type == "住宿水单":
-            info_json["_is_folio"] = True
-        reason_codes.append("PRESERVED_LOCAL_CITS_GBT_TYPE")
-        return doc_type, reason_codes
-
-    if "取消" in file_text:
-        info_json["_cwt_cancellation"] = True
-        reason_codes.append("CWT_HOTEL_CANCELLATION")
-        return "住宿确认单", reason_codes
-    if any(kw in seller for kw in ["GBT Travel"]) or "scct" in file_text_lower or "scct" in subject_lower:
-        reason_codes.append("CLASSIFIED_AS_CWT_SERVICE_FEE")
-        return "差旅服务费", reason_codes
-    if any(kw in file_text_lower for kw in ["flight", "air", "机票", "航班", "行程单 - 机票"]):
-        reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT_BY_FILENAME")
-        return "航班行程单", reason_codes
-    if any(kw in doc_type.lower() for kw in ["机票", "航班", "flight", "air"]):
-        reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT")
-        return "航班行程单", reason_codes
-    if any(kw in file_text_lower for kw in ["酒店", "行程单 - 酒店"]):
-        reason_codes.append("CLASSIFIED_AS_CWT_HOTEL_BY_FILENAME")
-        return "住宿确认单", reason_codes
-    reason_codes.append("CLASSIFIED_AS_CWT_HOTEL")
-    return "住宿确认单", reason_codes
+    return _classify_cwt_document_type(info_json, info, file_name, local_cits_fast_path)
 
 
 def normalize_document_type_for_archive(info_json, file_name, cwt_classified=False):
-    doc_type = str((info_json or {}).get("Type", ""))
-    seller = str((info_json or {}).get("Seller", ""))
-    reason_codes = []
-    if cwt_classified:
-        return doc_type, reason_codes
-    if doc_type == "非目标公司发票":
-        reason_codes.append("PRESERVED_NON_TARGET_COMPANY")
-        return doc_type, reason_codes
-
-    file_text = str(file_name or "")
-    file_text_lower = file_text.lower()
-    doc_type_lower = doc_type.lower()
-    folio_signal = (
-        any(kw in doc_type for kw in ["水单", "账单", "结账单", "住宿明细"])
-        or any(kw in doc_type_lower for kw in ["folio"])
-        or any(kw in file_text for kw in ["水单", "结账单", "账单", "住宿明细"])
-        or any(kw in file_text_lower for kw in ["folio"])
-    )
-
-    if folio_signal:
-        doc_type = "住宿水单"
-        info_json["_is_folio"] = True
-        reason_codes.append("CLASSIFIED_AS_HOTEL_FOLIO")
-    elif any(kw in doc_type for kw in ["行程单", "报销单"]) or any(kw in file_text for kw in ["行程单", "行程报销单", "报销单"]):
-        _is_flight = (
-            "机票" in file_text_lower
-            or any(kw in doc_type_lower for kw in ["机票", "航班", "flight", "air"])
-            or any(kw in seller for kw in ["航空", "Airlines", "Air China", "东航", "南航", "国航"])
-        )
-        if _is_flight:
-            doc_type = "航班行程单"
-            reason_codes.append("CLASSIFIED_AS_FLIGHT_ITINERARY")
-        else:
-            doc_type = "打车"
-            info_json["_is_itinerary"] = True
-            reason_codes.append("CLASSIFIED_AS_RIDE_ITINERARY")
-    elif any(kw in doc_type for kw in ["打车", "出租", "滴滴", "高德", "约车"]):
-        doc_type = "打车"
-        reason_codes.append("CLASSIFIED_AS_RIDE_BY_TYPE")
-    elif any(kw in seller for kw in ["滴滴", "高德", "约车", "盛智", "畅行"]):
-        doc_type = "打车"
-        reason_codes.append("CLASSIFIED_AS_RIDE_BY_SELLER")
-    elif any(kw in doc_type for kw in ["火车", "高铁", "铁路"]):
-        doc_type = "火车票"
-        reason_codes.append("CLASSIFIED_AS_TRAIN_BY_TYPE")
-    elif "住宿" in doc_type:
-        doc_type = "住宿发票"
-        reason_codes.append("CLASSIFIED_AS_HOTEL_INVOICE")
-    else:
-        reason_codes.append("CLASSIFICATION_FROM_MODEL_TYPE")
-
-    return doc_type, reason_codes
+    return _normalize_document_type_for_archive(info_json, file_name, cwt_classified)
 
 
 class _FallbackDocumentTraceStore:

@@ -12,6 +12,7 @@ import requests
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 from document_types import MANUAL_REVIEW_FOLDER, get_document_type_names, normalize_document_type
 from email_body_receipts import CANONICAL_MARKER
+from invoice_domain import DocumentIdentity, InvoiceRecord
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -47,6 +48,24 @@ class InvoiceExtractor:
     @staticmethod
     def _normalize_type_from_text(value):
         return normalize_document_type(value)
+
+    @staticmethod
+    def _adapt_extraction_result(payload, pdf_path=None, document_context=None):
+        """Validate an extractor result through the typed boundary without changing its legacy shape."""
+        if payload is None:
+            return None
+        context = document_context or {}
+        source_locator = os.path.abspath(pdf_path) if pdf_path else ""
+        source_filename = str(context.get("original_filename") or (os.path.basename(pdf_path) if pdf_path else ""))
+        identity = DocumentIdentity(
+            document_id=str(context.get("document_id") or source_locator or source_filename or "extraction-result"),
+            source_message_uid=str(context.get("email_id") or context.get("source_email_id") or ""),
+            source_filename=source_filename,
+            source_locator=source_locator,
+            source_kind=str(context.get("source_kind") or "extraction"),
+            provider_group_key=str(context.get("provider_group_key") or ""),
+        )
+        return InvoiceRecord.from_legacy(payload, identity).to_legacy()
 
 
     def pdf_to_base64_image(self, pdf_path):
@@ -1157,6 +1176,9 @@ class InvoiceExtractor:
             extraction_trace["timing_ms"] = copy.deepcopy(timing_trace)
             self.last_timing_trace = copy.deepcopy(timing_trace)
 
+        def _adapt_result(result):
+            return self._adapt_extraction_result(result, pdf_path=pdf_path, document_context=document_context)
+
         # 兼容单张图片的传入情况
         if isinstance(base64_images, str):
             base64_images = [base64_images]
@@ -1370,6 +1392,7 @@ class InvoiceExtractor:
 
             email_body_receipt_result = self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path)
             if email_body_receipt_result:
+                email_body_receipt_result = _adapt_result(email_body_receipt_result)
                 extraction_trace["engine"] = "local_email_body_receipt_pdf"
                 extraction_trace["reason_code"] = "LOCAL_EMAIL_BODY_RECEIPT_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(email_body_receipt_result)
@@ -1384,6 +1407,7 @@ class InvoiceExtractor:
 
             foreign_invoice_result = self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path)
             if foreign_invoice_result:
+                foreign_invoice_result = _adapt_result(foreign_invoice_result)
                 extraction_trace["engine"] = "local_foreign_invoice_pdf"
                 extraction_trace["reason_code"] = "LOCAL_FOREIGN_INVOICE_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(foreign_invoice_result)
@@ -1395,6 +1419,7 @@ class InvoiceExtractor:
 
             cits_gbt_result = self._try_extract_cits_gbt_from_pdf_text(abs_pdf_path, document_context=document_context)
             if cits_gbt_result:
+                cits_gbt_result = _adapt_result(cits_gbt_result)
                 extraction_trace["engine"] = "local_cits_gbt_pdf"
                 extraction_trace["reason_code"] = "LOCAL_CITS_GBT_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(cits_gbt_result)
@@ -1406,6 +1431,7 @@ class InvoiceExtractor:
 
             ride_itinerary_result = self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path)
             if ride_itinerary_result:
+                ride_itinerary_result = _adapt_result(ride_itinerary_result)
                 extraction_trace["engine"] = "local_ride_itinerary_pdf"
                 extraction_trace["reason_code"] = "LOCAL_RIDE_ITINERARY_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(ride_itinerary_result)
@@ -1417,6 +1443,7 @@ class InvoiceExtractor:
 
             ihg_folio_result = self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path)
             if ihg_folio_result:
+                ihg_folio_result = _adapt_result(ihg_folio_result)
                 extraction_trace["engine"] = "local_ihg_folio_pdf"
                 extraction_trace["reason_code"] = "LOCAL_IHG_FOLIO_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(ihg_folio_result)
@@ -1430,6 +1457,7 @@ class InvoiceExtractor:
             if not local_standard_result:
                 local_standard_result = self._try_extract_standard_china_einvoice_from_pdf_text(abs_pdf_path)
             if local_standard_result:
+                local_standard_result = _adapt_result(local_standard_result)
                 extraction_trace["engine"] = "local_standard_einvoice_pdf"
                 extraction_trace["reason_code"] = "LOCAL_STANDARD_EINVOICE_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(local_standard_result)
@@ -1450,6 +1478,7 @@ class InvoiceExtractor:
                 track_a_result = _call_track_a_llm(full_ocr_text)
             finally:
                 timing_trace["track_a_llm_ms"] = _elapsed_ms(track_a_llm_started_at)
+            track_a_result = _adapt_result(track_a_result)
             track_a_success = True
             extraction_trace["track_a"] = {"status": "success", "reason_code": None, "message": None}
         except Exception as e:
@@ -1476,6 +1505,7 @@ class InvoiceExtractor:
                 track_b_result = _call_track_b_vision(base64_images)
             finally:
                 timing_trace["track_b_vision_ms"] = _elapsed_ms(track_b_started_at)
+            track_b_result = _adapt_result(track_b_result)
             extraction_trace["track_b"] = {"status": "success", "reason_code": None, "message": None}
             extraction_trace["engine"] = "track_b"
             extraction_trace["reason_code"] = "TRACK_A_FAILED_TRACK_B_FALLBACK"
@@ -1494,6 +1524,7 @@ class InvoiceExtractor:
             }
             local_fallback_result = self._try_extract_didi_invoice_from_pdf_text(pdf_path)
             if local_fallback_result:
+                local_fallback_result = _adapt_result(local_fallback_result)
                 extraction_trace["engine"] = "local_didi_pdf_fallback"
                 extraction_trace["reason_code"] = "TRACK_A_TRACK_B_FAILED_LOCAL_DIDI_PDF_FALLBACK"
                 extraction_trace["result"] = copy.deepcopy(local_fallback_result)
