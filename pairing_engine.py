@@ -159,20 +159,19 @@ def _optimal_assignments(
             objective = (pair_count, total_score)
             if objective < best_objective:
                 continue
-            candidate_assignments = []
-            for assignment in child_assignments:
-                if companion_index is None:
-                    candidate_assignments.append(assignment)
-                else:
-                    candidate_assignments.append(((invoice_index, companion_index),) + assignment)
             if objective > best_objective:
                 best_objective = objective
                 best_assignments = []
-            for assignment in candidate_assignments:
-                if assignment not in best_assignments:
-                    best_assignments.append(assignment)
+            for assignment in child_assignments:
                 if len(best_assignments) == 2:
                     break
+                candidate = (
+                    assignment
+                    if companion_index is None
+                    else ((invoice_index, companion_index),) + assignment
+                )
+                if candidate not in best_assignments:
+                    best_assignments.append(candidate)
         return best_objective, tuple(best_assignments)
 
     return solve(0, 0)[1]

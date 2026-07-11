@@ -67,6 +67,80 @@ def build_processing_history_key(info, file_name, pdf_path):
         return f"att-legacy:{legacy_key}"
 
 
+def build_document_trace_id(info, file_name, pdf_path):
+    import hashlib
+
+    info = info or {}
+    source_locator = str(info.get("source_url") or info.get("filepath") or pdf_path or "").strip()
+    if source_locator and not info.get("is_url", False):
+        source_locator = os.path.normcase(os.path.abspath(source_locator))
+    evidence = {
+        "processing_history_key": build_processing_history_key(info, file_name, pdf_path),
+        "source_message_uid": str(info.get("email_id") or info.get("source_email_id") or "").strip(),
+        "source_filename": str(file_name or "").strip(),
+        "source_locator": source_locator,
+        "source_kind": str(info.get("source_kind") or "").strip(),
+        "source_url": str(info.get("source_url") or "").strip(),
+        "provider_group_key": str(info.get("provider_group_key") or "").strip(),
+    }
+    canonical = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def canonical_artifact_role(info_json, file_name=""):
+    info_json = info_json or {}
+    doc_type = str(info_json.get("Type") or "").strip().lower()
+    evidence = f"{doc_type} {file_name}".lower()
+
+    if any(token in evidence for token in ("住宿水单", "水单", "folio", "酒店账单")):
+        return "hotel_folio"
+    ride_evidence = any(token in evidence for token in ("打车", "滴滴", "高德", "约车", "ride"))
+    itinerary_evidence = bool(info_json.get("_is_itinerary")) or any(
+        token in evidence for token in ("行程单", "行程报销单", "itinerary")
+    )
+    if ride_evidence and itinerary_evidence:
+        return "ride_itinerary"
+    if ride_evidence:
+        return "ride_invoice"
+    if "住宿" in evidence or "hotel" in evidence:
+        return "hotel_invoice"
+    return "invoice"
+
+
+def build_business_record_key(code, number, info_json, file_name=""):
+    identity = f"{str(code or '').strip()}_{str(number or '').strip()}"
+    return f"{identity}::{canonical_artifact_role(info_json, file_name)}"
+
+
+def is_business_duplicate(code, number, records, info_json, file_name=""):
+    if not str(code or "").strip() and not str(number or "").strip():
+        return False
+    records = records or {}
+    role = canonical_artifact_role(info_json, file_name)
+    if build_business_record_key(code, number, info_json, file_name) in records:
+        return True
+
+    legacy_key = f"{str(code or '').strip()}_{str(number or '').strip()}"
+    legacy_record = records.get(legacy_key)
+    if not isinstance(legacy_record, dict):
+        return False
+    stored_role = str(legacy_record.get("artifact_role") or "").strip()
+    if not stored_role and legacy_record.get("file"):
+        stored_role = canonical_artifact_role({}, legacy_record["file"])
+    return stored_role == role if stored_role else role == "invoice"
+
+
+def record_business_success(records, code, number, info_json, file_name, date="", amount=""):
+    key = build_business_record_key(code, number, info_json, file_name)
+    records[key] = {
+        "file": file_name,
+        "date": date or info_json.get("Date", ""),
+        "amount": amount or info_json.get("Amount", ""),
+        "artifact_role": canonical_artifact_role(info_json, file_name),
+    }
+    return key
+
+
 class QuotaExceededError(RuntimeError):
     pass
 
@@ -2159,10 +2233,7 @@ class InvoiceAppAPI:
                 try:
                     time.sleep(0.2) # 确保磁盘 IO 已完成
                     print(f">>> [{i+1}/{total_attachments}] 开始处理文件: {file_name}")
-                    import hashlib
-                    document_id = hashlib.md5(
-                        f"{info.get('filepath', '')}|{info.get('subject', '')}|{file_name}|{info.get('tier', 0)}|{i}".encode("utf-8")
-                    ).hexdigest()
+                    document_id = build_document_trace_id(info, file_name, pdf_path)
                     trace_store.start_document(
                         source_filename=source_filename,
                         source_path=info.get("filepath"),
@@ -3252,7 +3323,13 @@ class InvoiceAppAPI:
                     invoice_code = info_json.get("InvoiceCode", "").strip()
                     invoice_number = info_json.get("InvoiceNumber", "").strip()
                     if invoice_code or invoice_number:
-                        if extractor.is_duplicate(invoice_code, invoice_number, business_records):
+                        if is_business_duplicate(
+                            invoice_code,
+                            invoice_number,
+                            business_records,
+                            info_json,
+                            file_name,
+                        ):
                             self.stats["errors"] += 1
                             self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-yellow-400", "msg": f"已触发发票去重机制 (发票代码/号码相同): {file_name}"})
                             processed_filepaths.add(pdf_path)
@@ -3495,8 +3572,13 @@ class InvoiceAppAPI:
                             
                         # 更新 Business 去重字典，整轮成功后再统一持久化
                         if invoice_code or invoice_number:
-                            dup_key = f"{invoice_code}_{invoice_number}"
-                            business_records[dup_key] = {"file": os.path.basename(result_path), "date": info_json.get("Date", ""), "amount": info_json.get("Amount", "")}
+                            record_business_success(
+                                business_records,
+                                invoice_code,
+                                invoice_number,
+                                info_json,
+                                os.path.basename(result_path),
+                            )
                     else:
                         self.stats["errors"] += 1
                         self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "跳过:", "color": "text-yellow-400", "msg": f"未归档或放入人工分类: {file_name} ({result_path})"})

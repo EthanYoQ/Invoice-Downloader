@@ -201,3 +201,96 @@ def test_archive_hotel_adapter_exposes_ambiguity_without_guessing_wrapper_pairs(
     assert assignment.pairs == ()
     assert len(assignment.ambiguities) == 1
     assert match_hotel_pairs(invoices, folios) == []
+
+
+def test_legacy_wrappers_accept_amount_and_date_only_dictionaries():
+    from archive_pairing import match_hotel_pairs, match_ride_pairs
+
+    ride_invoice = {"amount": "100.00", "date": "20260605"}
+    ride_itinerary = {"amount": "103.00", "date": "20260605"}
+    hotel_invoice = {"amount": "500.00", "date": "20260601"}
+    hotel_folio = {"amount": "500.00", "date": "20260603"}
+
+    assert match_ride_pairs([ride_invoice], [ride_itinerary]) == [(ride_invoice, ride_itinerary)]
+    assert match_hotel_pairs([hotel_invoice], [hotel_folio]) == [(hotel_invoice, hotel_folio)]
+
+
+def test_complete_equal_score_component_keeps_only_two_optimal_signatures():
+    from pairing_engine import _optimal_assignments
+
+    size = 6
+    edges = {(invoice, companion): 1 for invoice in range(size) for companion in range(size)}
+
+    assignments = _optimal_assignments(tuple(range(size)), tuple(range(size)), edges)
+
+    assert len(assignments) == 2
+    assert assignments[0] != assignments[1]
+    assert all(len(assignment) == size for assignment in assignments)
+
+
+def test_production_identity_pair_sequence_and_names_survive_input_shuffle(tmp_path):
+    from app_api import build_document_trace_id
+    from archive_pairing import assign_ride_pairs, build_ride_pair_renames
+
+    candidates = []
+    for label, role, amount, uid in (
+        ("invoice-100", "invoice", "100.00", "mail-1"),
+        ("itinerary-100", "itinerary", "100.00", "mail-1"),
+        ("invoice-200", "invoice", "200.00", "mail-2"),
+        ("itinerary-200", "itinerary", "200.00", "mail-2"),
+    ):
+        source_path = tmp_path / f"{label}.pdf"
+        source_path.write_bytes(f"immutable-{label}".encode("ascii"))
+        candidates.append(
+            {
+                "label": label,
+                "role": role,
+                "amount": amount,
+                "email_id": uid,
+                "filepath": str(source_path),
+                "subject": f"subject-{uid}",
+                "tier": 1,
+            }
+        )
+
+    def snapshot(items):
+        identities = {}
+        invoices = []
+        itineraries = []
+        for item in items:
+            source_path = item["filepath"]
+            source_name = item["label"] + ".pdf"
+            document_id = build_document_trace_id(item, source_name, source_path)
+            identities[item["label"]] = document_id
+            meta = {
+                "document_id": document_id,
+                "source_label": item["label"],
+                "filename": f"20260605_{'打车' if item['role'] == 'invoice' else '行程单'}_{item['amount']}_滴滴出行.pdf",
+                "path": source_path,
+                "date": "20260605",
+                "amount": item["amount"],
+                "seller": "滴滴出行",
+                "source_message_uid": item["email_id"],
+                "ext": ".pdf",
+            }
+            (invoices if item["role"] == "invoice" else itineraries).append(meta)
+
+        assignment = assign_ride_pairs(invoices, itineraries)
+        pair_sequence = tuple(
+            (invoice["source_label"], itinerary["source_label"])
+            for invoice, itinerary in assignment.pairs
+        )
+        names = tuple(
+            (
+                build_ride_pair_renames(invoice, itinerary, index).invoice_filename,
+                build_ride_pair_renames(invoice, itinerary, index).supporting_filename,
+            )
+            for index, (invoice, itinerary) in enumerate(assignment.pairs, 1)
+        )
+        return identities, pair_sequence, names
+
+    expected = snapshot(candidates)
+    for seed in range(8):
+        shuffled = candidates[:]
+        random.Random(seed).shuffle(shuffled)
+        assert snapshot(shuffled) == expected

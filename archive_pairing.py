@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime as dt
 from decimal import Decimal, InvalidOperation
+import hashlib
+import json
 import os
 import re
 
@@ -131,17 +133,30 @@ def _merchant_tokens(meta: dict) -> frozenset[str]:
     return frozenset(token.lower() for token in re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", text) if token)
 
 
-def _archive_document_id(meta: dict) -> str:
+def _archive_document_id(meta: dict, role: str) -> str:
     for key in ("document_id", "id", "path", "filename"):
         value = str(meta.get(key) or "").strip()
         if value:
             return value
-    raise ValueError("Pairing archive metadata requires a stable document identifier")
+    amount = _decimal_amount(meta.get("amount"))
+    business_date = _business_date(meta.get("date"))
+    payload = {
+        "role": role,
+        "amount": format(amount, "f") if amount is not None else "",
+        "business_date": business_date.isoformat() if business_date else "",
+        "provider": _provider(meta),
+        "merchant_tokens": sorted(_merchant_tokens(meta)),
+        "source_message_uid": str(
+            meta.get("source_message_uid") or meta.get("source_email_id") or meta.get("email_id") or ""
+        ).strip(),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return f"canonical:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _pairing_document(meta: dict, role: str) -> PairingDocument:
     return PairingDocument(
-        id=_archive_document_id(meta),
+        id=_archive_document_id(meta, role),
         role=role,
         amount=_decimal_amount(meta.get("amount")),
         business_date=_business_date(meta.get("date")),
