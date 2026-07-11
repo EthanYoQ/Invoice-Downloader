@@ -57,17 +57,28 @@ class ProcessingLoopFailure(RuntimeError):
     user_message = "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
 
 
-class TruthAuditCompatibilityPathDisabled(RuntimeError):
-    reason_code = "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED"
-    user_message = "真值审计证据已保留到本次运行目录，但兼容路径无法在时限内安全发布。"
+class TruthAuditEvidenceError(RuntimeError):
+    def __init__(self, reason_code, user_message):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.user_message = user_message
+
+
+@dataclass(frozen=True)
+class TruthAuditPaths:
+    run_root: Path
+    monitoring_dir: Path
+    artifact_dir: Path
+    report_path: Path
+    error_path: Path
+    index_path: Path
+    run_config_path: Path
 
 
 @dataclass(frozen=True)
 class TruthAuditJob:
     run_id: str
-    run_root: Path
-    monitoring_dir: Path
-    quarantine_dir: Path
+    paths: TruthAuditPaths
     thread: threading.Thread
     ready: threading.Event
     abandoned: threading.Event
@@ -496,6 +507,36 @@ class InvoiceAppAPI:
         if self._active_run_handle is not None:
             return str(self._active_run_handle.staging_dir)
         return str(self._run_context.get("staging_dir") or "staging")
+
+    @staticmethod
+    def _resolve_truth_audit_paths(context, run_id):
+        context = dict(context or {})
+        configured_root = str(context.get("run_root") or "").strip()
+        if configured_root:
+            run_root = Path(configured_root).resolve()
+        else:
+            configured_monitoring = str(context.get("monitoring_dir") or "").strip()
+            run_root = (
+                Path(configured_monitoring).resolve().parent
+                if configured_monitoring
+                else Path.cwd().resolve()
+            )
+        monitoring_dir = run_root / "monitoring"
+        safe_run_id = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "-",
+            str(run_id or "run"),
+        ).strip("-.") or "run"
+        artifact_dir = monitoring_dir / "quarantined" / safe_run_id
+        return TruthAuditPaths(
+            run_root=run_root,
+            monitoring_dir=monitoring_dir,
+            artifact_dir=artifact_dir,
+            report_path=artifact_dir / "email_truth_audit.json",
+            error_path=artifact_dir / "email_truth_audit_error.json",
+            index_path=artifact_dir / "truth_audit_index.json",
+            run_config_path=monitoring_dir / "run_config.json",
+        )
 
     def _monitoring_path(self, filename):
         run_context = self._refresh_run_context()
@@ -984,25 +1025,16 @@ class InvoiceAppAPI:
         lifecycle_run_id = str(
             self._active_run_handle.run_id if self._active_run_handle is not None else ""
         )
-        safe_lifecycle_run_id = re.sub(
-            r"[^A-Za-z0-9._-]+",
-            "-",
-            lifecycle_run_id,
-        ).strip("-.")
-        truth_audit_artifact_dir = ""
-        if safe_lifecycle_run_id and self._run_context.get("monitoring_dir"):
-            truth_audit_artifact_dir = str(
-                Path(self._run_context["monitoring_dir"])
-                / "quarantined"
-                / safe_lifecycle_run_id
-            )
+        paths = self._resolve_truth_audit_paths(self._run_context, lifecycle_run_id)
         self._diag_write_json(
-            self._monitoring_path("run_config.json"),
+            str(paths.run_config_path),
             {
                 **serialize_run_context(self._run_context),
                 "run_id": self._current_run_id,
                 "staging_dir": self._active_staging_path(),
-                "truth_audit_artifact_dir": truth_audit_artifact_dir,
+                "monitoring_dir": str(paths.monitoring_dir),
+                "truth_audit_artifact_dir": str(paths.artifact_dir),
+                "truth_audit_index_path": str(paths.index_path),
                 "email_domain": self._packaged_diag_email_domain(email_address),
                 "has_auth_code": bool(auth_code),
                 "has_api_key": bool(api_key),
@@ -1035,24 +1067,47 @@ class InvoiceAppAPI:
             or context.get("run_id", "")
             or uuid.uuid4().hex
         )
-        run_root = Path(context.get("run_root") or context.get("monitoring_dir") or Path.cwd()).resolve()
-        monitoring_dir = Path(context.get("monitoring_dir") or (run_root / "monitoring")).resolve()
-        try:
-            monitoring_dir.relative_to(run_root)
-        except ValueError:
-            monitoring_dir = run_root / "monitoring"
-        safe_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", run_id).strip("-.") or "run"
-        quarantine_dir = monitoring_dir / "quarantined" / safe_run_id
+        paths = self._resolve_truth_audit_paths(context, run_id)
         ready = threading.Event()
         abandoned = threading.Event()
         result = {}
         date_from = self._effective_date_from
         date_to = self._effective_date_to
 
-        def _write_quarantined(filename, payload):
-            source_path = quarantine_dir / filename
+        def _write_evidence(source_path, payload, status, reason_code, user_message):
             self._diag_write_json(str(source_path), payload)
-            result["source_path"] = source_path
+            index_payload = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "status": status,
+                "reason_code": reason_code,
+                "artifact_path": str(source_path),
+            }
+            self._diag_write_json(str(paths.index_path), index_payload)
+            valid = False
+            try:
+                persisted_index = json.loads(paths.index_path.read_text(encoding="utf-8"))
+                persisted_artifact = Path(persisted_index.get("artifact_path", "")).resolve()
+                persisted_artifact.relative_to(paths.artifact_dir.resolve())
+                valid = bool(
+                    persisted_index.get("run_id") == run_id
+                    and persisted_index.get("status") == status
+                    and persisted_index.get("reason_code") == reason_code
+                    and persisted_artifact == source_path.resolve()
+                    and persisted_artifact.exists()
+                )
+            except Exception:
+                valid = False
+            result.update(
+                {
+                    "valid": valid,
+                    "status": status,
+                    "reason_code": reason_code,
+                    "user_message": user_message,
+                    "source_path": source_path,
+                    "index_path": paths.index_path,
+                }
+            )
 
         def _runner():
             try:
@@ -1065,10 +1120,18 @@ class InvoiceAppAPI:
                     date_from,
                     date_to,
                 )
-                _write_quarantined("email_truth_audit.json", report)
+                if not isinstance(report, dict):
+                    raise ValueError("TRUTH_AUDIT_EVIDENCE_INVALID")
+                _write_evidence(
+                    paths.report_path,
+                    report,
+                    "success",
+                    "TRUTH_AUDIT_OK",
+                    "",
+                )
             except ModuleNotFoundError as exc:
-                _write_quarantined(
-                    "email_truth_audit_error.json",
+                _write_evidence(
+                    paths.error_path,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "skipped",
@@ -1076,16 +1139,32 @@ class InvoiceAppAPI:
                         "error_type": type(exc).__name__,
                         "error_hash": stable_hash(str(exc))[:12],
                     },
+                    "failed",
+                    "AUDIT_EMAIL_TRUTH_MODULE_MISSING",
+                    "真值审计模块不可用，请查看诊断报告。",
                 )
             except Exception as exc:
-                _write_quarantined(
-                    "email_truth_audit_error.json",
+                reason_code = (
+                    "TRUTH_AUDIT_EVIDENCE_INVALID"
+                    if str(exc) == "TRUTH_AUDIT_EVIDENCE_INVALID"
+                    else "TRUTH_AUDIT_FAILED"
+                )
+                user_message = (
+                    "真值审计证据无效，请查看诊断报告。"
+                    if reason_code == "TRUTH_AUDIT_EVIDENCE_INVALID"
+                    else "真值审计失败，请查看诊断报告。"
+                )
+                _write_evidence(
+                    paths.error_path,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "reason": "TRUTH_AUDIT_FAILED",
+                        "reason": reason_code,
                         "error_type": type(exc).__name__,
                         "error_hash": stable_hash(str(exc))[:12],
                     },
+                    "failed",
+                    reason_code,
+                    user_message,
                 )
             finally:
                 ready.set()
@@ -1093,9 +1172,7 @@ class InvoiceAppAPI:
         thread = threading.Thread(target=_runner, name="InvoiceFlowTruthAudit", daemon=True)
         job = TruthAuditJob(
             run_id=run_id,
-            run_root=run_root,
-            monitoring_dir=monitoring_dir,
-            quarantine_dir=quarantine_dir,
+            paths=paths,
             thread=thread,
             ready=ready,
             abandoned=abandoned,
@@ -1142,23 +1219,26 @@ class InvoiceAppAPI:
             self._truth_audit_thread = None
             if self._truth_audit_job is job:
                 self._truth_audit_job = None
-            raise RuntimeError("TRUTH_AUDIT_RUN_NOT_AUTHORIZED")
-
-        source_path = job.result.get("source_path")
-        if not source_path or not Path(source_path).exists():
-            self._truth_audit_thread = None
-            if self._truth_audit_job is job:
-                self._truth_audit_job = None
-            raise RuntimeError("TRUTH_AUDIT_PUBLICATION_MISSING")
+            raise TruthAuditEvidenceError(
+                "TRUTH_AUDIT_EVIDENCE_INVALID",
+                "真值审计证据无效，请查看诊断报告。",
+            )
 
         if time.monotonic() > deadline:
             _expire_job()
         self._truth_audit_thread = None
         if self._truth_audit_job is job:
             self._truth_audit_job = None
-        raise TruthAuditCompatibilityPathDisabled(
-            "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED"
-        )
+        if not job.result.get("valid"):
+            raise TruthAuditEvidenceError(
+                "TRUTH_AUDIT_EVIDENCE_INVALID",
+                "真值审计证据无效，请查看诊断报告。",
+            )
+        if job.result.get("status") != "success":
+            raise TruthAuditEvidenceError(
+                job.result.get("reason_code") or "TRUTH_AUDIT_FAILED",
+                job.result.get("user_message") or "真值审计失败，请查看诊断报告。",
+            )
 
     def _inspect_pdf_health(self, pdf_path):
         if not pdf_path or not str(pdf_path).lower().endswith(".pdf"):

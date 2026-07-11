@@ -521,12 +521,12 @@ def test_normal_path_promotion_stall_fails_closed_without_late_visibility(tmp_pa
     assert bounded, "lifecycle waited for blocked normal-path promotion"
     assert promotion_entered.is_set() is False
 
-    assert api.run_state == "failed"
-    assert terminal_events == ["failed"]
+    assert api.run_state == "completed"
+    assert terminal_events == ["completed"]
     assert api._worker_thread is None
     assert api._run_lifecycle.can_begin is True
     assert api._run_lifecycle.owned_staging_count == 0
-    assert old_handle.snapshot.finalizer_failures[0].reason_code == "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED"
+    assert old_handle.snapshot.finalizer_failures == ()
     immutable_artifact = (
         shared_root
         / "monitoring"
@@ -545,6 +545,119 @@ def test_normal_path_promotion_stall_fails_closed_without_late_visibility(tmp_pa
 
     assert not normal_path.exists()
     assert (api.run_state, api.status_text, api.logs) == state_before
+
+
+def test_controlled_run_config_and_audit_share_confined_canonical_locator(tmp_path, monkeypatch):
+    import audit_email_truth
+
+    api = InvoiceAppAPI(truth_audit_timeout_seconds=0.05)
+    run_root = tmp_path / "confined-run"
+    external_monitoring = tmp_path / "external-monitoring"
+    context = _controlled_context(run_root, "confined")
+    context["monitoring_dir"] = str(external_monitoring)
+    api._run_context = context
+    api._current_run_id = "confined"
+    monkeypatch.setattr(api, "_refresh_run_context", lambda: api._run_context)
+    monkeypatch.setattr(audit_email_truth, "collect_truth_table", lambda *args: {"status": "ok", "rows": 1})
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: None)
+
+    api._begin_run("running")
+    handle = api._active_run_handle
+    api._safe_write_run_config("test@qq.com", auth_code="AUTH", api_key="API")
+    api._start_truth_audit_async("test@qq.com", "AUTH")
+    assert api._truth_audit_job.ready.wait(1)
+    api._mark_finalizing()
+    api._start_async_finalizers()
+    api._finish_run(True, "done")
+
+    confined_monitoring = run_root / "monitoring"
+    run_config_path = confined_monitoring / "run_config.json"
+    assert api.run_state == "completed"
+    assert run_config_path.exists()
+    run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+    assert Path(run_config["monitoring_dir"]) == confined_monitoring
+    index_path = Path(run_config["truth_audit_index_path"])
+    assert index_path.exists()
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    artifact_path = Path(index["artifact_path"])
+    assert artifact_path.exists()
+    assert artifact_path == (
+        confined_monitoring
+        / "quarantined"
+        / handle.run_id
+        / "email_truth_audit.json"
+    )
+    assert Path(run_config["truth_audit_artifact_dir"]) == artifact_path.parent
+    assert not (external_monitoring / "run_config.json").exists()
+    assert not list(external_monitoring.rglob("email_truth_audit*.json"))
+    assert not list(external_monitoring.rglob("truth_audit_index.json"))
+
+
+def test_timely_valid_truth_audit_keeps_run_completed(tmp_path, monkeypatch):
+    import audit_email_truth
+
+    api = InvoiceAppAPI(truth_audit_timeout_seconds=0.05)
+    run_root = tmp_path / "timely-success"
+    api._run_context = _controlled_context(run_root, "timely")
+    api._current_run_id = "timely"
+    monkeypatch.setattr(api, "_refresh_run_context", lambda: api._run_context)
+    monkeypatch.setattr(audit_email_truth, "collect_truth_table", lambda *args: {"status": "ok", "rows": 2})
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: None)
+    terminal_events = []
+    monkeypatch.setattr(
+        api,
+        "_safe_emit_run_state_event",
+        lambda old, new: terminal_events.append(new) if new in {"completed", "failed"} else None,
+    )
+
+    api._begin_run("running")
+    api._safe_write_run_config("test@qq.com", auth_code="AUTH", api_key="API")
+    api._start_truth_audit_async("test@qq.com", "AUTH")
+    assert api._truth_audit_job.ready.wait(1)
+    api._mark_finalizing()
+    api._start_async_finalizers()
+    api._finish_run(True, "done")
+
+    run_config = json.loads((run_root / "monitoring" / "run_config.json").read_text(encoding="utf-8"))
+    assert api.run_state == "completed"
+    assert terminal_events == ["completed"]
+    assert "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED" not in api.last_error
+    assert Path(run_config["truth_audit_index_path"]).exists()
+
+
+def test_truth_audit_error_fails_with_truthful_sanitized_reason(tmp_path, monkeypatch):
+    import audit_email_truth
+
+    api = InvoiceAppAPI(truth_audit_timeout_seconds=0.05)
+    run_root = tmp_path / "audit-error"
+    api._run_context = _controlled_context(run_root, "audit-error")
+    api._current_run_id = "audit-error"
+    monkeypatch.setattr(api, "_refresh_run_context", lambda: api._run_context)
+
+    def failed_audit(*args):
+        raise RuntimeError("https://secret.example/?api_key=AUDIT-SECRET")
+
+    monkeypatch.setattr(audit_email_truth, "collect_truth_table", failed_audit)
+    monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: None)
+
+    api._begin_run("running")
+    api._safe_write_run_config("test@qq.com", auth_code="AUTH", api_key="API")
+    api._start_truth_audit_async("test@qq.com", "AUTH")
+    assert api._truth_audit_job.ready.wait(1)
+    api._mark_finalizing()
+    api._start_async_finalizers()
+    api._finish_run(True, "done")
+
+    run_config = json.loads((run_root / "monitoring" / "run_config.json").read_text(encoding="utf-8"))
+    index = json.loads(Path(run_config["truth_audit_index_path"]).read_text(encoding="utf-8"))
+    assert api.run_state == "failed"
+    assert "TRUTH_AUDIT_FAILED" in api.last_error
+    assert "TRUTH_AUDIT_COMPATIBILITY_PATH_DISABLED" not in api.last_error
+    assert "secret.example" not in api.last_error
+    assert "AUDIT-SECRET" not in api.last_error
+    assert index["status"] == "failed"
+    assert index["reason_code"] == "TRUTH_AUDIT_FAILED"
+    assert Path(index["artifact_path"]).exists()
 
 
 def test_start_processing_thread_start_failure_releases_lifecycle_once(tmp_path, monkeypatch):
