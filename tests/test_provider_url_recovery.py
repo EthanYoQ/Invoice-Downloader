@@ -187,12 +187,14 @@ class FakeBrowserRequest:
         method="GET",
         headers=None,
         post_data_buffer=None,
+        resource_type="document",
     ):
         self.url = url
         self.frame = FakeFrame(page) if page is not None else None
         self.method = method
         self.headers = headers or {}
         self.post_data_buffer = post_data_buffer
+        self.resource_type = resource_type
 
     def all_headers(self):
         return dict(self.headers)
@@ -362,8 +364,9 @@ class SessionFakePinnedTransport:
         timeout=20,
         suppress_auth=False,
         decode_content=True,
+        max_response_bytes=None,
     ):
-        del suppress_auth, decode_content
+        del suppress_auth, decode_content, max_response_bytes
         kwargs = {
             "headers": dict(headers or {}),
             "allow_redirects": False,
@@ -721,6 +724,42 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertEqual(kwargs["body"], b"request-body")
         self.assertEqual(kwargs["headers"]["Cookie"], "browser_cookie=one")
 
+    def test_browser_and_direct_requests_apply_explicit_resource_size_bounds(self):
+        response = FakePinnedResponse(
+            "https://public.example/document",
+            headers={"Content-Type": "text/html"},
+            content=b"ok",
+        )
+        transport = RecordingPinnedTransport(response=response)
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+        converter._browser_http_session = object()
+
+        for resource_type in ("document", "xhr", "script", "image", "font"):
+            converter._guard_browser_request(
+                FakeRoute(),
+                FakeBrowserRequest(
+                    f"https://public.example/{resource_type}",
+                    resource_type=resource_type,
+                ),
+            )
+
+        limits = {
+            call[2].url.rsplit("/", 1)[-1]: call[3]["max_response_bytes"]
+            for call in transport.calls
+        }
+        self.assertGreater(limits["document"], limits["script"])
+        self.assertEqual(limits["document"], limits["xhr"])
+        self.assertEqual(limits["script"], limits["image"])
+        self.assertEqual(limits["image"], limits["font"])
+
+        transport.calls.clear()
+        converter._request_public(object(), "GET", "https://public.example/invoice.pdf")
+        self.assertGreater(transport.calls[0][3]["max_response_bytes"], 0)
+
     def test_browser_route_pinned_failure_aborts_and_compromises_page(self):
         policy = public_test_policy()
         error = PublicUrlPolicyError(
@@ -887,7 +926,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(route.closed)
         self.assertEqual(route.closed.get("code"), 1008)
 
-    def test_browser_context_is_offline_and_only_uses_fulfilled_routes(self):
+    def test_browser_context_keeps_network_enabled_but_installs_only_guarded_routes(self):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
         )
@@ -895,8 +934,141 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
 
         context = converter._new_browser_context(browser)
 
-        self.assertTrue(context.options["offline"])
+        self.assertNotIn("offline", context.options)
         self.assertEqual([kind for kind, _, _ in context.routes], ["http", "websocket"])
+
+    def test_real_chrome_follows_fulfilled_document_and_subresource_redirects_without_origin_network(self):
+        start_url = "https://route-proof.example/start"
+        final_url = "https://route-proof.example/final"
+        script_start_url = "https://assets-proof.example/script-start.js"
+        script_final_url = "https://assets-proof.example/script-final.js"
+        expected_chain = {
+            start_url,
+            final_url,
+            script_start_url,
+            script_final_url,
+        }
+        payloads = {
+            start_url: FakePinnedResponse(
+                start_url,
+                status_code=302,
+                headers={"Location": final_url},
+            ),
+            final_url: FakePinnedResponse(
+                final_url,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content=(
+                    f"<html><body>final"
+                    f"<script src='{script_start_url}'></script>"
+                    "</body></html>"
+                ).encode("utf-8"),
+            ),
+            script_start_url: FakePinnedResponse(
+                script_start_url,
+                status_code=302,
+                headers={"Location": script_final_url},
+            ),
+            script_final_url: FakePinnedResponse(
+                script_final_url,
+                headers={"Content-Type": "application/javascript"},
+                content=(
+                    b"document.documentElement.dataset.redirectScript = 'executed';"
+                ),
+            ),
+        }
+
+        class MappingPinnedTransport:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, session, method, target, **kwargs):
+                del session
+                self.calls.append((method, target.url, kwargs))
+                if target.url not in payloads:
+                    raise AssertionError(f"unexpected browser request: {target.url}")
+                return payloads[target.url]
+
+        class AuditedRoute:
+            def __init__(self, route, request_url, actions):
+                self._route = route
+                self._request_url = request_url
+                self._actions = actions
+
+            def fulfill(self, **kwargs):
+                self._actions["fulfill"].append(self._request_url)
+                return self._route.fulfill(**kwargs)
+
+            def abort(self, reason=None):
+                self._actions["abort"].append(self._request_url)
+                return self._route.abort(reason)
+
+            def continue_(self, **kwargs):
+                self._actions["continue"].append(self._request_url)
+                return self._route.continue_(**kwargs)
+
+            def fallback(self, **kwargs):
+                self._actions["fallback"].append(self._request_url)
+                return self._route.fallback(**kwargs)
+
+        validation_calls = []
+        policy = public_test_policy()
+        original_validate = policy.validate
+
+        def recording_validate(url):
+            validation_calls.append(str(url))
+            return original_validate(url)
+
+        policy.validate = recording_validate
+        transport = MappingPinnedTransport()
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            timeout_ms=10000,
+            url_policy=policy,
+            pinned_transport=transport,
+        )
+        actions = {name: [] for name in ("fulfill", "abort", "continue", "fallback")}
+        original_guard = converter._guard_browser_request
+
+        def audited_guard(route, request):
+            return original_guard(AuditedRoute(route, request.url, actions), request)
+
+        converter._guard_browser_request = audited_guard
+
+        with pdf_converter.sync_playwright() as playwright:
+            if not Path(playwright.chromium.executable_path).is_file():
+                self.skipTest("Playwright 1.58 Chrome for Testing is not installed")
+            browser = playwright.chromium.launch(headless=True)
+            context = converter._new_browser_context(browser)
+            page = context.new_page()
+            try:
+                response = converter._goto_public_page(page, start_url, 10000)
+                page.wait_for_function(
+                    "document.documentElement.dataset.redirectScript === 'executed'",
+                    timeout=10000,
+                )
+                self.assertEqual(response.url, final_url)
+                self.assertEqual(page.url, final_url)
+                converter._ensure_browser_page_secure(page)
+            except Exception as exc:
+                raise AssertionError(
+                    f"chrome redirect failure; actions={actions}; "
+                    f"pinned_calls={transport.calls}; "
+                    f"rejections={converter._browser_policy_rejections}"
+                ) from exc
+            finally:
+                context.close()
+                browser.close()
+
+        pinned_urls = [url for _, url, _ in transport.calls]
+        self.assertEqual(set(pinned_urls), expected_chain)
+        self.assertEqual(
+            set(actions["fulfill"]),
+            {start_url, final_url, script_start_url},
+        )
+        self.assertEqual(actions["continue"], [])
+        self.assertEqual(actions["fallback"], [])
+        self.assertEqual(actions["abort"], [])
+        self.assertTrue(expected_chain.issubset(set(validation_calls)))
 
     def test_dom_private_urls_are_removed_before_provider_probe(self):
         converter = PDFConverter(
@@ -972,34 +1144,144 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertNotIn("synthetic-secret", process_log)
         self.assertNotIn("SYNTHETIC_MAILBOX_SUBJECT", process_log)
 
-    def test_recursive_trace_sanitizer_removes_nested_urls_exceptions_and_subjects(self):
+    def test_persistence_payloads_are_allowlisted_while_runtime_metadata_stays_usable(self):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
         )
-        trace = {
-            "url": "https://public.example/private-capability?value=synthetic-secret",
-            "message": "failed at https://public.example/private-capability?value=synthetic-secret",
+        sensitive_event = {
+            "kind": "network_seen",
+            "status": 200,
+            "reason_code": "PINNED_RESPONSE",
+            "provider_family": "synthetic_provider",
+            "url": "https://public.example/capability-segment?token=TOKEN-VALUE&query=query-secret",
+            "path": r"C:\Users\Synthetic\invoice.pdf",
+            "authorization": "Bearer AUTH-SECRET",
+            "cookie": "session=COOKIE-SECRET",
+            "subject": "MAILBOX-SUBJECT",
+            "message": "MESSAGE-SECRET",
+            "exception": RuntimeError("EXCEPTION-SECRET"),
+            "raw_body": "RAW-BODY-SECRET",
+            "fields": {
+                "buyer": "BUYER-ENTITY",
+                "seller": "SELLER-ENTITY",
+                "invoice_number": "INV-2026-SECRET",
+            },
             "nested": [
                 {
-                    "resolved_url": "https://cdn.example/opaque-segment#fragment",
-                    "exception": RuntimeError("SYNTHETIC_MAILBOX_SUBJECT"),
+                    "token": "NESTED-TOKEN",
+                    "query": "NESTED-QUERY",
                 }
             ],
-            "subject": "SYNTHETIC_MAILBOX_SUBJECT",
+        }
+        runtime_metadata = {
+            "status": "downloaded",
+            "reason_code": "",
+            "provider_family": "synthetic_provider",
+            "timing_ms": {"total_ms": 12.5},
+            "pdf_path": r"C:\Users\Synthetic\invoice.pdf",
+            "source_url": sensitive_event["url"],
+            "selected_fields": sensitive_event["fields"],
+            "captured_network": [sensitive_event],
+            "captured_artifacts": [sensitive_event],
+            "retention_payload": sensitive_event,
+            "diagnostic_payload": sensitive_event,
+            "trace_payload": sensitive_event,
         }
 
-        sanitized = converter._sanitize_trace(trace)
-        rendered = json.dumps(sanitized)
+        result = converter._persistence_safe_result(runtime_metadata)
 
-        self.assertIn("https://public.example/<redacted>", rendered)
+        self.assertEqual(result.get("selected_fields"), sensitive_event["fields"])
+        self.assertEqual(result["pdf_path"], runtime_metadata["pdf_path"])
+
+        persisted_payloads = [
+            dict(result),
+            converter._sanitize_trace(runtime_metadata["captured_network"]),
+            converter._sanitize_trace(runtime_metadata["captured_artifacts"]),
+            converter._sanitize_trace(runtime_metadata["retention_payload"]),
+            converter._sanitize_trace(runtime_metadata["diagnostic_payload"]),
+            converter._sanitize_trace(runtime_metadata["trace_payload"]),
+        ]
+        rendered = json.dumps(persisted_payloads)
+
         for forbidden in (
-            "private-capability",
-            "synthetic-secret",
-            "opaque-segment",
-            "fragment",
-            "SYNTHETIC_MAILBOX_SUBJECT",
+            "capability-segment",
+            "TOKEN-VALUE",
+            "query-secret",
+            "AUTH-SECRET",
+            "COOKIE-SECRET",
+            "MAILBOX-SUBJECT",
+            "MESSAGE-SECRET",
+            "EXCEPTION-SECRET",
+            "RAW-BODY-SECRET",
+            "BUYER-ENTITY",
+            "SELLER-ENTITY",
+            "INV-2026-SECRET",
+            r"C:\\Users\\Synthetic",
+            "NESTED-TOKEN",
+            "NESTED-QUERY",
+            "authorization",
+            "cookie",
+            "subject",
+            "message",
+            "exception",
+            "raw_body",
+            "fields",
+            "buyer",
+            "seller",
+            "invoice_number",
         ):
             self.assertNotIn(forbidden, rendered)
+        self.assertEqual(dict(result)["captured_network"][0]["kind"], "network_seen")
+        self.assertEqual(dict(result)["captured_network"][0]["status"], 200)
+
+    def test_process_invoice_links_exposes_raw_runtime_fields_but_serializes_safe_view(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        runtime_metadata = {
+            "status": "downloaded",
+            "reason_code": "",
+            "provider_family": "fpyun_direct_invoice",
+            "pdf_path": r"C:\Users\Synthetic\runtime-invoice.pdf",
+            "selected_fields": {
+                "buyer": "RUNTIME-BUYER",
+                "seller": "RUNTIME-SELLER",
+                "invoice_number": "RUNTIME-INVOICE-NUMBER",
+            },
+            "captured_network": [
+                {
+                    "kind": "network_seen",
+                    "status": 200,
+                    "url": "https://public.example/capability?token=RUNTIME-TOKEN",
+                }
+            ],
+        }
+        converter._recover_direct_invoice_group = (
+            lambda *args, **kwargs: runtime_metadata
+        )
+
+        result = converter.process_invoice_links(
+            "https://public.example/invoice",
+            "RUNTIME-MAILBOX-SUBJECT",
+            "synthetic-email-id",
+            return_metadata=True,
+            candidate_info={"provider_family": "fpyun_direct_invoice"},
+        )[0]
+
+        self.assertEqual(result.get("selected_fields"), runtime_metadata["selected_fields"])
+        self.assertEqual(result["pdf_path"], runtime_metadata["pdf_path"])
+        rendered = json.dumps(result)
+        for forbidden in (
+            "RUNTIME-BUYER",
+            "RUNTIME-SELLER",
+            "RUNTIME-INVOICE-NUMBER",
+            "RUNTIME-TOKEN",
+            "runtime-invoice.pdf",
+            "RUNTIME-MAILBOX-SUBJECT",
+            "capability",
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertEqual(json.loads(rendered)["status"], "downloaded")
 
     def test_direct_invoice_acceptance_normalizes_seller_parentheses(self):
         api = InvoiceAppAPI()

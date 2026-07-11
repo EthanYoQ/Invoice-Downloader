@@ -65,7 +65,29 @@ class PinnedHttpResponse:
         return None
 
 
+class PinnedHttpError(RuntimeError):
+    pass
+
+
+class PinnedHttpConnectionError(PinnedHttpError):
+    def __init__(self):
+        super().__init__("pinned transport connection failed")
+
+
+class PinnedResponseTooLargeError(PinnedHttpError):
+    def __init__(self):
+        super().__init__("response exceeds configured size limit")
+
+
 class PinnedHttpTransport:
+    DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+    READ_CHUNK_BYTES = 64 * 1024
+    RETRYABLE_TRANSPORT_ERRORS = (
+        urllib3.exceptions.HTTPError,
+        OSError,
+        TimeoutError,
+    )
+
     def __init__(
         self,
         pool_manager_factory=None,
@@ -196,6 +218,46 @@ class PinnedHttpTransport:
         )
         return session.prepare_request(request)
 
+    @classmethod
+    def _buffer_response(cls, raw, max_response_bytes, decode_content):
+        try:
+            limit = int(max_response_bytes)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_response_bytes must be a positive integer") from exc
+        if limit <= 0:
+            raise ValueError("max_response_bytes must be a positive integer")
+
+        content_length = raw.headers.get("Content-Length")
+        if content_length not in (None, ""):
+            try:
+                declared_size = int(str(content_length).strip())
+            except (TypeError, ValueError):
+                declared_size = None
+            if declared_size is not None and declared_size > limit:
+                raise PinnedResponseTooLargeError()
+
+        chunks = []
+        total = 0
+        while True:
+            read_size = min(cls.READ_CHUNK_BYTES, limit - total + 1)
+            chunk = raw.read(read_size, decode_content=decode_content)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise PinnedResponseTooLargeError()
+            chunks.append(bytes(chunk))
+        return b"".join(chunks)
+
+    @staticmethod
+    def _close_raw_response(raw):
+        if raw is None:
+            return
+        try:
+            raw.release_conn()
+        finally:
+            raw.close()
+
     def request(
         self,
         session,
@@ -210,6 +272,7 @@ class PinnedHttpTransport:
         timeout=20,
         suppress_auth=False,
         decode_content=True,
+        max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
     ):
         prepared = self._prepare_request(
             session,
@@ -224,45 +287,62 @@ class PinnedHttpTransport:
         )
         if suppress_auth:
             prepared.headers.pop("Authorization", None)
-        plan = self.build_plan(target, original_url=prepared.url)
-        manager = self._manager_for(target, plan)
-        wire_headers = CaseInsensitiveDict(prepared.headers)
-        wire_headers["Host"] = plan.host_header
+        method_name = str(prepared.method or method or "GET").upper()
+        addresses = tuple(dict.fromkeys(target.public_addresses))
+        if method_name not in {"GET", "HEAD"}:
+            addresses = addresses[:1]
 
-        raw = None
-        try:
-            raw = manager.request(
-                prepared.method,
-                plan.transport_url,
-                body=prepared.body,
-                headers=dict(wire_headers),
-                redirect=False,
-                retries=False,
-                preload_content=True,
-                decode_content=decode_content,
-                timeout=timeout,
-            )
-            response_headers = CaseInsensitiveDict(raw.headers.items())
-            set_cookie_headers = tuple(raw.headers.getlist("Set-Cookie"))
-            content = bytes(raw.data or b"")
-            status = int(raw.status)
-            if decode_content and "Content-Encoding" in response_headers:
-                response_headers.pop("Content-Encoding", None)
-                response_headers.pop("Content-Length", None)
+        for selected_ip in addresses:
+            raw = None
+            try:
+                plan = self.build_plan(
+                    target,
+                    selected_ip=selected_ip,
+                    original_url=prepared.url,
+                )
+                manager = self._manager_for(target, plan)
+                wire_headers = CaseInsensitiveDict(prepared.headers)
+                wire_headers["Host"] = plan.host_header
+                raw = manager.request(
+                    prepared.method,
+                    plan.transport_url,
+                    body=prepared.body,
+                    headers=dict(wire_headers),
+                    redirect=False,
+                    retries=False,
+                    preload_content=False,
+                    decode_content=decode_content,
+                    timeout=timeout,
+                )
+                response_headers = CaseInsensitiveDict(raw.headers.items())
+                set_cookie_headers = tuple(raw.headers.getlist("Set-Cookie"))
+                status = int(raw.status)
+                content = self._buffer_response(
+                    raw,
+                    max_response_bytes=max_response_bytes,
+                    decode_content=decode_content,
+                )
+                if decode_content and "Content-Encoding" in response_headers:
+                    response_headers.pop("Content-Encoding", None)
+                    response_headers.pop("Content-Length", None)
 
-            extract_cookies_to_jar(session.cookies, prepared, raw)
+                extract_cookies_to_jar(session.cookies, prepared, raw)
 
-            return PinnedHttpResponse(
-                url=target.url,
-                content=content,
-                headers=response_headers,
-                status_code=status,
-                request=prepared,
-                set_cookie_headers=set_cookie_headers,
-            )
-        finally:
-            if raw is not None:
-                try:
-                    raw.close()
-                finally:
-                    raw.release_conn()
+                return PinnedHttpResponse(
+                    url=target.url,
+                    content=content,
+                    headers=response_headers,
+                    status_code=status,
+                    request=prepared,
+                    set_cookie_headers=set_cookie_headers,
+                )
+            except PinnedHttpError:
+                raise
+            except self.RETRYABLE_TRANSPORT_ERRORS:
+                if selected_ip != addresses[-1]:
+                    continue
+                raise PinnedHttpConnectionError() from None
+            finally:
+                self._close_raw_response(raw)
+
+        raise PinnedHttpConnectionError()
