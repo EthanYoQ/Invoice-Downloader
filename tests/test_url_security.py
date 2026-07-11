@@ -1,6 +1,9 @@
+import json
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 
-from url_security import PublicUrlPolicy, PublicUrlPolicyError
+from url_security import CachedDohResolver, PublicUrlPolicy, PublicUrlPolicyError
 
 
 PUBLIC_V4 = "93.184.216.34"
@@ -178,14 +181,15 @@ def test_proxy_mode_rejects_wrong_transport_peer_even_when_loopback():
         policy.verify_response_peer(object(), validated)
 
 
-def test_browser_missing_peer_is_allowed_only_for_attested_proxy_target():
+def test_browser_missing_peer_is_never_accepted_as_transport_proof():
     proxy_policy = PublicUrlPolicy(
         resolver=resolver_for({"invoice.example": ["198.18.0.42"]}),
         public_resolver=resolver_for({"invoice.example": [PUBLIC_V4]}),
         proxy_endpoint=("127.0.0.1", 7897),
     )
     proxy_target = proxy_policy.validate("https://invoice.example/invoice.pdf")
-    assert proxy_policy.verify_browser_peer(None, proxy_target) is None
+    with pytest.raises(PublicUrlPolicyError):
+        proxy_policy.verify_browser_peer(None, proxy_target)
 
     direct = direct_policy(
         resolver=resolver_for({"invoice.example": [PUBLIC_V4]})
@@ -220,3 +224,137 @@ def test_sanitized_url_never_emits_capability_path_query_or_fragment():
     assert "opaque" not in sanitized
     assert "query-value" not in sanitized
     assert "fragment-value" not in sanitized
+
+
+class FakeDohResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class FakeDohOpener:
+    def __init__(self, behavior):
+        self.behavior = behavior
+        self.calls = []
+
+    def __call__(self, request, timeout):
+        parsed = urlsplit(request.full_url)
+        record_type = (parse_qs(parsed.query).get("type") or [""])[0]
+        key = (parsed.netloc, record_type)
+        self.calls.append((key, timeout))
+        result = self.behavior[key]
+        if isinstance(result, Exception):
+            raise result
+        answers = [
+            {"type": 1 if ":" not in address else 28, "data": address}
+            for address in result
+        ]
+        return FakeDohResponse({"Status": 0, "Answer": answers})
+
+
+DOH_ENDPOINTS = (
+    "https://primary.test/resolve?name={name}&type={type}",
+    "https://fallback.test/resolve?name={name}&type={type}",
+)
+
+
+def test_doh_primary_results_are_cached_and_timeouts_are_bounded():
+    opener = FakeDohOpener(
+        {
+            ("primary.test", "A"): [PUBLIC_V4],
+            ("primary.test", "AAAA"): [PUBLIC_V6],
+        }
+    )
+    resolver = CachedDohResolver(
+        opener=opener,
+        endpoints=DOH_ENDPOINTS,
+        timeout_seconds=0.5,
+        cache_seconds=60,
+    )
+
+    first = resolver("invoice.example", 443)
+    second = resolver("invoice.example", 443)
+
+    assert first == second == (PUBLIC_V4, PUBLIC_V6)
+    assert len(opener.calls) == 2
+    assert all(timeout <= 0.5 for _, timeout in opener.calls)
+
+
+def test_doh_falls_back_to_second_tls_resolver():
+    opener = FakeDohOpener(
+        {
+            ("primary.test", "A"): TimeoutError("primary down"),
+            ("primary.test", "AAAA"): TimeoutError("primary down"),
+            ("fallback.test", "A"): [PUBLIC_V4],
+            ("fallback.test", "AAAA"): [],
+        }
+    )
+    resolver = CachedDohResolver(opener=opener, endpoints=DOH_ENDPOINTS)
+
+    assert resolver("invoice.example", 443) == (PUBLIC_V4,)
+    assert [key[0] for key, _ in opener.calls] == [
+        "primary.test",
+        "primary.test",
+        "fallback.test",
+        "fallback.test",
+    ]
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        ["10.0.0.8"],
+        [PUBLIC_V4, "10.0.0.8"],
+    ],
+)
+def test_doh_rejects_all_private_or_mixed_answers(answers):
+    opener = FakeDohOpener(
+        {
+            ("primary.test", "A"): answers,
+            ("primary.test", "AAAA"): [],
+        }
+    )
+    resolver = CachedDohResolver(
+        opener=opener,
+        endpoints=(DOH_ENDPOINTS[0],),
+    )
+
+    with pytest.raises(RuntimeError, match="non-public"):
+        resolver("invoice.example", 443)
+
+
+def test_doh_all_resolvers_unavailable_is_explicit_fail_closed():
+    opener = FakeDohOpener(
+        {
+            ("primary.test", "A"): TimeoutError("down"),
+            ("primary.test", "AAAA"): TimeoutError("down"),
+            ("fallback.test", "A"): TimeoutError("down"),
+            ("fallback.test", "AAAA"): TimeoutError("down"),
+        }
+    )
+    resolver = CachedDohResolver(opener=opener, endpoints=DOH_ENDPOINTS)
+
+    with pytest.raises(RuntimeError, match="all public DNS attestors unavailable"):
+        resolver("invoice.example", 443)
+
+
+def test_https_proxy_without_explicit_port_defaults_to_443():
+    policy = PublicUrlPolicy(
+        resolver=lambda host, port: ["198.18.0.42"],
+        public_resolver=lambda host, port: [PUBLIC_V4],
+        proxy_endpoint="https://127.0.0.1",
+        proxy_bypass_checker=lambda host: False,
+    )
+
+    target = policy.validate("https://invoice.example/document")
+
+    assert target.proxy_endpoint.scheme == "https"
+    assert target.proxy_endpoint.port == 443

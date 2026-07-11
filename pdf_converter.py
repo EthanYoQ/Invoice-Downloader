@@ -1,8 +1,6 @@
-import json
 import logging
 import os
 import re
-from dataclasses import dataclass
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import fitz  # PyMuPDF
@@ -46,27 +44,10 @@ from provider_direct_invoice import (
     normalize_token as normalize_direct_token,
     parse_direct_invoice_xml_fields,
 )
+from pinned_http import PinnedHttpTransport
 from url_security import PublicUrlPolicy, PublicUrlPolicyError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-
-@dataclass(frozen=True)
-class BufferedPublicResponse:
-    url: str
-    content: bytes
-    headers: dict
-    status_code: int
-
-    @property
-    def text(self):
-        return self.content.decode("utf-8", errors="replace")
-
-    def json(self):
-        return json.loads(self.text)
-
-    def close(self):
-        return None
 
 
 class PDFConverter:
@@ -98,13 +79,22 @@ class PDFConverter:
         ],
     }
 
-    def __init__(self, staging_dir="staging", timeout_ms=30000, url_policy=None):
+    def __init__(
+        self,
+        staging_dir="staging",
+        timeout_ms=30000,
+        url_policy=None,
+        pinned_transport=None,
+    ):
         self.staging_dir = os.path.abspath(staging_dir)
         self.timeout_ms = timeout_ms
         self.generic_timeout_ms = max(8000, min(int(timeout_ms or 0) or 30000, 12000))
         self.provider_settle_timeout_ms = max(1500, min(int(timeout_ms or 0) or 30000, 4000))
         self.url_policy = url_policy or PublicUrlPolicy()
+        self.pinned_transport = pinned_transport or PinnedHttpTransport()
         self._browser_request_contexts = {}
+        self._browser_fulfilled_requests = set()
+        self._browser_http_session = None
         self._browser_page_compromises = {}
         self._browser_pages = {}
         self._browser_global_compromise = None
@@ -249,6 +239,29 @@ class PDFConverter:
             "source": source,
         }
 
+    def _sanitize_trace(self, value, field_name=""):
+        key = str(field_name or "").lower()
+        if isinstance(value, dict):
+            return {
+                item_key: self._sanitize_trace(item_value, item_key)
+                for item_key, item_value in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._sanitize_trace(item, field_name) for item in value]
+        if isinstance(value, BaseException):
+            return type(value).__name__
+        if key in {"subject", "message", "exception", "error"}:
+            return "<redacted>"
+        if key.endswith("url") or key.endswith("urls"):
+            return self.url_policy.sanitize(str(value or "")) if value else ""
+        if isinstance(value, str):
+            return re.sub(
+                r"https?://[^\s\]\[\}\{\)\(]+",
+                lambda match: self.url_policy.sanitize(match.group(0)),
+                value,
+            )
+        return value
+
     @staticmethod
     def _origin(validated):
         parsed = urlparse(validated.url)
@@ -284,7 +297,6 @@ class PDFConverter:
         blocked = set()
         if cross_origin:
             blocked.update(credential_headers)
-            blocked.update(entity_headers)
         if method_changed_to_get:
             blocked.update(entity_headers)
         return {
@@ -308,46 +320,43 @@ class PDFConverter:
         request_method = str(method or "GET").upper()
         request_kwargs = dict(kwargs)
         request_kwargs.pop("allow_redirects", None)
-        request_kwargs["allow_redirects"] = False
-        request_kwargs["stream"] = True
+        request_kwargs.pop("stream", None)
+        timeout = request_kwargs.pop("timeout", 20)
+        suppress_auth = False
 
         for redirect_count in range(max_redirects + 1):
-            response = getattr(session, request_method.lower())(
-                current.url, **request_kwargs
+            response = self.pinned_transport.request(
+                session,
+                request_method,
+                current,
+                headers=request_kwargs.get("headers"),
+                data=request_kwargs.get("data"),
+                json=request_kwargs.get("json"),
+                files=request_kwargs.get("files"),
+                params=request_kwargs.get("params"),
+                timeout=timeout,
+                suppress_auth=suppress_auth,
             )
-            try:
-                response_url = str(getattr(response, "url", "") or current.url)
-                if self._url_origin(response_url) != self._origin(current):
-                    raise PublicUrlPolicyError(
-                        response_url, "response origin changed without a validated redirect"
-                    )
-                self.url_policy.verify_response_peer(response, current)
-
-                status = int(getattr(response, "status_code", 0) or 0)
-                response_headers = dict(getattr(response, "headers", {}) or {})
-                location = self._header_value(response_headers, "location")
-                if status not in {301, 302, 303, 307, 308} or not location:
-                    content = response.content
-                    return BufferedPublicResponse(
-                        response_url,
-                        bytes(content or b""),
-                        response_headers,
-                        status,
-                    )
-                if redirect_count >= max_redirects:
-                    raise PublicUrlPolicyError(current.url, "too many redirects")
-                next_target = self.url_policy.resolve_redirect(current, location)
-                next_method = self._redirect_method(request_method, status)
-                changed_to_get = request_method != next_method and next_method == "GET"
-                headers = self._redirect_headers(
-                    request_kwargs.get("headers", {}),
-                    cross_origin=self._origin(current) != self._origin(next_target),
-                    method_changed_to_get=changed_to_get,
-                )
-            finally:
-                response.close()
+            status = int(getattr(response, "status_code", 0) or 0)
+            response_headers = getattr(response, "headers", {}) or {}
+            location = self._header_value(response_headers, "location")
+            if status not in {301, 302, 303, 307, 308} or not location:
+                return response
+            if redirect_count >= max_redirects:
+                raise PublicUrlPolicyError(current.url, "too many redirects")
+            next_target = self.url_policy.resolve_redirect(current, location)
+            next_method = self._redirect_method(request_method, status)
+            changed_to_get = request_method != next_method and next_method == "GET"
+            cross_origin = self._origin(current) != self._origin(next_target)
+            headers = self._redirect_headers(
+                request_kwargs.get("headers", {}),
+                cross_origin=cross_origin,
+                method_changed_to_get=changed_to_get,
+            )
+            suppress_auth = suppress_auth or cross_origin
 
             request_kwargs["headers"] = headers
+            request_kwargs.pop("params", None)
             if changed_to_get:
                 request_kwargs.pop("data", None)
                 request_kwargs.pop("json", None)
@@ -387,8 +396,42 @@ class PDFConverter:
         page = self._page_from_request(request)
         try:
             validated = self.url_policy.validate(request.url)
-            self._browser_request_contexts[id(request)] = validated
-        except PublicUrlPolicyError as exc:
+            request_key = self._browser_request_key(request)
+            self._browser_request_contexts[request_key] = validated
+            if self._browser_http_session is None:
+                raise PublicUrlPolicyError(
+                    request.url, "browser pinned transport session is unavailable"
+                )
+            response = self.pinned_transport.request(
+                self._browser_http_session,
+                str(getattr(request, "method", "GET") or "GET"),
+                validated,
+                headers=self._browser_request_headers(request),
+                body=getattr(request, "post_data_buffer", None),
+                timeout=max(1, self.timeout_ms / 1000.0),
+                decode_content=False,
+            )
+            response_headers = self._browser_fulfill_headers(
+                response.headers,
+                getattr(response, "set_cookie_headers", ()),
+            )
+            self._browser_fulfilled_requests.add(request_key)
+            try:
+                route.fulfill(
+                    status=response.status_code,
+                    headers=response_headers,
+                    body=response.content,
+                )
+            except Exception:
+                self._browser_fulfilled_requests.discard(request_key)
+                raise
+            return
+        except Exception as caught:
+            exc = (
+                caught
+                if isinstance(caught, PublicUrlPolicyError)
+                else PublicUrlPolicyError(request.url, "pinned browser transport failed")
+            )
             self._mark_browser_page_compromised(page, exc)
             self._browser_policy_rejections.append(
                 self._policy_rejection_log(exc, "browser_request")
@@ -396,7 +439,36 @@ class PDFConverter:
             logging.warning("%s", exc)
             route.abort("blockedbyclient")
             return
-        route.continue_()
+
+    @staticmethod
+    def _browser_request_key(request):
+        impl = getattr(request, "_impl_obj", None)
+        return getattr(impl, "_guid", None) or id(request)
+
+    @staticmethod
+    def _browser_request_headers(request):
+        all_headers = getattr(request, "all_headers", None)
+        headers = dict(
+            all_headers() if callable(all_headers) else getattr(request, "headers", {}) or {}
+        )
+        blocked = {"host", "content-length", "connection", "proxy-connection"}
+        return {
+            key: value
+            for key, value in headers.items()
+            if str(key).lower() not in blocked
+        }
+
+    @staticmethod
+    def _browser_fulfill_headers(headers, set_cookie_headers=()):
+        blocked = {"connection", "proxy-connection", "transfer-encoding", "content-length"}
+        result = {
+            key: value
+            for key, value in dict(headers or {}).items()
+            if str(key).lower() not in blocked
+        }
+        if set_cookie_headers:
+            result["Set-Cookie"] = "\n".join(set_cookie_headers)
+        return result
 
     def _block_browser_websocket(self, web_socket):
         exc = PublicUrlPolicyError(
@@ -442,20 +514,20 @@ class PDFConverter:
         request = getattr(response, "request", None)
         page = self._page_from_request(request)
         try:
-            validated = self._browser_request_contexts.get(id(request))
-            if validated is None:
-                validated = self.url_policy.validate(response_url)
-            elif self._origin(validated) != self._url_origin(response_url):
+            request_key = self._browser_request_key(request)
+            validated = self._browser_request_contexts.get(request_key)
+            if (
+                validated is None
+                or request_key not in self._browser_fulfilled_requests
+            ):
+                raise PublicUrlPolicyError(
+                    response_url, "browser response was not produced by pinned fulfillment"
+                )
+            if self._origin(validated) != self._url_origin(response_url):
                 raise PublicUrlPolicyError(
                     response_url, "browser response target changed unexpectedly"
                 )
-            try:
-                server_address = response.server_addr()
-            except Exception as exc:
-                raise PublicUrlPolicyError(
-                    response_url, "browser connected peer could not be verified"
-                ) from exc
-            return self.url_policy.verify_browser_peer(server_address, validated)
+            return True
         except PublicUrlPolicyError as exc:
             self._mark_browser_page_compromised(page, exc)
             raise
@@ -545,16 +617,26 @@ class PDFConverter:
 
     def _new_browser_context(self, browser):
         self._browser_request_contexts.clear()
+        self._browser_fulfilled_requests.clear()
         self._browser_page_compromises.clear()
         self._browser_pages.clear()
         self._browser_global_compromise = None
+        self._require_requests()
+        self._browser_http_session = requests.Session()
+        self._browser_http_session.trust_env = False
+        browser_http_session = self._browser_http_session
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             accept_downloads=True,
             service_workers="block",
+            offline=True,
         )
         context.route("**/*", self._guard_browser_request)
         context.route_web_socket("**/*", self._block_browser_websocket)
+        try:
+            context.on("close", lambda: browser_http_session.close())
+        except Exception:
+            pass
         return context
 
     def _build_candidate_urls(self, text_content, subject, candidate_info):
@@ -1117,7 +1199,7 @@ class PDFConverter:
                 selected_artifact, _ = self._select_baiwang_recovery_result(artifacts, expected_fields)
                 if selected_artifact:
                     recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-                    recovery_meta["captured_network"] = network_logs[:200]
+                    recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
                     recovery_meta["captured_artifacts"] = [
                         {
                             "path": artifact.get("path", ""),
@@ -1131,6 +1213,9 @@ class PDFConverter:
                         }
                         for artifact in artifacts
                     ]
+                    recovery_meta["captured_artifacts"] = self._sanitize_trace(
+                        recovery_meta["captured_artifacts"]
+                    )
                     recovery_meta.update(
                         {
                             "pdf_path": selected_artifact.get("path", ""),
@@ -1190,7 +1275,9 @@ class PDFConverter:
                                 continue
 
                             body_text = self._read_body_text(page)
-                            recovery_meta["resolved_urls"].append(page.url)
+                            recovery_meta["resolved_urls"].append(
+                                self.url_policy.sanitize(page.url)
+                            )
                             recovery_meta["body_excerpt"] = body_text[:800] or recovery_meta["body_excerpt"]
                             try:
                                 recovery_meta["page_title"] = page.title() or recovery_meta["page_title"]
@@ -1264,7 +1351,7 @@ class PDFConverter:
 
         selected_artifact, select_reason = self._select_baiwang_recovery_result(artifacts, expected_fields)
         recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-        recovery_meta["captured_network"] = network_logs[:200]
+        recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
         recovery_meta["captured_artifacts"] = [
             {
                 "path": artifact.get("path", ""),
@@ -1278,6 +1365,9 @@ class PDFConverter:
             }
             for artifact in artifacts
         ]
+        recovery_meta["captured_artifacts"] = self._sanitize_trace(
+            recovery_meta["captured_artifacts"]
+        )
 
         if selected_artifact:
             recovery_meta.update(
@@ -1361,7 +1451,7 @@ class PDFConverter:
         selected_artifact, select_reason = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
         if selected_artifact:
             recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-            recovery_meta["captured_network"] = network_logs[:200]
+            recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
             recovery_meta["captured_artifacts"] = [
                 {
                     "path": artifact.get("path", ""),
@@ -1375,10 +1465,19 @@ class PDFConverter:
                 }
                 for artifact in artifacts
             ]
+            recovery_meta["captured_artifacts"] = self._sanitize_trace(
+                recovery_meta["captured_artifacts"]
+            )
             recovery_meta.update(
                 {
-                    "resolved_url": selected_artifact.get("resolved_url", ""),
-                    "resolved_urls": [selected_artifact.get("resolved_url", "")] if selected_artifact.get("resolved_url") else recovery_meta["resolved_urls"],
+                    "resolved_url": self.url_policy.sanitize(
+                        selected_artifact.get("resolved_url", "")
+                    ),
+                    "resolved_urls": [
+                        self.url_policy.sanitize(
+                            selected_artifact.get("resolved_url", "")
+                        )
+                    ] if selected_artifact.get("resolved_url") else recovery_meta["resolved_urls"],
                     "pdf_path": selected_artifact.get("path", ""),
                     "download_mode": selected_artifact.get("download_mode", ""),
                     "status": "downloaded",
@@ -1391,7 +1490,7 @@ class PDFConverter:
             return recovery_meta
         if provider_family != "bwjf_signed_invoice":
             recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-            recovery_meta["captured_network"] = network_logs[:200]
+            recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
             recovery_meta["captured_artifacts"] = [
                 {
                     "path": artifact.get("path", ""),
@@ -1405,6 +1504,9 @@ class PDFConverter:
                 }
                 for artifact in artifacts
             ]
+            recovery_meta["captured_artifacts"] = self._sanitize_trace(
+                recovery_meta["captured_artifacts"]
+            )
             recovery_meta["reason_code"] = f"DIRECT_INVOICE_{select_reason.upper()}"
             recovery_meta["failure_stage"] = "provider_recovery"
             return recovery_meta
@@ -1463,9 +1565,13 @@ class PDFConverter:
                             if not response:
                                 network_logs.append({"kind": "navigation_no_response", "url": url})
                                 continue
-                            recovery_meta["resolved_urls"].append(page.url)
+                            recovery_meta["resolved_urls"].append(
+                                self.url_policy.sanitize(page.url)
+                            )
                             if not recovery_meta["resolved_url"]:
-                                recovery_meta["resolved_url"] = page.url
+                                recovery_meta["resolved_url"] = self.url_policy.sanitize(
+                                    page.url
+                                )
                             recovery_meta["body_excerpt"] = (self._read_body_text(page) or "")[:800]
                             try:
                                 recovery_meta["page_title"] = page.title() or recovery_meta["page_title"]
@@ -1542,7 +1648,7 @@ class PDFConverter:
 
         selected_artifact, select_reason = self._select_direct_invoice_recovery_result(artifacts, expected_fields)
         recovery_meta["timing_ms"] = {"total_ms": self._elapsed_ms(recovery_started_at)}
-        recovery_meta["captured_network"] = network_logs[:200]
+        recovery_meta["captured_network"] = self._sanitize_trace(network_logs[:200])
         recovery_meta["captured_artifacts"] = [
             {
                 "path": artifact.get("path", ""),
@@ -1556,12 +1662,17 @@ class PDFConverter:
             }
             for artifact in artifacts
         ]
+        recovery_meta["captured_artifacts"] = self._sanitize_trace(
+            recovery_meta["captured_artifacts"]
+        )
 
         if selected_artifact:
             recovery_meta.update(
                 {
                     "pdf_path": selected_artifact.get("path", ""),
-                    "resolved_url": selected_artifact.get("resolved_url", ""),
+                    "resolved_url": self.url_policy.sanitize(
+                        selected_artifact.get("resolved_url", "")
+                    ),
                     "download_mode": selected_artifact.get("download_mode", ""),
                     "status": "downloaded",
                     "reason_code": "",
@@ -1634,8 +1745,8 @@ class PDFConverter:
                 link_started_at = __import__("time").perf_counter()
                 pdf_path = os.path.join(email_staging_path, f"web_invoice_{index + 1}.pdf")
                 link_meta = {
-                    "source_url": url,
-                    "resolved_url": url,
+                    "source_url": safe_log_url,
+                    "resolved_url": safe_log_url,
                     "pdf_path": pdf_path,
                     "provider_family": "",
                     "download_mode": "",
@@ -1668,7 +1779,7 @@ class PDFConverter:
                         continue
 
                     body_text = self._read_body_text(page)
-                    link_meta["resolved_url"] = page.url
+                    link_meta["resolved_url"] = self.url_policy.sanitize(page.url)
                     link_meta["body_excerpt"] = body_text[:800]
                     link_meta["page_title"] = self._safe_page_title(page)
                     self._ensure_browser_page_secure(page)

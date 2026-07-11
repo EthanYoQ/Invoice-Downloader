@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from urllib.parse import urlparse
 
+from requests.structures import CaseInsensitiveDict
+
 from app_api import InvoiceAppAPI, build_processing_history_key
 import pdf_converter
 from email_fetcher import _build_link_candidate_decision
@@ -87,7 +89,15 @@ class FakeSession:
             return FakeResponse(url, b"%PDF-1.5\nkpbyd pdf", {"Content-Type": "application/pdf"})
         if url == "https://nnfp.jss.com.cn/71ykyWlR=C-18aNx":
             return FakeResponse(
-                "https://nnfp.jss.com.cn/scan-invoice/printQrcode?paramList=91430103MABWFD0J9B!!!26060100373102829862!false&aliView=true&shortLinkSource=1&wxApplet=0",
+                url,
+                headers={
+                    "Location": "https://nnfp.jss.com.cn/scan-invoice/printQrcode?paramList=91430103MABWFD0J9B!!!26060100373102829862!false&aliView=true&shortLinkSource=1&wxApplet=0"
+                },
+                status_code=302,
+            )
+        if "nnfp.jss.com.cn/scan-invoice/printQrcode" in url:
+            return FakeResponse(
+                url,
                 b"<html></html>",
                 {"Content-Type": "text/html; charset=utf-8"},
             )
@@ -156,18 +166,36 @@ class RecordingSession:
 class FakeRoute:
     def __init__(self):
         self.action = None
+        self.continue_calls = 0
 
     def continue_(self):
+        self.continue_calls += 1
         self.action = "continue"
 
     def abort(self, reason=None):
         self.action = ("abort", reason)
 
+    def fulfill(self, **kwargs):
+        self.action = ("fulfill", kwargs)
+
 
 class FakeBrowserRequest:
-    def __init__(self, url, page=None):
+    def __init__(
+        self,
+        url,
+        page=None,
+        method="GET",
+        headers=None,
+        post_data_buffer=None,
+    ):
         self.url = url
         self.frame = FakeFrame(page) if page is not None else None
+        self.method = method
+        self.headers = headers or {}
+        self.post_data_buffer = post_data_buffer
+
+    def all_headers(self):
+        return dict(self.headers)
 
 
 class FakeFrame:
@@ -214,6 +242,30 @@ class FakeWebSocketRoute:
         self.closed = kwargs
 
 
+class FakeBrowserContext:
+    def __init__(self, options):
+        self.options = options
+        self.routes = []
+
+    def route(self, pattern, callback):
+        self.routes.append(("http", pattern, callback))
+
+    def route_web_socket(self, pattern, callback):
+        self.routes.append(("websocket", pattern, callback))
+
+    def on(self, event, callback):
+        return None
+
+
+class FakeBrowser:
+    def __init__(self):
+        self.context = None
+
+    def new_context(self, **kwargs):
+        self.context = FakeBrowserContext(kwargs)
+        return self.context
+
+
 class FakeDomPage:
     def locator(self, selector):
         return self
@@ -256,6 +308,94 @@ class ExplodingServerAddressResponse(FakeBrowserResponse):
         raise RuntimeError("server address unavailable")
 
 
+class FakePinnedResponse:
+    def __init__(
+        self,
+        url,
+        status_code=200,
+        headers=None,
+        content=b"",
+        set_cookie_headers=(),
+    ):
+        self.url = url
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.content = content
+        self.set_cookie_headers = tuple(set_cookie_headers)
+
+    @property
+    def text(self):
+        return self.content.decode("utf-8", errors="replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+    def close(self):
+        return None
+
+
+class RecordingPinnedTransport:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def request(self, session, method, target, **kwargs):
+        self.calls.append((session, method, target, kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+class SessionFakePinnedTransport:
+    def request(
+        self,
+        session,
+        method,
+        target,
+        headers=None,
+        body=None,
+        data=None,
+        json=None,
+        files=None,
+        params=None,
+        timeout=20,
+        suppress_auth=False,
+        decode_content=True,
+    ):
+        del suppress_auth, decode_content
+        kwargs = {
+            "headers": dict(headers or {}),
+            "allow_redirects": False,
+            "stream": True,
+            "timeout": timeout,
+        }
+        request_data = body if body is not None else data
+        if request_data is not None:
+            kwargs["data"] = request_data
+        if json is not None:
+            kwargs["json"] = json
+        if files is not None:
+            kwargs["files"] = files
+        if params is not None:
+            kwargs["params"] = params
+        source = getattr(session, method.lower())(target.url, **kwargs)
+        try:
+            status = int(getattr(source, "status_code", 0) or 0)
+            content = b"" if status in {301, 302, 303, 307, 308} else source.content
+            return FakePinnedResponse(
+                target.url,
+                status_code=status,
+                headers=CaseInsensitiveDict(getattr(source, "headers", {}) or {}),
+                content=content,
+                set_cookie_headers=(
+                    (getattr(source, "headers", {}) or {}).get("Set-Cookie"),
+                ) if (getattr(source, "headers", {}) or {}).get("Set-Cookie") else (),
+            )
+        finally:
+            source.close()
+
+
 NUONUO_XML = """<?xml version="1.0" encoding="utf-8"?>
 <EInvoice><SellerName>长沙楼上餐饮管理有限公司</SellerName><BuyerName>辉瑞投资有限公司</BuyerName>
 <TotalTax-includedAmount>399.40</TotalTax-includedAmount><InvoiceNumber>26432000001233579481</InvoiceNumber>
@@ -268,6 +408,13 @@ BAIWANG_XML = """<?xml version="1.0" encoding="utf-8"?>
 
 
 class ProviderUrlRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self._original_pinned_transport = pdf_converter.PinnedHttpTransport
+        pdf_converter.PinnedHttpTransport = SessionFakePinnedTransport
+
+    def tearDown(self):
+        pdf_converter.PinnedHttpTransport = self._original_pinned_transport
+
     def test_private_direct_candidate_is_rejected_before_session_connection(self):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
@@ -307,20 +454,24 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertEqual(redirect_response.close_calls, 1)
         self.assertEqual(redirect_response.content_reads, 0)
 
-    def test_public_request_rejects_connected_private_peer(self):
+    def test_public_request_uses_pinned_transport_without_session_network_method(self):
+        response = FakePinnedResponse(
+            "https://public.example/invoice.pdf",
+            content=b"%PDF-1.5\npublic",
+        )
+        transport = RecordingPinnedTransport(response=response)
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(),
-            url_policy=public_test_policy(peer_address="10.0.0.9"),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
         )
-        source_response = FakeResponse("https://public.example/invoice.pdf")
-        session = RecordingSession([source_response])
 
-        with self.assertRaises(PublicUrlPolicyError):
-            converter._request_public(
-                session, "GET", "https://public.example/invoice.pdf"
-            )
-        self.assertEqual(source_response.close_calls, 1)
-        self.assertEqual(source_response.content_reads, 0)
+        result = converter._request_public(
+            object(), "GET", "https://public.example/invoice.pdf"
+        )
+
+        self.assertEqual(result.content, b"%PDF-1.5\npublic")
+        self.assertEqual(len(transport.calls), 1)
 
     def test_public_request_buffers_body_then_closes_source_response(self):
         converter = PDFConverter(
@@ -402,7 +553,15 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
                         [method, expected_second_method],
                     )
                     redirected_headers = session.calls[1][2]["headers"]
-                    self.assertEqual(redirected_headers, {"X-Keep": "yes"})
+                    expected_headers = {"X-Keep": "yes"}
+                    if expected_second_method == method:
+                        expected_headers.update(
+                            {
+                                "Content-Type": "application/json",
+                                "Content-Length": "2",
+                            }
+                        )
+                    self.assertEqual(redirected_headers, expected_headers)
                     if expected_second_method == "GET":
                         self.assertNotIn("data", session.calls[1][2])
                     else:
@@ -506,19 +665,107 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
                 self.assertEqual(route.action[0], "abort")
 
         route = FakeRoute()
+        converter._browser_http_session = FakeSession()
         converter._guard_browser_request(
             route, FakeBrowserRequest("https://public.example/invoice")
         )
-        self.assertEqual(route.action, "continue")
+        self.assertEqual(route.action[0], "fulfill")
+        self.assertEqual(route.continue_calls, 0)
 
-    def test_browser_peer_violation_marks_page_compromised_before_body_read(self):
+    def test_browser_route_fulfills_from_pinned_transport_without_browser_origin_network(self):
+        response = FakePinnedResponse(
+            "https://public.example/document",
+            status_code=200,
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Set-Cookie": "provider_session=abc; Path=/; Secure",
+                "X-Provider": "yes",
+            },
+            content=b"<html>public</html>",
+            set_cookie_headers=(
+                "provider_session=abc; Path=/; Secure",
+                "provider_second=two; Path=/; Secure",
+            ),
+        )
+        transport = RecordingPinnedTransport(response=response)
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+        converter._browser_http_session = object()
+        page = FakeBrowserPage()
+        request = FakeBrowserRequest(
+            "https://public.example/document",
+            page,
+            method="POST",
+            headers={"Cookie": "browser_cookie=one", "X-Request": "yes"},
+            post_data_buffer=b"request-body",
+        )
+        route = FakeRoute()
+
+        converter._guard_browser_request(route, request)
+
+        self.assertEqual(route.action[0], "fulfill")
+        fulfilled = route.action[1]
+        self.assertEqual(fulfilled["status"], 200)
+        self.assertEqual(fulfilled["body"], b"<html>public</html>")
+        self.assertEqual(
+            fulfilled["headers"]["Set-Cookie"],
+            "provider_session=abc; Path=/; Secure\nprovider_second=two; Path=/; Secure",
+        )
+        self.assertEqual(route.continue_calls, 0)
+        _, method, target, kwargs = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(target.host, "public.example")
+        self.assertEqual(kwargs["body"], b"request-body")
+        self.assertEqual(kwargs["headers"]["Cookie"], "browser_cookie=one")
+
+    def test_browser_route_pinned_failure_aborts_and_compromises_page(self):
+        policy = public_test_policy()
+        error = PublicUrlPolicyError(
+            "https://public.example/private-capability?value=synthetic",
+            "pinned transport failed",
+        )
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=policy,
+            pinned_transport=RecordingPinnedTransport(error=error),
+        )
+        converter._browser_http_session = object()
+        page = FakeBrowserPage()
+        route = FakeRoute()
+
+        converter._guard_browser_request(
+            route,
+            FakeBrowserRequest("https://public.example/document", page),
+        )
+
+        self.assertEqual(route.action[0], "abort")
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._ensure_browser_page_secure(page)
+
+    def test_private_target_is_rejected_before_pinned_transport_receives_request(self):
+        transport = RecordingPinnedTransport()
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+
+        with self.assertRaises(PublicUrlPolicyError):
+            converter._request_public(
+                object(), "GET", "http://127.0.0.1/private-capability"
+            )
+
+        self.assertEqual(transport.calls, [])
+
+    def test_unfulfilled_browser_response_marks_page_compromised_before_body_read(self):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
         )
         page = FakeBrowserPage()
         request = FakeBrowserRequest("https://public.example/document", page)
-        route = FakeRoute()
-        converter._guard_browser_request(route, request)
         response = FakeBrowserResponse(
             "https://public.example/document",
             "127.0.0.1",
@@ -549,13 +796,12 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         with self.assertRaises(PublicUrlPolicyError):
             converter._ensure_browser_page_secure(page)
 
-    def test_generic_response_guard_marks_private_subresource_peer_compromised(self):
+    def test_generic_response_guard_marks_unfulfilled_subresource_compromised(self):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
         )
         page = FakeEventPage()
         request = FakeBrowserRequest("https://cdn.example/resource.js", page)
-        converter._guard_browser_request(FakeRoute(), request)
         converter._attach_browser_response_guard(page)
 
         page.emit(
@@ -585,43 +831,40 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertEqual(artifacts, [retained])
         self.assertFalse(discarded_path.exists())
 
-    def test_browser_server_addr_none_rules_follow_explicit_proxy_mode(self):
-        proxy_converter = PDFConverter(
-            staging_dir=tempfile.mkdtemp(), url_policy=fake_ip_proxy_policy()
+    def test_browser_none_server_addr_is_accepted_only_as_fulfilled_response_metadata(self):
+        response = FakePinnedResponse(
+            "https://pis.baiwang.com/document",
+            content=b"<html>public</html>",
         )
-        proxy_page = FakeBrowserPage()
-        proxy_request = FakeBrowserRequest(
-            "https://pis.baiwang.com/document", proxy_page
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=fake_ip_proxy_policy(),
+            pinned_transport=RecordingPinnedTransport(response=response),
         )
-        proxy_converter._guard_browser_request(FakeRoute(), proxy_request)
-        proxy_response = FakeBrowserResponse(
+        converter._browser_http_session = object()
+        page = FakeBrowserPage()
+        request = FakeBrowserRequest("https://pis.baiwang.com/document", page)
+        converter._guard_browser_request(FakeRoute(), request)
+        browser_response = FakeBrowserResponse(
             "https://pis.baiwang.com/document",
             None,
-            request=proxy_request,
+            request=request,
         )
-        self.assertIsNone(proxy_converter._validate_browser_response(proxy_response))
-        proxy_converter._ensure_browser_page_secure(proxy_page)
 
-        direct_converter = PDFConverter(
-            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
-        )
-        direct_page = FakeBrowserPage()
-        direct_request = FakeBrowserRequest(
-            "https://public.example/document", direct_page
-        )
-        direct_converter._guard_browser_request(FakeRoute(), direct_request)
-        direct_response = FakeBrowserResponse(
-            "https://public.example/document",
-            None,
-            request=direct_request,
-        )
-        with self.assertRaises(PublicUrlPolicyError):
-            direct_converter._validate_browser_response(direct_response)
+        self.assertTrue(converter._validate_browser_response(browser_response))
+        converter._ensure_browser_page_secure(page)
 
-    def test_browser_server_addr_exception_fails_closed_even_in_proxy_mode(self):
+    def test_fulfilled_browser_response_never_calls_server_addr(self):
+        pinned_response = FakePinnedResponse(
+            "https://pis.baiwang.com/document",
+            content=b"<html>public</html>",
+        )
         converter = PDFConverter(
-            staging_dir=tempfile.mkdtemp(), url_policy=fake_ip_proxy_policy()
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=fake_ip_proxy_policy(),
+            pinned_transport=RecordingPinnedTransport(response=pinned_response),
         )
+        converter._browser_http_session = object()
         page = FakeBrowserPage()
         request = FakeBrowserRequest("https://pis.baiwang.com/document", page)
         converter._guard_browser_request(FakeRoute(), request)
@@ -631,8 +874,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
             request=request,
         )
 
-        with self.assertRaises(PublicUrlPolicyError):
-            converter._validate_browser_response(response)
+        self.assertTrue(converter._validate_browser_response(response))
 
     def test_browser_websockets_are_blocked(self):
         converter = PDFConverter(
@@ -644,6 +886,17 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
 
         self.assertIsNotNone(route.closed)
         self.assertEqual(route.closed.get("code"), 1008)
+
+    def test_browser_context_is_offline_and_only_uses_fulfilled_routes(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        browser = FakeBrowser()
+
+        context = converter._new_browser_context(browser)
+
+        self.assertTrue(context.options["offline"])
+        self.assertEqual([kind for kind, _, _ in context.routes], ["http", "websocket"])
 
     def test_dom_private_urls_are_removed_before_provider_probe(self):
         converter = PDFConverter(
@@ -681,7 +934,7 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
             )
         self.assertEqual(response.content_reads, 0)
 
-    def test_browser_response_rejects_peer_not_in_validated_dns_set(self):
+    def test_unattributed_unfulfilled_browser_response_compromises_context(self):
         converter = PDFConverter(
             staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
         )
@@ -718,6 +971,35 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertNotIn("private-capability", process_log)
         self.assertNotIn("synthetic-secret", process_log)
         self.assertNotIn("SYNTHETIC_MAILBOX_SUBJECT", process_log)
+
+    def test_recursive_trace_sanitizer_removes_nested_urls_exceptions_and_subjects(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+        trace = {
+            "url": "https://public.example/private-capability?value=synthetic-secret",
+            "message": "failed at https://public.example/private-capability?value=synthetic-secret",
+            "nested": [
+                {
+                    "resolved_url": "https://cdn.example/opaque-segment#fragment",
+                    "exception": RuntimeError("SYNTHETIC_MAILBOX_SUBJECT"),
+                }
+            ],
+            "subject": "SYNTHETIC_MAILBOX_SUBJECT",
+        }
+
+        sanitized = converter._sanitize_trace(trace)
+        rendered = json.dumps(sanitized)
+
+        self.assertIn("https://public.example/<redacted>", rendered)
+        for forbidden in (
+            "private-capability",
+            "synthetic-secret",
+            "opaque-segment",
+            "fragment",
+            "SYNTHETIC_MAILBOX_SUBJECT",
+        ):
+            self.assertNotIn(forbidden, rendered)
 
     def test_direct_invoice_acceptance_normalizes_seller_parentheses(self):
         api = InvoiceAppAPI()

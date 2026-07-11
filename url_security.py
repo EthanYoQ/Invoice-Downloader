@@ -90,6 +90,7 @@ class ProxyEndpoint:
     host: str
     port: int
     addresses: tuple[str, ...]
+    scheme: str = "http"
 
     def matches(self, address: str, port: int | None) -> bool:
         return port == self.port and address in self.addresses
@@ -110,16 +111,23 @@ class ValidatedPublicUrl:
 
 
 class CachedDohResolver:
-    _cache = {}
-    _lock = threading.Lock()
-
-    def __init__(self, timeout_seconds=1.5, cache_seconds=300):
+    def __init__(
+        self,
+        timeout_seconds=1.5,
+        cache_seconds=300,
+        opener=None,
+        endpoints=None,
+    ):
         self.timeout_seconds = max(0.2, min(float(timeout_seconds), 2.0))
         self.cache_seconds = max(30, int(cache_seconds))
-        self.endpoints = (
+        self._opener = opener or urlopen
+        self.endpoints = tuple(endpoints or (
             "https://cloudflare-dns.com/dns-query?name={name}&type={type}",
             "https://dns.google/resolve?name={name}&type={type}",
-        )
+            "https://dns.quad9.net/dns-query?name={name}&type={type}",
+        ))
+        self._cache = {}
+        self._lock = threading.Lock()
 
     def __call__(self, host: str, port: int) -> Sequence[str]:
         cache_key = host.lower()
@@ -139,20 +147,33 @@ class CachedDohResolver:
                     headers={"Accept": "application/dns-json"},
                 )
                 try:
-                    with urlopen(request, timeout=self.timeout_seconds) as response:
+                    with self._opener(request, timeout=self.timeout_seconds) as response:
                         payload = json.loads(response.read().decode("utf-8"))
-                    endpoint_worked = int(payload.get("Status", -1)) == 0
+                    endpoint_worked = endpoint_worked or int(payload.get("Status", -1)) == 0
                     for answer in payload.get("Answer", []) or []:
                         if int(answer.get("type", 0)) in {1, 28}:
                             addresses.append(str(answer.get("data", "")))
                 except Exception as exc:
                     last_error = exc
             if endpoint_worked and addresses:
-                result = tuple(dict.fromkeys(addresses))
+                parsed_addresses = []
+                for value in addresses:
+                    try:
+                        address = ipaddress.ip_address(value)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "public DNS attestor returned an invalid address"
+                        ) from exc
+                    if not _is_public_unicast(address):
+                        raise RuntimeError(
+                            "public DNS attestor returned a non-public address"
+                        )
+                    parsed_addresses.append(address.compressed)
+                result = tuple(dict.fromkeys(parsed_addresses))
                 with self._lock:
                     self._cache[cache_key] = (now + self.cache_seconds, result)
                 return result
-        raise RuntimeError("public DNS attestation unavailable") from last_error
+        raise RuntimeError("all public DNS attestors unavailable") from last_error
 
 
 def _proxy_spec_mapping(proxy_endpoint):
@@ -177,13 +198,17 @@ def _parse_proxy_spec(spec, resolver: Resolver) -> ProxyEndpoint | None:
         return spec
     if isinstance(spec, (tuple, list)) and len(spec) == 2:
         host, port = str(spec[0]), int(spec[1])
+        scheme = "http"
     else:
         value = str(spec).strip()
         if not value:
             return None
         parsed = urlsplit(value if "://" in value else f"http://{value}")
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"}:
+            return None
         host = parsed.hostname or ""
-        port = parsed.port or 80
+        port = parsed.port or (443 if scheme == "https" else 80)
     if not host or not (1 <= port <= 65535):
         return None
     try:
@@ -197,7 +222,7 @@ def _parse_proxy_spec(spec, resolver: Resolver) -> ProxyEndpoint | None:
     )
     if not canonical:
         return None
-    return ProxyEndpoint(host.lower(), port, canonical)
+    return ProxyEndpoint(host.lower(), port, canonical, scheme)
 
 
 class PublicUrlPolicy:
@@ -396,8 +421,6 @@ class PublicUrlPolicy:
 
     def verify_browser_peer(self, peer, validated: ValidatedPublicUrl):
         if peer is None:
-            if validated.proxy_endpoint is not None and validated.public_addresses:
-                return None
             raise PublicUrlPolicyError(
                 validated.url, "browser connected peer could not be verified"
             )
