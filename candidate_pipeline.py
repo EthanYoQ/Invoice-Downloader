@@ -389,6 +389,23 @@ class CandidatePreflight:
         )
         return pdf_path
 
+    def release_current_run_candidate(self, candidate) -> bool:
+        """Release dedupe state created by this preflight for an explicit retry."""
+        canonical_id = candidate.identity.document_id
+        compatibility_key = candidate.compatibility_history_key
+        if (
+            canonical_id not in self.seen_identities
+            or compatibility_key not in self.seen_history_keys
+        ):
+            return False
+        self.seen_identities.discard(canonical_id)
+        self.seen_history_keys.discard(compatibility_key)
+        self.working_history.discard(canonical_id)
+        self.working_history.discard(compatibility_key)
+        with self.sidecar_lock:
+            self.sidecar.pop(canonical_id, None)
+        return True
+
     def __call__(self, candidate):
         from extraction_pipeline import ExtractionOutcome
 

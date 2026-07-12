@@ -9,8 +9,9 @@ import time
 import pytest
 
 from archive_service import ArchivedOutcome, ArchiveReport, ArchiveService
-from app_api import _ProcessingPipelineSession
+from app_api import ProcessingLoopFailure, _ProcessingPipelineSession
 from candidate_pipeline import (
+    CandidatePreflight,
     CandidatePipeline,
     DocumentCandidate,
     partition_redundant_provider_candidates,
@@ -1144,16 +1145,18 @@ def test_processing_session_retries_uncovered_strong_provider_failure(tmp_path):
     class FakePipeline:
         def __init__(self):
             self.provider_attempts = 0
+            self.retry_attempts = 0
 
         def extract(self, batch, **_progress):
             batch = list(batch)
             if not batch:
                 return []
             self.provider_attempts += 1
-            if self.provider_attempts == 1:
-                return [
-                    ExtractionOutcome.unresolved(candidate, "URL_DOWNLOAD_FAILED")
-                ]
+            return [ExtractionOutcome.unresolved(candidate, "URL_DOWNLOAD_FAILED")]
+
+        def retry_current_run_failures(self, batch):
+            assert list(batch) == [candidate]
+            self.retry_attempts += 1
             return [
                 ExtractionOutcome.resolved(
                     candidate,
@@ -1201,9 +1204,153 @@ def test_processing_session_retries_uncovered_strong_provider_failure(tmp_path):
 
     report = session.archive(session.extract())
 
-    assert pipeline.provider_attempts == 2
+    assert pipeline.provider_attempts == 1
+    assert pipeline.retry_attempts == 1
     assert report.archived_count == 1
     assert report.unresolved_count == 0
+
+
+def test_extraction_pipeline_retry_releases_only_current_run_failed_candidate(tmp_path):
+    candidate = CandidatePipeline().collect(
+        [
+            {
+                "filepath": "https://provider.example/invoice",
+                "email_id": "mail-1",
+                "provider_family": "nuonuo_scan_invoice",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            }
+        ]
+    )[0]
+    working_history = set()
+
+    class ApiStub:
+        def _should_gate_controlled_run_url(self, _legacy):
+            return False
+
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "provider invoice"
+
+    class Probe:
+        status = "resolved"
+        result = {"is_invoice": True, "InvoiceNumber": "26110000000000000001"}
+        engine = "local"
+        reason_code = "LOCAL_PARSE"
+
+    class ExtractorStub:
+        def probe_local_only(self, _path, *, document_context):
+            assert document_context["provider_family"] == "nuonuo_scan_invoice"
+            return Probe()
+
+    class ConverterStub:
+        calls = 0
+
+        def process_invoice_links(self, *_args, **_kwargs):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                return []
+            recovered = tmp_path / "invoice.pdf"
+            recovered.write_bytes(b"%PDF-1.4\n")
+            return [{"status": "success", "pdf_path": str(recovered)}]
+
+    preflight = CandidatePreflight(
+        api=ApiStub(),
+        extractor=ExtractorStub(),
+        working_history=working_history,
+        sidecar={},
+        sidecar_lock=threading.Lock(),
+        converter_factory=ConverterStub,
+    )
+    pipeline = ExtractionPipeline(
+        local_parser=preflight,
+        remote_extractor=lambda _candidate: pytest.fail("remote must not run"),
+    )
+
+    first = pipeline.extract([candidate])
+    second = pipeline.retry_current_run_failures([candidate])
+
+    assert first[0].reason_code == "URL_DOWNLOAD_FAILED"
+    assert second[0].status == "resolved"
+    assert ConverterStub.calls == 2
+    assert candidate.identity.document_id in working_history
+    assert candidate.compatibility_history_key in working_history
+
+
+def test_processing_session_provider_retry_wait_is_cancellable(tmp_path, monkeypatch):
+    candidate = CandidatePipeline().collect(
+        [
+            {
+                "filepath": "https://provider.example/invoice",
+                "email_id": "mail-1",
+                "provider_family": "nuonuo_scan_invoice",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            }
+        ]
+    )[0]
+
+    class PipelineStub:
+        def extract(self, batch, **_progress):
+            batch = list(batch)
+            if not batch:
+                return []
+            return [ExtractionOutcome.unresolved(candidate, "URL_DOWNLOAD_FAILED")]
+
+        def retry_current_run_failures(self, _batch):
+            pytest.fail("cancelled retry must not run")
+
+    class TraceStore:
+        def set_fields(self, *_args, **_kwargs):
+            return None
+
+        def get_record(self, _document_id):
+            return {}
+
+    class ApiStub:
+        _stop_requested = False
+
+        def _safe_emit_stage_event(self, *_args):
+            return None
+
+        def _mark_output_run_state(self, *_args, **_kwargs):
+            return None
+
+        def _commit_output_state(self, *_args):
+            return None
+
+    api = ApiStub()
+    sleep_calls = []
+
+    def request_stop(seconds):
+        sleep_calls.append(seconds)
+        api._stop_requested = True
+
+    monkeypatch.setattr("app_api.time.sleep", request_stop)
+    session = _ProcessingPipelineSession(
+        api=api,
+        candidates=[candidate],
+        pipeline=PipelineStub(),
+        archive_service=ArchiveService(
+            writer=lambda _outcome, _root: str(tmp_path / "invoice.pdf")
+        ),
+        save_path=str(tmp_path),
+        output_state_dir=str(tmp_path / "state"),
+        working_history=set(),
+        business_records={},
+        sidecar={},
+        trace_store=TraceStore(),
+        provider_retry_delay_seconds=20,
+    )
+
+    with pytest.raises(ProcessingLoopFailure, match="PROCESSING_PIPELINE_INCOMPLETE"):
+        session.archive(session.extract())
+
+    assert sleep_calls and max(sleep_calls) <= 0.25
 
 
 def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_path: Path):

@@ -155,6 +155,7 @@ class ExtractionPipeline:
         *,
         progress_offset: int = 0,
         progress_total: int | None = None,
+        _emit_progress_events: bool = True,
     ) -> list[ExtractionOutcome]:
         ordered = [
             candidate
@@ -171,7 +172,8 @@ class ExtractionPipeline:
             if progress_total is None
             else max(minimum_total, int(progress_total))
         )
-        self._emit_progress(progress_offset, overall_total)
+        if _emit_progress_events:
+            self._emit_progress(progress_offset, overall_total)
         outcomes: dict[int, ExtractionOutcome] = {}
         unresolved: list[tuple[int, DocumentCandidate]] = []
         completed = 0
@@ -194,7 +196,8 @@ class ExtractionPipeline:
                     )
                 except Exception:
                     pass
-            self._emit_progress(progress_offset + completed, overall_total)
+            if _emit_progress_events:
+                self._emit_progress(progress_offset + completed, overall_total)
 
         def stopped(candidate: DocumentCandidate) -> ExtractionOutcome:
             return ExtractionOutcome(
@@ -325,6 +328,20 @@ class ExtractionPipeline:
                 record(ordinal, outcome)
             final.append(outcome)
         return final
+
+    def retry_current_run_failures(
+        self, candidates: Iterable[DocumentCandidate]
+    ) -> list[ExtractionOutcome]:
+        ordered = tuple(candidates)
+        release = getattr(self._local_parser, "release_current_run_candidate", None)
+        if not callable(release):
+            raise RuntimeError("local parser does not support explicit current-run retries")
+        for candidate in ordered:
+            if not release(candidate):
+                raise RuntimeError(
+                    "candidate was not registered by this pipeline in the current run"
+                )
+        return self.extract(ordered, _emit_progress_events=False)
 
 
 class SharedRuntimeRemoteExtractor:

@@ -236,6 +236,16 @@ class _ProcessingPipelineSession:
             and len(invoice_number) == 20
         )
 
+    def _wait_for_provider_retry(self) -> bool:
+        remaining = self._provider_retry_delay_seconds
+        while remaining > 0:
+            if bool(getattr(self._api, "_stop_requested", False)):
+                return False
+            interval = min(0.25, remaining)
+            time.sleep(interval)
+            remaining -= interval
+        return not bool(getattr(self._api, "_stop_requested", False))
+
     def archive(self, outcomes):
         from archive_service import ArchiveReport
         from candidate_pipeline import partition_redundant_provider_candidates
@@ -343,13 +353,9 @@ class _ProcessingPipelineSession:
         ]
         retried_failures = []
         recovered_retry_failures = []
-        if retryable_failures:
-            if self._provider_retry_delay_seconds:
-                time.sleep(self._provider_retry_delay_seconds)
-            retry_outcomes = self._pipeline.extract(
-                [outcome.candidate for outcome in retryable_failures],
-                progress_offset=max(0, self._candidate_total - len(retryable_failures)),
-                progress_total=self._candidate_total,
+        if retryable_failures and self._wait_for_provider_retry():
+            retry_outcomes = self._pipeline.retry_current_run_failures(
+                [outcome.candidate for outcome in retryable_failures]
             )
             retried_failures = [
                 outcome
@@ -395,6 +401,8 @@ class _ProcessingPipelineSession:
                 for outcome in retried_failures
                 if outcome.candidate.identity.document_id in retry_pending_ids
             ]
+        elif retryable_failures:
+            retried_failures = list(retryable_failures)
         terminal_failures = sorted(
             [
                 *recovered_failures,
