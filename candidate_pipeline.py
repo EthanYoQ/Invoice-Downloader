@@ -547,8 +547,8 @@ def partition_redundant_provider_candidates(
             ExtractionOutcome(
                 candidate=candidate,
                 status="retained",
-                reason_code="PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT",
-                message="PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT",
+                reason_code="PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_INVOICE",
+                message="PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_INVOICE",
                 artifact_path=candidate.source_path,
                 trace_context=candidate.trace_context,
             )

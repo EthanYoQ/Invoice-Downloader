@@ -655,7 +655,7 @@ def test_archived_attachment_defers_matching_provider_url_without_network(tmp_pa
 
     assert pending == []
     assert skipped[0].status == "retained"
-    assert skipped[0].reason_code == "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT"
+    assert skipped[0].reason_code == "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_INVOICE"
 
 
 def test_provider_url_remains_pending_without_exact_archived_identity(tmp_path):
@@ -923,9 +923,140 @@ def test_processing_session_never_downloads_exact_archived_provider_url(tmp_path
     assert pipeline.calls[1][0] == []
     assert report.can_complete is True
     assert archive_service.calls[1][0].reason_code == (
-        "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT"
+        "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_INVOICE"
     )
     assert trace_store.events[0][0] == candidates[1].identity.document_id
+
+
+def test_processing_session_reconciles_failure_only_after_sibling_url_archives(
+    tmp_path,
+):
+    candidates = CandidatePipeline().collect(
+        [
+            {
+                "filepath": "https://provider.example/failing",
+                "email_id": "mail-1",
+                "provider_family": "chinatax_direct_invoice",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            },
+            {
+                "filepath": "https://provider.example/succeeds",
+                "email_id": "mail-1",
+                "provider_family": "chinatax_direct_invoice",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            },
+        ]
+    )
+
+    class FakePipeline:
+        def __init__(self):
+            self.calls = []
+
+        def extract(self, batch, **progress):
+            batch = list(batch)
+            self.calls.append((batch, progress))
+            if not batch:
+                return []
+            assert batch == candidates
+            return [
+                ExtractionOutcome.unresolved(
+                    candidates[0], "URL_DOWNLOAD_FAILED"
+                ),
+                ExtractionOutcome.resolved(
+                    candidates[1],
+                    {
+                        "info_json": {
+                            "InvoiceNumber": "26110000000000000001",
+                            "is_invoice": True,
+                            "Type": "餐饮",
+                        }
+                    },
+                ),
+            ]
+
+    class TraceStore:
+        def __init__(self):
+            self.records = {}
+            self.events = []
+
+        def set_fields(self, document_id, **fields):
+            self.events.append((document_id, fields))
+            self.records.setdefault(document_id, {}).update(fields)
+
+        def get_record(self, document_id):
+            return self.records.get(document_id)
+
+    trace_store = TraceStore()
+
+    class ArchiveServiceStub:
+        def __init__(self):
+            self.calls = []
+
+        def archive(self, outcomes, _root, *, finalize=True):
+            assert finalize is False
+            outcomes = list(outcomes)
+            self.calls.append(outcomes)
+            archived = []
+            counts = Counter(outcome.status for outcome in outcomes)
+            for outcome in outcomes:
+                path = ""
+                if outcome.status == "resolved":
+                    path = str(tmp_path / f"{outcome.candidate.sequence}.pdf")
+                    Path(path).write_bytes(b"%PDF-1.4\n")
+                    trace_store.set_fields(
+                        outcome.candidate.identity.document_id,
+                        normalized_fields=dict(
+                            outcome.to_legacy_payload()["info_json"]
+                        ),
+                    )
+                archived.append(ArchivedOutcome(outcome=outcome, archive_path=path))
+            return ArchiveReport(
+                outcomes=tuple(archived),
+                archived_count=counts["resolved"],
+                retained_count=counts["retained"],
+                manual_count=counts["manual_review"],
+                unresolved_count=counts["unresolved"],
+                duplicate_count=counts["duplicate"],
+            )
+
+        def finalize(self, report, _root):
+            return report
+
+    class ApiStub:
+        def _safe_emit_stage_event(self, *_args):
+            return None
+
+        def _commit_output_state(self, *_args):
+            return None
+
+    archive_service = ArchiveServiceStub()
+    session = _ProcessingPipelineSession(
+        api=ApiStub(),
+        candidates=candidates,
+        pipeline=FakePipeline(),
+        archive_service=archive_service,
+        save_path=str(tmp_path),
+        output_state_dir=str(tmp_path / "state"),
+        working_history={},
+        business_records={},
+        sidecar={},
+        trace_store=trace_store,
+    )
+
+    report = session.archive(session.extract())
+
+    assert report.unresolved_count == 0
+    assert report.archived_count == 1
+    assert report.retained_count == 1
+    assert [outcome.status for outcome in archive_service.calls[1]] == ["resolved"]
+    assert [outcome.status for outcome in archive_service.calls[2]] == ["retained"]
+    assert archive_service.calls[2][0].reason_code == (
+        "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_INVOICE"
+    )
 
 
 def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_path: Path):

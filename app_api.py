@@ -219,6 +219,25 @@ class _ProcessingPipelineSession:
         from archive_service import ArchiveReport
         from candidate_pipeline import partition_redundant_provider_candidates
 
+        def merge_reports(reports):
+            return ArchiveReport(
+                outcomes=tuple(
+                    sorted(
+                        (
+                            archived
+                            for source_report in reports
+                            for archived in source_report.outcomes
+                        ),
+                        key=lambda archived: archived.outcome.candidate.sequence,
+                    )
+                ),
+                archived_count=sum(item.archived_count for item in reports),
+                retained_count=sum(item.retained_count for item in reports),
+                manual_count=sum(item.manual_count for item in reports),
+                unresolved_count=sum(item.unresolved_count for item in reports),
+                duplicate_count=sum(item.duplicate_count for item in reports),
+            )
+
         primary_outcomes = list(outcomes)
         primary_report = self._archive_service.archive(
             primary_outcomes, self._save_path, finalize=False
@@ -237,33 +256,71 @@ class _ProcessingPipelineSession:
             progress_offset=offset,
             progress_total=self._candidate_total,
         )
-        deferred_outcomes = sorted(
-            [*skipped, *provider_outcomes],
+        failed_provider_outcomes = [
+            outcome
+            for outcome in provider_outcomes
+            if outcome.status == "unresolved"
+            and outcome.reason_code == "URL_DOWNLOAD_FAILED"
+        ]
+        failed_document_ids = {
+            outcome.candidate.identity.document_id
+            for outcome in failed_provider_outcomes
+        }
+        archiveable_outcomes = sorted(
+            [
+                *skipped,
+                *(
+                    outcome
+                    for outcome in provider_outcomes
+                    if outcome.candidate.identity.document_id
+                    not in failed_document_ids
+                ),
+            ],
             key=lambda outcome: outcome.candidate.sequence,
         )
-        if deferred_outcomes:
-            deferred_report = self._archive_service.archive(
-                deferred_outcomes, self._save_path, finalize=False
+        reports = [primary_report]
+        if archiveable_outcomes:
+            reports.append(
+                self._archive_service.archive(
+                    archiveable_outcomes, self._save_path, finalize=False
+                )
             )
-            report = ArchiveReport(
-                outcomes=primary_report.outcomes + deferred_report.outcomes,
-                archived_count=(
-                    primary_report.archived_count + deferred_report.archived_count
-                ),
-                retained_count=(
-                    primary_report.retained_count + deferred_report.retained_count
-                ),
-                manual_count=primary_report.manual_count + deferred_report.manual_count,
-                unresolved_count=(
-                    primary_report.unresolved_count
-                    + deferred_report.unresolved_count
-                ),
-                duplicate_count=(
-                    primary_report.duplicate_count + deferred_report.duplicate_count
-                ),
+
+        archived_evidence = tuple(
+            archived
+            for source_report in reports
+            for archived in source_report.outcomes
+        )
+        recovered_failures, still_pending = partition_redundant_provider_candidates(
+            [outcome.candidate for outcome in failed_provider_outcomes],
+            archived_evidence,
+            canonical_info_by_document_id=self._canonical_info_by_document_id(
+                archived_evidence
             )
-        else:
-            report = primary_report
+        )
+        self._record_deferred_outcomes(recovered_failures)
+        pending_ids = {
+            candidate.identity.document_id for candidate in still_pending
+        }
+        terminal_failures = sorted(
+            [
+                *recovered_failures,
+                *(
+                    outcome
+                    for outcome in failed_provider_outcomes
+                    if outcome.candidate.identity.document_id in pending_ids
+                ),
+            ],
+            key=lambda outcome: outcome.candidate.sequence,
+        )
+        if terminal_failures:
+            reports.append(
+                self._archive_service.archive(
+                    terminal_failures, self._save_path, finalize=False
+                )
+            )
+
+        report = merge_reports(reports)
         report = self._archive_service.finalize(report, self._save_path)
         if not report.can_complete:
             self._api._mark_output_run_state(
