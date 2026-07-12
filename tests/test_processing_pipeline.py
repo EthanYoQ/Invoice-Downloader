@@ -1127,6 +1127,85 @@ def test_processing_session_reconciles_failure_only_after_sibling_url_archives(
     )
 
 
+def test_processing_session_retries_uncovered_strong_provider_failure(tmp_path):
+    candidate = CandidatePipeline().collect(
+        [
+            {
+                "filepath": "https://provider.example/invoice",
+                "email_id": "mail-1",
+                "provider_family": "nuonuo_scan_invoice",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            }
+        ]
+    )[0]
+
+    class FakePipeline:
+        def __init__(self):
+            self.provider_attempts = 0
+
+        def extract(self, batch, **_progress):
+            batch = list(batch)
+            if not batch:
+                return []
+            self.provider_attempts += 1
+            if self.provider_attempts == 1:
+                return [
+                    ExtractionOutcome.unresolved(candidate, "URL_DOWNLOAD_FAILED")
+                ]
+            return [
+                ExtractionOutcome.resolved(
+                    candidate,
+                    {
+                        "info_json": {
+                            "InvoiceNumber": "26110000000000000001",
+                            "is_invoice": True,
+                            "Type": "餐饮",
+                        }
+                    },
+                )
+            ]
+
+    class TraceStore:
+        def set_fields(self, *_args, **_kwargs):
+            return None
+
+        def get_record(self, _document_id):
+            return {}
+
+    class ApiStub:
+        def _safe_emit_stage_event(self, *_args):
+            return None
+
+        def _commit_output_state(self, *_args):
+            return None
+
+    pipeline = FakePipeline()
+    archive_service = ArchiveService(
+        writer=lambda _outcome, _root: str(tmp_path / "invoice.pdf")
+    )
+    session = _ProcessingPipelineSession(
+        api=ApiStub(),
+        candidates=[candidate],
+        pipeline=pipeline,
+        archive_service=archive_service,
+        save_path=str(tmp_path),
+        output_state_dir=str(tmp_path / "state"),
+        working_history={},
+        business_records={},
+        sidecar={},
+        trace_store=TraceStore(),
+        provider_retry_delay_seconds=0,
+    )
+
+    report = session.archive(session.extract())
+
+    assert pipeline.provider_attempts == 2
+    assert report.archived_count == 1
+    assert report.unresolved_count == 0
+
+
 def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_path: Path):
     events = 0
 

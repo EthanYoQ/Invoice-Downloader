@@ -144,6 +144,7 @@ class _ProcessingPipelineSession:
         sidecar,
         trace_store,
         owned_extractor=None,
+        provider_retry_delay_seconds=0.0,
     ):
         self._api = api
         self.candidates = candidates
@@ -156,6 +157,9 @@ class _ProcessingPipelineSession:
         self._sidecar = sidecar
         self._trace_store = trace_store
         self._owned_extractor = owned_extractor
+        self._provider_retry_delay_seconds = max(
+            0.0, float(provider_retry_delay_seconds)
+        )
         self._provider_url_candidates = []
         self._candidate_total = len(candidates)
         self._closed = False
@@ -214,6 +218,23 @@ class _ProcessingPipelineSession:
             for document_id, record in records.items()
             if isinstance(record, dict)
         }
+
+    @staticmethod
+    def _is_strong_provider_retry_candidate(candidate):
+        legacy = candidate.to_legacy()
+        expected = legacy.get("provider_expected_fields") or {}
+        invoice_number = "".join(
+            character
+            for character in str(
+                expected.get("invoice_number") or expected.get("InvoiceNumber") or ""
+            )
+            if character.isdigit()
+        )
+        return bool(
+            candidate.identity.source_kind == "url"
+            and legacy.get("provider_family")
+            and len(invoice_number) == 20
+        )
 
     def archive(self, outcomes):
         from archive_service import ArchiveReport
@@ -299,17 +320,87 @@ class _ProcessingPipelineSession:
             )
         )
         self._record_deferred_outcomes(recovered_failures)
-        pending_ids = {
+        still_pending_ids = {
             candidate.identity.document_id for candidate in still_pending
         }
+        remaining_failures = [
+            outcome
+            for outcome in failed_provider_outcomes
+            if outcome.candidate.identity.document_id in still_pending_ids
+        ]
+        retryable_failures = [
+            outcome
+            for outcome in remaining_failures
+            if self._is_strong_provider_retry_candidate(outcome.candidate)
+        ]
+        retryable_ids = {
+            outcome.candidate.identity.document_id for outcome in retryable_failures
+        }
+        nonretryable_failures = [
+            outcome
+            for outcome in remaining_failures
+            if outcome.candidate.identity.document_id not in retryable_ids
+        ]
+        retried_failures = []
+        recovered_retry_failures = []
+        if retryable_failures:
+            if self._provider_retry_delay_seconds:
+                time.sleep(self._provider_retry_delay_seconds)
+            retry_outcomes = self._pipeline.extract(
+                [outcome.candidate for outcome in retryable_failures],
+                progress_offset=max(0, self._candidate_total - len(retryable_failures)),
+                progress_total=self._candidate_total,
+            )
+            retried_failures = [
+                outcome
+                for outcome in retry_outcomes
+                if outcome.status == "unresolved"
+                and outcome.reason_code == "URL_DOWNLOAD_FAILED"
+            ]
+            retried_failure_ids = {
+                outcome.candidate.identity.document_id
+                for outcome in retried_failures
+            }
+            retried_archiveable = [
+                outcome
+                for outcome in retry_outcomes
+                if outcome.candidate.identity.document_id not in retried_failure_ids
+            ]
+            if retried_archiveable:
+                reports.append(
+                    self._archive_service.archive(
+                        retried_archiveable, self._save_path, finalize=False
+                    )
+                )
+            archived_evidence = tuple(
+                archived
+                for source_report in reports
+                for archived in source_report.outcomes
+            )
+            recovered_retry_failures, retry_still_pending = (
+                partition_redundant_provider_candidates(
+                    [outcome.candidate for outcome in retried_failures],
+                    archived_evidence,
+                    canonical_info_by_document_id=self._canonical_info_by_document_id(
+                        archived_evidence
+                    ),
+                )
+            )
+            self._record_deferred_outcomes(recovered_retry_failures)
+            retry_pending_ids = {
+                candidate.identity.document_id for candidate in retry_still_pending
+            }
+            retried_failures = [
+                outcome
+                for outcome in retried_failures
+                if outcome.candidate.identity.document_id in retry_pending_ids
+            ]
         terminal_failures = sorted(
             [
                 *recovered_failures,
-                *(
-                    outcome
-                    for outcome in failed_provider_outcomes
-                    if outcome.candidate.identity.document_id in pending_ids
-                ),
+                *nonretryable_failures,
+                *recovered_retry_failures,
+                *retried_failures,
             ],
             key=lambda outcome: outcome.candidate.sequence,
         )
@@ -2629,6 +2720,7 @@ class InvoiceAppAPI:
             sidecar=sidecar,
             trace_store=trace_store,
             owned_extractor=_owned_extractor,
+            provider_retry_delay_seconds=20.0,
         )
 
     def _retain_artifact(self, save_path, source_path, bucket, reason, metadata=None):
