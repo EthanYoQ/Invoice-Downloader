@@ -74,7 +74,11 @@ class ArchiveService:
         self._archive_keys: set[str] = {str(key) for key in existing_dedupe_keys}
 
     def archive(
-        self, outcomes: Iterable[ExtractionOutcome], output_root: str | Path
+        self,
+        outcomes: Iterable[ExtractionOutcome],
+        output_root: str | Path,
+        *,
+        finalize: bool = True,
     ) -> ArchiveReport:
         root = Path(output_root)
         ordered = sorted(tuple(outcomes), key=lambda item: item.candidate.sequence)
@@ -205,6 +209,14 @@ class ArchiveService:
             unresolved_count=unresolved_count,
             duplicate_count=duplicate_count,
         )
+        if finalize:
+            report = self.finalize(report, root)
+        return report
+
+    def finalize(
+        self, report: ArchiveReport, output_root: str | Path
+    ) -> ArchiveReport:
+        root = Path(output_root)
         if self._finalizer is not None:
             try:
                 final_paths = self._finalizer(report, root)

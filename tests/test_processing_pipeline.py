@@ -8,8 +8,13 @@ import time
 
 import pytest
 
-from archive_service import ArchiveReport, ArchiveService
-from candidate_pipeline import CandidatePipeline, DocumentCandidate
+from archive_service import ArchivedOutcome, ArchiveReport, ArchiveService
+from app_api import _ProcessingPipelineSession
+from candidate_pipeline import (
+    CandidatePipeline,
+    DocumentCandidate,
+    partition_redundant_provider_candidates,
+)
 from extraction_pipeline import ExtractionOutcome, ExtractionPipeline
 from glm_runtime import GlmRequestError
 
@@ -528,6 +533,41 @@ def test_archive_finalizer_can_publish_final_renamed_path_for_lineage(tmp_path: 
     assert Path(report.outcomes[0].archive_path).read_bytes() == b"invoice"
 
 
+def test_archive_can_defer_finalizer_until_complete_report(tmp_path: Path):
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"invoice")
+    candidate = CandidatePipeline().collect(
+        [{"filepath": str(source), "message_uid": "100"}]
+    )[0]
+    outcome = ExtractionOutcome.resolved(candidate, {"InvoiceNumber": "12345678"})
+    calls = []
+
+    def writer(_outcome, root):
+        initial = root / "before.pdf"
+        initial.parent.mkdir(parents=True)
+        initial.write_bytes(source.read_bytes())
+        return str(initial)
+
+    def finalizer(report, _root):
+        calls.append(report)
+        initial = Path(report.outcomes[0].archive_path)
+        renamed = initial.with_name("after.pdf")
+        initial.replace(renamed)
+        return {candidate.identity.document_id: str(renamed)}
+
+    service = ArchiveService(writer=writer, finalizer=finalizer)
+    report = service.archive([outcome], tmp_path / "output", finalize=False)
+
+    assert calls == []
+    assert Path(report.outcomes[0].archive_path).name == "before.pdf"
+
+    finalized = service.finalize(report, tmp_path / "output")
+
+    assert len(calls) == 1
+    assert Path(finalized.outcomes[0].archive_path).name == "after.pdf"
+    assert Path(finalized.outcomes[0].archive_path).is_file()
+
+
 def test_archive_is_single_threaded_ordered_and_idempotent(tmp_path: Path):
     calls: list[tuple[int, int]] = []
     main_thread = threading.get_ident()
@@ -577,6 +617,315 @@ def test_terminal_retention_and_manual_review_do_not_block_run_completion():
     )
 
     assert report.can_complete is True
+
+
+def test_archived_attachment_defers_matching_provider_url_without_network(tmp_path):
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": "C:/staging/invoice.pdf", "email_id": "mail-1"},
+            {
+                "filepath": "https://provider.example/fallback",
+                "email_id": "mail-1",
+                "provider_family": "baiwang",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            },
+        ]
+    )
+    attachment = ExtractionOutcome.resolved(
+        candidates[0],
+        {
+            "info_json": {
+                "InvoiceNumber": "26110000000000000001",
+                "is_invoice": True,
+            }
+        },
+    )
+
+    archive_path = tmp_path / "invoice.pdf"
+    archive_path.write_bytes(b"%PDF-1.4\n")
+    skipped, pending = partition_redundant_provider_candidates(
+        [candidates[1]],
+        [ArchivedOutcome(outcome=attachment, archive_path=str(archive_path))],
+        canonical_info_by_document_id={
+            candidates[0].identity.document_id: attachment.payload["info_json"]
+        },
+    )
+
+    assert pending == []
+    assert skipped[0].status == "retained"
+    assert skipped[0].reason_code == "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT"
+
+
+def test_provider_url_remains_pending_without_exact_archived_identity(tmp_path):
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": "C:/staging/invoice.pdf", "email_id": "mail-1"},
+            {
+                "filepath": "https://provider.example/fallback",
+                "email_id": "mail-1",
+                "provider_family": "baiwang",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            },
+        ]
+    )
+    different = ExtractionOutcome.resolved(
+        candidates[0],
+        {
+            "info_json": {
+                "InvoiceNumber": "26110000000000000002",
+                "is_invoice": True,
+            }
+        },
+    )
+
+    archive_path = tmp_path / "different.pdf"
+    archive_path.write_bytes(b"%PDF-1.4\n")
+    skipped, pending = partition_redundant_provider_candidates(
+        [candidates[1]],
+        [ArchivedOutcome(outcome=different, archive_path=str(archive_path))],
+        canonical_info_by_document_id={
+            candidates[0].identity.document_id: different.payload["info_json"]
+        },
+    )
+
+    assert skipped == []
+    assert pending == [candidates[1]]
+
+
+def test_extracted_but_unarchived_attachment_never_suppresses_provider_url():
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": "C:/staging/invoice.pdf", "email_id": "mail-1"},
+            {
+                "filepath": "https://provider.example/fallback",
+                "email_id": "mail-1",
+                "provider_family": "baiwang",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            },
+        ]
+    )
+    attachment = ExtractionOutcome.resolved(
+        candidates[0],
+        {
+            "info_json": {
+                "InvoiceNumber": "26110000000000000001",
+                "is_invoice": True,
+            }
+        },
+    )
+
+    skipped, pending = partition_redundant_provider_candidates(
+        [candidates[1]],
+        [ArchivedOutcome(outcome=attachment, archive_path="")],
+        canonical_info_by_document_id={
+            candidates[0].identity.document_id: attachment.payload["info_json"]
+        },
+    )
+
+    assert skipped == []
+    assert pending == [candidates[1]]
+
+
+def test_archived_itinerary_quoting_invoice_number_never_suppresses_provider_url(
+    tmp_path,
+):
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": "C:/staging/itinerary.pdf", "email_id": "mail-1"},
+            {
+                "filepath": "https://provider.example/fallback",
+                "email_id": "mail-1",
+                "provider_family": "baiwang",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            },
+        ]
+    )
+    itinerary = ExtractionOutcome.resolved(
+        candidates[0],
+        {
+            "info_json": {
+                "InvoiceNumber": "26110000000000000001",
+                "is_invoice": True,
+                "Type": "打车行程单",
+                "_is_itinerary": True,
+            }
+        },
+    )
+    archive_path = tmp_path / "itinerary.pdf"
+    archive_path.write_bytes(b"%PDF-1.4\n")
+
+    skipped, pending = partition_redundant_provider_candidates(
+        [candidates[1]],
+        [ArchivedOutcome(outcome=itinerary, archive_path=str(archive_path))],
+        canonical_info_by_document_id={
+            candidates[0].identity.document_id: {
+                "InvoiceNumber": "26110000000000000001",
+                "is_invoice": True,
+                "Type": "打车行程单",
+                "_is_itinerary": True,
+            }
+        },
+    )
+
+    assert skipped == []
+    assert pending == [candidates[1]]
+
+
+def test_extraction_progress_supports_monotonic_multi_phase_offsets():
+    progress = []
+    candidates = [_candidate(0), _candidate(1)]
+    pipeline = ExtractionPipeline(
+        local_parser=lambda candidate: {"sequence": candidate.sequence},
+        remote_extractor=lambda _candidate: pytest.fail("remote must not run"),
+        progress_callback=lambda completed, total, percent: progress.append(
+            (completed, total, percent)
+        ),
+    )
+
+    pipeline.extract(candidates, progress_offset=3, progress_total=5)
+
+    assert progress[0] == (3, 5, 60)
+    assert progress[-1] == (5, 5, 100)
+
+
+def test_processing_session_never_downloads_exact_archived_provider_url(tmp_path):
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": "C:/staging/invoice.pdf", "email_id": "mail-1"},
+            {
+                "filepath": "https://provider.example/fallback",
+                "email_id": "mail-1",
+                "provider_family": "baiwang",
+                "provider_expected_fields": {
+                    "invoice_number": "26110000000000000001"
+                },
+            },
+        ]
+    )
+
+    class FakePipeline:
+        def __init__(self):
+            self.calls = []
+
+        def extract(self, batch, **progress):
+            batch = list(batch)
+            self.calls.append((batch, progress))
+            if not batch:
+                return []
+            assert batch == [candidates[0]]
+            return [
+                ExtractionOutcome.resolved(
+                    candidates[0],
+                    {
+                        "info_json": {
+                            "InvoiceNumber": "26110000000000000001",
+                            "is_invoice": True,
+                        }
+                    },
+                )
+            ]
+
+    class FakeTraceStore:
+        def __init__(self):
+            self.events = []
+            self.records = {
+                candidates[0].identity.document_id: {
+                    "normalized_fields": {
+                        "InvoiceNumber": "26110000000000000001",
+                        "is_invoice": True,
+                        "Type": "餐饮",
+                    }
+                }
+            }
+
+        def set_fields(self, document_id, **fields):
+            self.events.append((document_id, fields))
+
+        def get_record(self, document_id):
+            return self.records.get(document_id)
+
+    class FakeApi:
+        def __init__(self):
+            self.events = []
+
+        def _safe_emit_stage_event(self, stage, event, extra=None):
+            self.events.append((stage, event, extra))
+
+        def _commit_output_state(self, *_args):
+            return None
+
+    pipeline = FakePipeline()
+    trace_store = FakeTraceStore()
+    api = FakeApi()
+    archive_path = tmp_path / "invoice.pdf"
+    archive_path.write_bytes(b"%PDF-1.4\n")
+
+    class FakeArchiveService:
+        def __init__(self):
+            self.calls = []
+
+        def archive(self, outcomes, _root, *, finalize=True):
+            assert finalize is False
+            outcomes = list(outcomes)
+            self.calls.append(outcomes)
+            if len(self.calls) == 1:
+                return ArchiveReport(
+                    outcomes=(
+                        ArchivedOutcome(
+                            outcome=outcomes[0], archive_path=str(archive_path)
+                        ),
+                    ),
+                    archived_count=1,
+                    retained_count=0,
+                    manual_count=0,
+                    unresolved_count=0,
+                    duplicate_count=0,
+                )
+            return ArchiveReport(
+                outcomes=tuple(ArchivedOutcome(outcome=item) for item in outcomes),
+                archived_count=0,
+                retained_count=len(outcomes),
+                manual_count=0,
+                unresolved_count=0,
+                duplicate_count=0,
+            )
+
+        def finalize(self, report, _root):
+            return report
+
+    archive_service = FakeArchiveService()
+    session = _ProcessingPipelineSession(
+        api=api,
+        candidates=candidates,
+        pipeline=pipeline,
+        archive_service=archive_service,
+        save_path=str(tmp_path),
+        output_state_dir=str(tmp_path / "state"),
+        working_history={},
+        business_records={},
+        sidecar={},
+        trace_store=trace_store,
+        owned_extractor=None,
+    )
+
+    outcomes = session.extract()
+    report = session.archive(outcomes)
+
+    assert len(pipeline.calls) == 2
+    assert pipeline.calls[1][0] == []
+    assert report.can_complete is True
+    assert archive_service.calls[1][0].reason_code == (
+        "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT"
+    )
+    assert trace_store.events[0][0] == candidates[1].identity.document_id
 
 
 def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_path: Path):

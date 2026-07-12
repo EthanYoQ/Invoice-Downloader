@@ -199,7 +199,12 @@ class CandidatePipeline:
                 metadata.setdefault(
                     "prefilter_reason_code", "MALFORMED_DOCUMENT_CANDIDATE"
                 )
-            is_url = bool(metadata.get("is_url") or source_url)
+            source_scheme = urlsplit(source_path).scheme.lower()
+            is_url = bool(
+                metadata.get("is_url")
+                or source_url
+                or source_scheme in {"http", "https"}
+            )
             filename = (
                 os.path.basename(urlsplit(source_url or source_path).path)
                 if is_url
@@ -452,3 +457,100 @@ class CandidatePreflight:
                 "base64_img": base64_img,
             }
         return None
+
+
+def _normalized_invoice_number(value):
+    return "".join(character for character in str(value or "") if character.isdigit())
+
+
+def _strong_archived_invoice_identities(
+    archived_outcomes, canonical_info_by_document_id
+):
+    identities = set()
+    supporting_type_tokens = (
+        "行程单",
+        "水单",
+        "收据",
+        "确认单",
+        "itinerary",
+        "folio",
+        "receipt",
+        "confirmation",
+    )
+    for archived in archived_outcomes:
+        outcome = getattr(archived, "outcome", None)
+        archive_path = str(getattr(archived, "archive_path", "") or "")
+        if (
+            outcome is None
+            or bool(getattr(archived, "duplicate", False))
+            or outcome.status != "resolved"
+            or not archive_path
+            or not os.path.isfile(archive_path)
+        ):
+            continue
+        info = canonical_info_by_document_id.get(
+            outcome.candidate.identity.document_id
+        )
+        if not isinstance(info, Mapping):
+            continue
+        document_type = str(info.get("Type") or info.get("type") or "").lower()
+        if (
+            info.get("is_invoice") is not True
+            or info.get("_is_itinerary") is True
+            or info.get("_is_folio") is True
+            or any(token in document_type for token in supporting_type_tokens)
+        ):
+            continue
+        recovered_number = _normalized_invoice_number(
+            info.get("InvoiceNumber") or info.get("invoice_number")
+        )
+        source_uid = str(outcome.candidate.identity.source_message_uid or "").strip()
+        if source_uid and recovered_number:
+            identities.add((source_uid, recovered_number))
+    return identities
+
+
+def partition_redundant_provider_candidates(
+    candidates,
+    primary_outcomes,
+    *,
+    canonical_info_by_document_id,
+):
+    """Skip a provider URL only after an exact same-email invoice is archived."""
+    from extraction_pipeline import ExtractionOutcome
+
+    recovered_identities = _strong_archived_invoice_identities(
+        primary_outcomes,
+        canonical_info_by_document_id,
+    )
+    skipped = []
+    pending = []
+    for candidate in candidates:
+        legacy = candidate.to_legacy()
+        expected_fields = legacy.get("provider_expected_fields") or {}
+        expected_number = _normalized_invoice_number(
+            expected_fields.get("invoice_number")
+            or expected_fields.get("InvoiceNumber")
+        )
+        source_uid = str(candidate.identity.source_message_uid or "").strip()
+        redundant = bool(
+            candidate.identity.source_kind == "url"
+            and legacy.get("provider_family")
+            and source_uid
+            and expected_number
+            and (source_uid, expected_number) in recovered_identities
+        )
+        if not redundant:
+            pending.append(candidate)
+            continue
+        skipped.append(
+            ExtractionOutcome(
+                candidate=candidate,
+                status="retained",
+                reason_code="PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT",
+                message="PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_ATTACHMENT",
+                artifact_path=candidate.source_path,
+                trace_context=candidate.trace_context,
+            )
+        )
+    return skipped, pending

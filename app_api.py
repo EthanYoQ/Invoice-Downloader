@@ -156,13 +156,115 @@ class _ProcessingPipelineSession:
         self._sidecar = sidecar
         self._trace_store = trace_store
         self._owned_extractor = owned_extractor
+        self._provider_url_candidates = []
+        self._candidate_total = len(candidates)
         self._closed = False
 
     def extract(self):
-        return self._pipeline.extract(self.candidates)
+        candidates = list(self.candidates)
+        primary = [
+            candidate
+            for candidate in candidates
+            if candidate.identity.source_kind != "url"
+        ]
+        self._provider_url_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.identity.source_kind == "url"
+        ]
+        return self._pipeline.extract(primary, progress_total=self._candidate_total)
+
+    def _record_deferred_outcomes(self, outcomes):
+        for outcome in outcomes:
+            event = {
+                "document_id": outcome.candidate.identity.document_id,
+                "sequence": outcome.candidate.sequence,
+                "status": outcome.status,
+                "reason_code": outcome.reason_code,
+            }
+            self._trace_store.set_fields(
+                event["document_id"], extraction_result=dict(event)
+            )
+            self._api._safe_emit_stage_event(
+                "extraction_pipeline", "trace", dict(event)
+            )
+
+    def _canonical_info_by_document_id(self, archived_outcomes):
+        document_ids = {
+            archived.outcome.candidate.identity.document_id
+            for archived in archived_outcomes
+        }
+        records = {}
+        getter = getattr(self._trace_store, "get_record", None)
+        if callable(getter):
+            records = {
+                document_id: getter(document_id) or {}
+                for document_id in document_ids
+            }
+        else:
+            iterator = getattr(self._trace_store, "iter_records", None)
+            if callable(iterator):
+                records = {
+                    str(record.get("document_id") or ""): record
+                    for record in iterator()
+                    if isinstance(record, dict)
+                }
+        return {
+            document_id: dict(record.get("normalized_fields") or {})
+            for document_id, record in records.items()
+            if isinstance(record, dict)
+        }
 
     def archive(self, outcomes):
-        report = self._archive_service.archive(outcomes, self._save_path)
+        from archive_service import ArchiveReport
+        from candidate_pipeline import partition_redundant_provider_candidates
+
+        primary_outcomes = list(outcomes)
+        primary_report = self._archive_service.archive(
+            primary_outcomes, self._save_path, finalize=False
+        )
+        skipped, pending = partition_redundant_provider_candidates(
+            self._provider_url_candidates,
+            primary_report.outcomes,
+            canonical_info_by_document_id=self._canonical_info_by_document_id(
+                primary_report.outcomes
+            ),
+        )
+        self._record_deferred_outcomes(skipped)
+        offset = len(primary_outcomes) + len(skipped)
+        provider_outcomes = self._pipeline.extract(
+            pending,
+            progress_offset=offset,
+            progress_total=self._candidate_total,
+        )
+        deferred_outcomes = sorted(
+            [*skipped, *provider_outcomes],
+            key=lambda outcome: outcome.candidate.sequence,
+        )
+        if deferred_outcomes:
+            deferred_report = self._archive_service.archive(
+                deferred_outcomes, self._save_path, finalize=False
+            )
+            report = ArchiveReport(
+                outcomes=primary_report.outcomes + deferred_report.outcomes,
+                archived_count=(
+                    primary_report.archived_count + deferred_report.archived_count
+                ),
+                retained_count=(
+                    primary_report.retained_count + deferred_report.retained_count
+                ),
+                manual_count=primary_report.manual_count + deferred_report.manual_count,
+                unresolved_count=(
+                    primary_report.unresolved_count
+                    + deferred_report.unresolved_count
+                ),
+                duplicate_count=(
+                    primary_report.duplicate_count + deferred_report.duplicate_count
+                ),
+            )
+        else:
+            report = primary_report
+        report = self._archive_service.finalize(report, self._save_path)
         if not report.can_complete:
             self._api._mark_output_run_state(
                 self._output_state_dir,

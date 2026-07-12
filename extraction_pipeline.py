@@ -149,7 +149,13 @@ class ExtractionPipeline:
         except Exception:
             return
 
-    def extract(self, candidates: Iterable[DocumentCandidate]) -> list[ExtractionOutcome]:
+    def extract(
+        self,
+        candidates: Iterable[DocumentCandidate],
+        *,
+        progress_offset: int = 0,
+        progress_total: int | None = None,
+    ) -> list[ExtractionOutcome]:
         ordered = [
             candidate
             for _original_index, candidate in sorted(
@@ -157,8 +163,15 @@ class ExtractionPipeline:
                 key=lambda item: (item[1].sequence, item[0]),
             )
         ]
-        total = len(ordered)
-        self._emit_progress(0, total)
+        batch_total = len(ordered)
+        progress_offset = max(0, int(progress_offset))
+        minimum_total = progress_offset + batch_total
+        overall_total = (
+            minimum_total
+            if progress_total is None
+            else max(minimum_total, int(progress_total))
+        )
+        self._emit_progress(progress_offset, overall_total)
         outcomes: dict[int, ExtractionOutcome] = {}
         unresolved: list[tuple[int, DocumentCandidate]] = []
         completed = 0
@@ -181,7 +194,7 @@ class ExtractionPipeline:
                     )
                 except Exception:
                     pass
-            self._emit_progress(completed, total)
+            self._emit_progress(progress_offset + completed, overall_total)
 
         def stopped(candidate: DocumentCandidate) -> ExtractionOutcome:
             return ExtractionOutcome(
