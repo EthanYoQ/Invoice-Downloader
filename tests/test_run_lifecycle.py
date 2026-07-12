@@ -626,6 +626,7 @@ def test_controlled_run_config_and_audit_share_confined_canonical_locator(tmp_pa
     assert api.run_state == "completed"
     assert run_config_path.exists()
     run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+    assert run_config["run_id"] == handle.run_id
     assert Path(run_config["monitoring_dir"]) == confined_monitoring
     index_path = Path(run_config["truth_audit_index_path"])
     assert index_path.exists()

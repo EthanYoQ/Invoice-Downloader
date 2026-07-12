@@ -1220,7 +1220,12 @@ class InvoiceAppAPI:
         lifecycle_run_id = str(
             self._active_run_handle.run_id if self._active_run_handle is not None else ""
         )
-        paths = self._resolve_truth_audit_paths(self._run_context, lifecycle_run_id)
+        canonical_run_id = str(
+            lifecycle_run_id
+            or getattr(request, "run_id", "")
+            or self._current_run_id
+        )
+        paths = self._resolve_truth_audit_paths(self._run_context, canonical_run_id)
         from run_evidence import RevisionUnavailable, default_hardware
 
         hardware_mode, hardware_fingerprint = default_hardware()
@@ -1245,7 +1250,7 @@ class InvoiceAppAPI:
             str(paths.run_config_path),
             {
                 **serialize_run_context(self._run_context),
-                "run_id": self._current_run_id,
+                "run_id": canonical_run_id,
                 "staging_dir": self._active_staging_path(),
                 "monitoring_dir": str(paths.monitoring_dir),
                 "truth_audit_artifact_dir": str(paths.artifact_dir),
