@@ -30,6 +30,8 @@ class RunRequest:
     run_root: str = ""
     evidence_required: bool = False
     candidate_version: str = "source"
+    validation_required: bool = False
+    manifest_included_count: int = 0
 
 
 @dataclass(frozen=True)

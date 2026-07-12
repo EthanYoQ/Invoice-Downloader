@@ -10,8 +10,11 @@ import os
 from pathlib import Path
 import platform
 from decimal import Decimal
+import re
+import shutil
+import subprocess
+import sys
 import tempfile
-import threading
 import time
 from typing import Any, Callable, Mapping
 
@@ -45,18 +48,62 @@ def _utc_text(value: dt.datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def default_revision() -> str:
-    import subprocess
+class RevisionUnavailable(RuntimeError):
+    reason_code = "TRUSTED_REVISION_UNAVAILABLE"
+    user_message = "当前程序缺少可信构建版本信息。"
 
+    def __init__(self) -> None:
+        super().__init__("trusted_revision_unavailable")
+
+
+def _default_identity_paths() -> tuple[Path, ...]:
+    module_dir = Path(__file__).resolve().parent
+    paths = [module_dir / "build" / "windows" / "build-identity.generated.json"]
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        meipass = Path(getattr(sys, "_MEIPASS", module_dir)).resolve()
+        paths.insert(0, meipass / "build_meta" / "build-identity.generated.json")
+        paths.insert(
+            1,
+            Path(sys.executable).resolve().parent
+            / "_internal"
+            / "build_meta"
+            / "build-identity.generated.json",
+        )
+    return tuple(paths)
+
+
+def _full_revision(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[0-9a-f]{40}", text) else ""
+
+
+def default_revision(*, identity_paths: tuple[Path, ...] | None = None) -> str:
+    candidates = identity_paths if identity_paths is not None else _default_identity_paths()
+    for path in candidates:
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, Mapping):
+            revision = _full_revision(payload.get("source_revision"))
+            if revision:
+                return revision
+
+    git = shutil.which("git")
+    if not git:
+        raise RevisionUnavailable()
     completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        [git, "rev-parse", "HEAD"],
         cwd=Path(__file__).resolve().parent,
         capture_output=True,
         text=True,
         check=False,
         timeout=10,
     )
-    return completed.stdout.strip() if completed.returncode == 0 else ""
+    revision = _full_revision(completed.stdout if completed.returncode == 0 else "")
+    if not revision:
+        raise RevisionUnavailable()
+    return revision
 
 
 def default_hardware() -> tuple[str, str]:
@@ -161,14 +208,16 @@ class RunEvidenceWriter:
         hardware_resolver: Callable[[], tuple[str, str]] | None = None,
         monotonic: Callable[[], float] | None = None,
         utc_clock: Callable[[], dt.datetime] | None = None,
+        capture_promoter: Callable[[], None] | None = None,
     ) -> None:
         self._revision = revision_resolver or default_revision
         self._version = version_resolver or (lambda: "source")
         self._hardware = hardware_resolver or default_hardware
         self._monotonic = monotonic or time.monotonic
         self._utc_clock = utc_clock or (lambda: dt.datetime.now(UTC))
+        self._capture_promoter = capture_promoter or (lambda: None)
         self._captured: dict[str, _CapturedRun] = {}
-        self._lock = threading.Lock()
+        self._abandoned: set[str] = set()
 
     @staticmethod
     def _lineage(run_id: str, output_root: Path, archive_report: Any) -> list[dict[str, Any]]:
@@ -224,6 +273,13 @@ class RunEvidenceWriter:
                 or combined.get("model")
                 or "local"
             )
+            artifact_role = str(
+                metadata.get("artifact_role")
+                or metadata.get("document_role")
+                or combined.get("artifact_role")
+                or combined.get("document_role")
+                or ("invoice" if combined.get("InvoiceNumber") else "document")
+            )
             rows.append(
                 {
                     "run_id": run_id,
@@ -233,16 +289,7 @@ class RunEvidenceWriter:
                     "output_relative_path": relative,
                     "output_sha256": output_hash,
                     "output_size": output_size,
-                    "invoice_identity": {
-                        "invoice_code": str(combined.get("InvoiceCode") or combined.get("invoice_code") or ""),
-                        "invoice_number": str(combined.get("InvoiceNumber") or combined.get("invoice_number") or ""),
-                        "invoice_date": str(combined.get("Date") or combined.get("invoice_date") or ""),
-                        "amount": str(combined.get("Amount") or combined.get("amount") or ""),
-                        "seller": str(combined.get("Seller") or combined.get("seller") or ""),
-                        "purchaser": str(combined.get("Purchaser") or combined.get("purchaser") or ""),
-                        "document_type": str(combined.get("Type") or combined.get("document_type") or ""),
-                        "category": str(combined.get("category") or combined.get("expected_category") or ""),
-                    },
+                    "artifact_role": artifact_role,
                     "transformation_type": transformation,
                     "provider_type": provider,
                 }
@@ -250,8 +297,39 @@ class RunEvidenceWriter:
             seen_documents.add(document_id)
         return rows
 
-    def capture(self, context: Any, result: Any) -> None:
+    @staticmethod
+    def _quarantine_capture(context: Any, reason_code: str) -> None:
+        root = Path(context.run_root or context.output_dir).resolve()
+        marker = (
+            root
+            / "diagnostics"
+            / "quarantined"
+            / str(context.run_id)
+            / "evidence_capture_late.json"
+        )
+        atomic_write_json(
+            marker,
+            {
+                "run_id": str(context.run_id),
+                "status": "quarantined",
+                "reason_code": reason_code,
+            },
+        )
+
+    def abandon(self, context: Any) -> None:
+        run_id = str(context.run_id)
+        self._abandoned.add(run_id)
+        self._captured.pop(run_id, None)
+
+    def capture(
+        self,
+        context: Any,
+        result: Any,
+        *,
+        authorization: Callable[[], bool] | None = None,
+    ) -> bool:
         request = context.request
+        authorized = authorization or (lambda: True)
         revision = str(self._revision() or "").strip()
         version = str(self._version() or "").strip()
         hardware_mode, hardware_fingerprint = self._hardware()
@@ -269,6 +347,26 @@ class RunEvidenceWriter:
         }
         if not revision or not version or not all(scope.values()):
             raise ValueError("incomplete_production_evidence_scope")
+        lineage = self._lineage(
+            request.run_id,
+            Path(request.save_path),
+            result.archive_report,
+        )
+        validation_required = bool(getattr(request, "validation_required", False))
+        included_count = int(getattr(request, "manifest_included_count", 0) or 0)
+        processing_failed = bool(
+            str(getattr(result, "reason_code", "") or "")
+            or str(getattr(result, "error", "") or "")
+        )
+        if (
+            not lineage
+            and not bool(getattr(result, "cancelled", False))
+            and (
+                (validation_required and included_count > 0)
+                or processing_failed
+            )
+        ):
+            raise ValueError("required_lineage_empty")
         captured = _CapturedRun(
             run_id=request.run_id,
             run_root=Path(request.run_root).resolve(strict=True),
@@ -280,10 +378,18 @@ class RunEvidenceWriter:
             hardware_fingerprint=str(hardware_fingerprint),
             started_monotonic_seconds=str(context.started_monotonic_seconds),
             started_at_utc=str(context.started_at_utc),
-            lineage=self._lineage(request.run_id, Path(request.save_path), result.archive_report),
+            lineage=lineage,
         )
-        with self._lock:
-            self._captured[request.run_id] = captured
+        self._capture_promoter()
+        if not authorized() or request.run_id in self._abandoned:
+            self._quarantine_capture(context, "EVIDENCE_CAPTURE_AUTHORIZATION_REVOKED")
+            return False
+        self._captured[request.run_id] = captured
+        if not authorized() or request.run_id in self._abandoned:
+            self._captured.pop(request.run_id, None)
+            self._quarantine_capture(context, "EVIDENCE_CAPTURE_AUTHORIZATION_REVOKED")
+            return False
+        return True
 
     def capture_for_test(
         self, *, run_id: str, run_root: Path, output_root: Path, archive_report: Any
@@ -292,8 +398,7 @@ class RunEvidenceWriter:
 
     def finalize(self, context: Any, result: Any) -> Path:
         del result
-        with self._lock:
-            captured = self._captured.pop(context.run_id, None)
+        captured = self._captured.pop(context.run_id, None)
         if captured is None:
             raise ValueError("run_lineage_not_captured")
         entries: list[dict[str, Any]] = []
@@ -321,6 +426,8 @@ class RunEvidenceWriter:
             "run_root": str(captured.run_root),
             "candidate_revision": captured.candidate_revision,
             "candidate_version": captured.candidate_version,
+            "validation_required": bool(context.request.validation_required),
+            "manifest_included_count": int(context.request.manifest_included_count),
             "scope": captured.scope,
             "scope_digest": compute_scope_digest(captured.scope),
             "hardware_mode": captured.hardware_mode,

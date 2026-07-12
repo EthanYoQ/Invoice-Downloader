@@ -53,6 +53,8 @@ def test_run_request_is_frozen_and_contains_no_secret_fields(tmp_path: Path):
         "run_root",
         "evidence_required",
         "candidate_version",
+        "validation_required",
+        "manifest_included_count",
     }
     serialized = repr(request) + repr(asdict(request))
     assert "auth_code" not in serialized
@@ -473,6 +475,14 @@ def test_app_api_worker_delegates_to_coordinator_not_legacy_whole_run():
     assert "_run_processing_loop(" not in source
     assert "_effective_date_from" not in source
     assert "_active_run_config" not in source
+
+
+def test_app_api_admission_propagates_explicit_validation_contract():
+    from app_api import InvoiceAppAPI
+
+    source = inspect.getsource(InvoiceAppAPI._admit_processing_run)
+    assert "validation_required=" in source
+    assert "manifest_included_count=" in source
 
 
 def test_app_api_coordinator_setup_failure_releases_run_without_secret(tmp_path: Path, monkeypatch):

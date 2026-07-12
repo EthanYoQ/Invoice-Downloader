@@ -9,7 +9,6 @@ import json
 import os
 import posixpath
 import stat
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -24,7 +23,9 @@ from run_evidence import (
     compute_inventory_digest as compute_production_inventory_digest,
     compute_lineage_digest,
     compute_scope_digest as compute_evidence_scope_digest,
+    default_revision,
 )
+from artifact_verifier import verify_final_artifact
 
 
 UTC = dt.timezone.utc
@@ -39,6 +40,41 @@ PERFORMANCE_SCOPE_FIELDS = (
     "run_mode",
     "hardware_mode",
     "hardware_fingerprint",
+)
+PINNED_BASELINE_PAYLOAD: dict[str, Any] = {
+    "schema_version": 2,
+    "accepted": True,
+    "run_id": "refactor_range2_20251125_20260614_20260624_231421",
+    "run_root": (
+        "manual_program_runs/"
+        "refactor_range2_20251125_20260614_20260624_231421"
+    ),
+    "elapsed_seconds": "3262.55",
+    "scope": {
+        "date_from": "2025-11-25",
+        "date_to": "2026-06-14",
+        "before_exclusive": "2026-06-15",
+        "account_domain": "qq.com",
+        "account_channel": "qq",
+        "mailbox": "INBOX",
+        "target_identifier": "辉瑞",
+        "run_mode": "clean-mailbox",
+        "hardware_mode": "windows-desktop-standard",
+    },
+    "manifest_sha256": (
+        "c1ea5ac2e8ccc3cfa2f5f96d217ed8f8459a213f389b0654b116e6d9bc13c8b7"
+    ),
+    "inventory_sha256": (
+        "f44b7ba5dc2080133b13e6f8320ec386b8ddc621877b5549206673ceff96fe5d"
+    ),
+    "strict_digest": (
+        "212ffb87c0d8f29810f035737a4913512303ce917eaeee544ccbf9c029822aea"
+    ),
+    "source_revision": "unrecorded",
+    "hardware_fingerprint": "unrecorded",
+}
+PINNED_BASELINE_CONTRACT_SHA256 = (
+    "7b3d7058437874c1f15deb73dfba765327b7d30b06ad95c5065528f661b99e10"
 )
 
 
@@ -101,19 +137,9 @@ def canonical_windows_path(value: str | Path) -> str:
 
 def resolve_current_revision() -> str:
     try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as exc:
+        return default_revision()
+    except RuntimeError as exc:
         raise BatchValidationError("trusted_revision_unavailable") from exc
-    if not revision:
-        raise BatchValidationError("trusted_revision_unavailable")
-    return revision
 
 
 def _default_reparse_checker(path: Path) -> bool:
@@ -267,6 +293,12 @@ def compute_performance_record_digest(value: Mapping[str, Any]) -> str:
             if key not in {"record_digest", "contract_digest"}
         }
     )
+
+
+def pinned_baseline_contract() -> dict[str, Any]:
+    payload = json.loads(json.dumps(PINNED_BASELINE_PAYLOAD, ensure_ascii=False))
+    payload["contract_sha256"] = PINNED_BASELINE_CONTRACT_SHA256
+    return payload
 
 
 @dataclass(frozen=True)
@@ -431,6 +463,12 @@ class BatchValidator:
                         "canonical_path": row["canonical_path"],
                         "artifact_sha256": row["artifact_sha256"],
                         "document_id": row["document_id"],
+                        "artifact_verification_mode": row[
+                            "artifact_verification_mode"
+                        ],
+                        "artifact_verification_fields": row[
+                            "artifact_verification_fields"
+                        ],
                     }
                     for row in assignments
                 ],
@@ -591,6 +629,11 @@ class BatchValidator:
         inventory: InventorySnapshot,
         scope: Mapping[str, str],
     ) -> list[dict[str, Any]]:
+        if (
+            evidence.get("validation_required") is not True
+            or evidence.get("manifest_included_count") != len(truth.included)
+        ):
+            raise BatchValidationError("validation_evidence_scope_mismatch")
         evidence_scope = evidence.get("scope")
         if not isinstance(evidence_scope, Mapping) or dict(evidence_scope) != dict(scope):
             raise BatchValidationError("run_evidence_scope_mismatch")
@@ -644,9 +687,23 @@ class BatchValidator:
         by_path: dict[str, Mapping[str, Any]] = {}
         document_ids: set[str] = set()
         output_root = Path(inventory.root)
+        allowed_lineage_fields = {
+            "run_id",
+            "document_id",
+            "source_email_uid",
+            "source_chain_sha256s",
+            "output_relative_path",
+            "output_sha256",
+            "output_size",
+            "artifact_role",
+            "transformation_type",
+            "provider_type",
+        }
         for row in lineage:
             if not isinstance(row, Mapping):
                 raise BatchValidationError("invalid_document_lineage")
+            if set(row) != allowed_lineage_fields:
+                raise BatchValidationError("lineage_contains_forbidden_identity")
             document_id = str(row.get("document_id") or "").strip()
             relative = str(row.get("output_relative_path") or "").strip()
             source_uid = str(row.get("source_email_uid") or "").strip()
@@ -684,9 +741,11 @@ class BatchValidator:
                 for value in source_chain
             ):
                 raise BatchValidationError("invalid_document_lineage")
-            if not str(row.get("transformation_type") or "") or not str(row.get("provider_type") or ""):
-                raise BatchValidationError("invalid_document_lineage")
-            if not isinstance(row.get("invoice_identity"), Mapping):
+            if (
+                not str(row.get("artifact_role") or "")
+                or not str(row.get("transformation_type") or "")
+                or not str(row.get("provider_type") or "")
+            ):
                 raise BatchValidationError("invalid_document_lineage")
             document_ids.add(document_id)
             by_path[canonical] = row
@@ -705,12 +764,25 @@ class BatchValidator:
             strong_hashes.add(str(lineage_row["output_sha256"]).lower())
             if truth_row.artifact_sha256.lower() not in strong_hashes:
                 raise BatchValidationError("truth_lineage_mismatch", truth_row.truth_id)
+            verification = verify_final_artifact(
+                truth_row.to_mapping(),
+                assignment["matched_path"],
+                output_sha256=str(lineage_row["output_sha256"]),
+                source_chain_sha256s=list(lineage_row["source_chain_sha256s"]),
+            )
+            if not verification.passed:
+                raise BatchValidationError(
+                    "artifact_content_verification_failed",
+                    f"{truth_row.truth_id}:{verification.reason_code}",
+                )
             bound.append(
                 {
                     **assignment,
                     "document_id": str(lineage_row["document_id"]),
                     "source_email_uid": str(lineage_row["source_email_uid"]),
                     "lineage_output_sha256": str(lineage_row["output_sha256"]),
+                    "artifact_verification_mode": verification.verification_mode,
+                    "artifact_verification_fields": list(verification.matched_fields),
                 }
             )
         return bound
@@ -810,38 +882,22 @@ class BatchValidator:
 
 
 def _accepted_baseline(payload: Mapping[str, Any]) -> tuple[Decimal, dict[str, str], str]:
-    if int(payload.get("schema_version", 0) or 0) != 1 or payload.get("accepted") is not True:
+    expected = pinned_baseline_contract()
+    if dict(payload) != expected:
         raise BatchValidationError("invalid_baseline_contract")
-    if str(payload.get("contract_digest") or "") != compute_performance_record_digest(payload):
-        raise BatchValidationError("invalid_baseline_contract")
-    required = (
-        "run_id",
-        "run_root",
-        "revision",
-        "inventory_sha256",
-        "strict_digest",
-        "manifest_sha256",
-        "hardware_mode",
-        "hardware_fingerprint",
-    )
-    if not all(str(payload.get(field) or "").strip() for field in required):
-        raise BatchValidationError("invalid_baseline_contract")
-    scope = payload.get("scope")
-    if not isinstance(scope, Mapping) or not all(str(value or "").strip() for value in scope.values()):
-        raise BatchValidationError("invalid_baseline_contract")
-    normalized_scope = {str(key): str(value) for key, value in scope.items()}
-    if str(payload.get("scope_digest") or "") != _sha256_json(normalized_scope):
-        raise BatchValidationError("invalid_baseline_contract")
+    canonical = {
+        key: value for key, value in payload.items() if key != "contract_sha256"
+    }
     if (
-        normalized_scope.get("hardware_mode") != str(payload.get("hardware_mode"))
-        or normalized_scope.get("hardware_fingerprint")
-        != str(payload.get("hardware_fingerprint"))
+        _sha256_json(canonical) != PINNED_BASELINE_CONTRACT_SHA256
+        or payload.get("contract_sha256") != PINNED_BASELINE_CONTRACT_SHA256
     ):
         raise BatchValidationError("invalid_baseline_contract")
-    elapsed = _decimal(payload.get("elapsed_seconds"), code="invalid_baseline_contract")
-    if elapsed <= 0:
-        raise BatchValidationError("invalid_baseline_contract")
-    return elapsed, normalized_scope, str(payload["contract_digest"])
+    return (
+        Decimal("3262.55"),
+        {str(key): str(value) for key, value in PINNED_BASELINE_PAYLOAD["scope"].items()},
+        PINNED_BASELINE_CONTRACT_SHA256,
+    )
 
 
 def _revalidate_candidate_report(
@@ -902,9 +958,9 @@ def compare_performance(
         Path(candidate_json), revision_resolver=resolver
     )
     candidate_scope = dict(candidate_result.scope)
-    if baseline_scope != candidate_scope:
+    if any(candidate_scope.get(key) != value for key, value in baseline_scope.items()):
         raise BatchValidationError("performance_contract_mismatch")
-    if str(baseline_payload.get("manifest_sha256") or "") != candidate_result.manifest_sha256:
+    if PINNED_BASELINE_PAYLOAD["manifest_sha256"] != candidate_result.manifest_sha256:
         raise BatchValidationError("performance_contract_mismatch")
     if baseline_payload.get("run_id") == candidate_result.run_id:
         raise BatchValidationError("performance_run_reused")
@@ -920,7 +976,7 @@ def compare_performance(
         speedup_fraction=format(speedup, ".8f"),
         threshold_fraction=format(threshold, ".2f"),
         scope_digest=candidate_result.scope_digest,
-        baseline_revision=str(baseline_payload["revision"]),
+        baseline_revision=str(PINNED_BASELINE_PAYLOAD["source_revision"]),
         candidate_revision=candidate_result.candidate_revision,
         baseline_record_digest=baseline_record,
         candidate_record_digest=candidate_result.validation_digest,

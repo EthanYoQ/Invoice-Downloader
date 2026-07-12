@@ -54,12 +54,16 @@ class ReportService:
         cleanup_callback: Callable[[RunFinalizationContext], Any] | None = None,
         evidence_writer: Any = None,
         timeout_seconds: float = 120.0,
+        evidence_capture_timeout_seconds: float = 120.0,
     ):
         self._report_callback = report_callback
         self._disconnect_callback = disconnect_callback
         self._cleanup_callback = cleanup_callback
         self._evidence_writer = evidence_writer
         self._timeout_seconds = max(0.001, float(timeout_seconds))
+        self._evidence_capture_timeout_seconds = max(
+            0.001, float(evidence_capture_timeout_seconds)
+        )
 
     def _bounded(self, name: str, callback: Callable[[], Any]) -> Callable[[], None]:
         def invoke() -> None:
@@ -103,7 +107,48 @@ class ReportService:
                 raise ValueError("production_evidence_writer_required")
             def capture_evidence() -> None:
                 nonlocal evidence_captured
-                self._evidence_writer.capture(context, result)
+                done = threading.Event()
+                abandoned = threading.Event()
+                failure: list[BaseException] = []
+                promoted: list[bool] = []
+
+                def runner() -> None:
+                    try:
+                        promoted.append(
+                            bool(
+                                self._evidence_writer.capture(
+                                    context,
+                                    result,
+                                    authorization=lambda: not abandoned.is_set(),
+                                )
+                            )
+                        )
+                    except BaseException as exc:
+                        failure.append(exc)
+                    finally:
+                        done.set()
+
+                thread = threading.Thread(
+                    target=runner,
+                    name=f"EvidenceCapture-{context.run_id}",
+                    daemon=True,
+                )
+                try:
+                    thread.start()
+                except BaseException as exc:
+                    abandoned.set()
+                    self._evidence_writer.abandon(context)
+                    raise FinalizerCallbackError("evidence_capture", exc) from None
+                if not done.wait(self._evidence_capture_timeout_seconds):
+                    abandoned.set()
+                    self._evidence_writer.abandon(context)
+                    raise FinalizerTimeoutError("evidence_capture")
+                if failure:
+                    self._evidence_writer.abandon(context)
+                    raise failure[0]
+                if promoted != [True]:
+                    self._evidence_writer.abandon(context)
+                    raise ValueError("evidence_capture_not_promoted")
                 evidence_captured = True
 
             callbacks.append(("evidence_capture", capture_evidence))

@@ -3368,6 +3368,12 @@ class InvoiceAppAPI:
                     candidate_version=str(
                         self._run_context.get("candidate_version") or "source"
                     ),
+                    validation_required=bool(
+                        self._run_context.get("validation_required", False)
+                    ),
+                    manifest_included_count=int(
+                        self._run_context.get("manifest_included_count", 0) or 0
+                    ),
                 )
                 dependencies = self._build_run_dependencies(
                     request,

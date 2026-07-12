@@ -220,7 +220,7 @@ def guarded_dynamic(name, *args, **kwargs):
 builtins.__import__ = guarded
 importlib.import_module = guarded_dynamic
 sys.path.insert(0, sys.argv[1])
-for module in ('truth_contracts', 'strict_truth_audit', 'run_evidence', 'batch_validation'):
+for module in ('truth_contracts', 'strict_truth_audit', 'artifact_verifier', 'run_evidence', 'batch_validation'):
     importlib.import_module(module)
 print('independent-import-ok')
 """
@@ -239,6 +239,7 @@ def test_no_hidden_dynamic_runtime_imports_and_offline_builder_has_no_top_level_
     for name in (
         "truth_contracts.py",
         "strict_truth_audit.py",
+        "artifact_verifier.py",
         "run_evidence.py",
         "batch_validation.py",
     ):

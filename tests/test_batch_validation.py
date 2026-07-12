@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -7,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import fitz
 
 from batch_validation import (
     BatchValidationError,
@@ -14,7 +16,6 @@ from batch_validation import (
     canonical_windows_path,
     compare_performance,
     compute_inventory,
-    compute_performance_record_digest,
 )
 from run_evidence import (
     compute_evidence_digest,
@@ -33,6 +34,7 @@ def _manifest(rows=1) -> dict:
     included = []
     for index in range(rows):
         suffix = index + 1
+        truth_sha = hashlib.sha256(f"artifact-{suffix}".encode()).hexdigest()
         included.append({
             "truth_id": f"t{suffix}",
             "truth_status": "included",
@@ -49,8 +51,8 @@ def _manifest(rows=1) -> dict:
             "amount": f"{suffix * 100}.00",
             "invoice_number": str(12345677 + suffix),
             "invoice_code": "",
-            "sha256": f"{suffix:x}" * 64,
-            "evidence": [{"sha256": f"{suffix:x}" * 64, "bytes": suffix * 100}],
+            "sha256": truth_sha,
+            "evidence": [{"sha256": truth_sha, "bytes": len(f"artifact-{suffix}".encode())}],
         })
     return {
         "summary": {
@@ -110,20 +112,11 @@ def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
             "run_id": "run-1",
             "document_id": f"doc-{suffix}",
             "source_email_uid": str(99 + suffix),
-            "source_chain_sha256s": [f"{suffix:x}" * 64],
+            "source_chain_sha256s": [hashlib.sha256(f"artifact-{suffix}".encode()).hexdigest()],
             "output_relative_path": f"餐饮/invoice-{suffix}.pdf",
             "output_sha256": artifact_sha,
             "output_size": len(artifact_bytes),
-            "invoice_identity": {
-                "invoice_code": "",
-                "invoice_number": str(12345677 + suffix),
-                "invoice_date": "2026-06-10",
-                "amount": f"{suffix * 100}.00",
-                "seller": f"标准商户{suffix}",
-                "purchaser": "目标公司",
-                "document_type": "餐饮",
-                "category": "餐饮",
-            },
+            "artifact_role": "invoice",
             "transformation_type": "attachment",
             "provider_type": "local",
         })
@@ -143,6 +136,8 @@ def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
         "active_run_config": {"company": "目标公司"},
         "candidate_revision": REVISION,
         "candidate_version": VERSION,
+        "validation_required": True,
+        "manifest_included_count": rows,
     })
     scope = {
         "date_from": "2026-06-01",
@@ -177,6 +172,8 @@ def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
         "hardware_fingerprint": "host-fixture-v1",
         "candidate_revision": REVISION,
         "candidate_version": VERSION,
+        "validation_required": True,
+        "manifest_included_count": rows,
         "scope": scope,
         "scope_digest": compute_evidence_scope_digest(scope),
         "lineage": lineage,
@@ -191,6 +188,30 @@ def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
 
 def _validator(**kwargs) -> BatchValidator:
     return BatchValidator(revision_resolver=lambda: REVISION, **kwargs)
+
+
+def _rebind_output_evidence(root: Path) -> None:
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    for row in evidence["lineage"]:
+        path = root / "output" / row["output_relative_path"]
+        payload = path.read_bytes()
+        row["output_sha256"] = hashlib.sha256(payload).hexdigest()
+        row["output_size"] = len(payload)
+    evidence["lineage_digest"] = compute_lineage_digest(evidence["lineage"])
+    evidence["output_inventory"] = [
+        {
+            "relative_path": row["output_relative_path"],
+            "size": row["output_size"],
+            "sha256": row["output_sha256"],
+        }
+        for row in evidence["lineage"]
+    ]
+    evidence["inventory_sha256"] = compute_production_inventory_digest(
+        evidence["output_inventory"]
+    )
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
 
 
 def _write_bound_supplied_audit(root: Path, result, **overrides) -> Path:
@@ -286,8 +307,33 @@ def test_candidate_run_without_lineage_fails_closed(tmp_path):
     assert exc_info.value.code == "missing_document_lineage"
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("validation_required", False), ("manifest_included_count", 0)],
+)
+def test_batch_validator_requires_matching_validation_truth_count(tmp_path, field, value):
+    root = _run_root(tmp_path)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence[field] = value
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code == "validation_evidence_scope_mismatch"
+
+
 def test_weak_business_match_cannot_satisfy_truth_without_content_lineage(tmp_path):
     root = _run_root(tmp_path)
+    artifact = root / "output" / "餐饮" / "invoice-1.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Invoice Number: 12345678")
+    document.save(artifact)
+    document.close()
+    _rebind_output_evidence(root)
     evidence_path = root / "diagnostics" / "run_evidence.json"
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     evidence["lineage"][0]["source_chain_sha256s"] = ["f" * 64]
@@ -330,6 +376,22 @@ def test_top_level_hardware_is_bound_to_evidence_scope(tmp_path):
     assert exc_info.value.code == "run_evidence_scope_mismatch"
 
 
+def test_lineage_rejects_clear_financial_identity_fields(tmp_path):
+    root = _run_root(tmp_path)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["lineage"][0]["seller"] = "Clear Seller"
+    evidence["lineage"][0]["invoice_number"] = "12345678"
+    evidence["lineage_digest"] = compute_lineage_digest(evidence["lineage"])
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code == "lineage_contains_forbidden_identity"
+
+
 def test_replaced_output_bytes_fail_even_when_weak_fields_still_match(tmp_path):
     root = _run_root(tmp_path)
     (root / "output" / "餐饮" / "invoice-1.pdf").write_bytes(b"arbitrary replacement")
@@ -338,6 +400,39 @@ def test_replaced_output_bytes_fail_even_when_weak_fields_still_match(tmp_path):
         _validator().validate(_manifest(), root)
 
     assert exc_info.value.code in {"run_evidence_inventory_mismatch", "lineage_output_mismatch"}
+
+
+@pytest.mark.parametrize("payload", [b"arbitrary replacement", b"", b"%PDF-corrupt"])
+def test_recomputed_lineage_cannot_hide_invalid_transformed_output(tmp_path, payload):
+    root = _run_root(tmp_path)
+    artifact = root / "output" / "餐饮" / "invoice-1.pdf"
+    artifact.write_bytes(payload)
+    _rebind_output_evidence(root)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code == "artifact_content_verification_failed"
+
+
+def test_recomputed_lineage_allows_valid_transformed_output_with_strong_identity(tmp_path):
+    root = _run_root(tmp_path)
+    artifact = root / "output" / "餐饮" / "invoice-1.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "Invoice Number: 12345678\nInvoice Date: 2026-06-10\n"
+        "Total Amount: 100.00\nSeller: Standard Merchant 1",
+    )
+    document.save(artifact)
+    document.close()
+    _rebind_output_evidence(root)
+
+    result = _validator().validate(_manifest(), root)
+
+    assert result.passed is True
+    assert result.assignments[0]["artifact_verification_mode"] == "transformed_content_identity"
 
 
 def test_tampered_supplied_audit_is_ignored_in_favor_of_fresh_evidence(tmp_path):
@@ -485,32 +580,35 @@ def _candidate_report(tmp_path: Path, *, seconds: str):
     return root, manifest_path, report_path, result
 
 
-def _baseline_contract(path: Path, candidate_result, *, seconds="3262.55") -> Path:
-    payload = {
-        "schema_version": 1,
-        "accepted": True,
-        "run_id": "accepted-baseline-run",
-        "run_root": "C:/accepted/baseline/run",
-        "revision": "baseline-d46a504",
-        "elapsed_seconds": seconds,
-        "scope": dict(candidate_result.scope),
-        "scope_digest": candidate_result.scope_digest,
-        "hardware_mode": candidate_result.scope["hardware_mode"],
-        "hardware_fingerprint": candidate_result.scope["hardware_fingerprint"],
-        "inventory_sha256": "b" * 64,
-        "strict_digest": "c" * 64,
-        "manifest_sha256": candidate_result.manifest_sha256,
+def _baseline_contract(path: Path, candidate_result, monkeypatch) -> Path:
+    import batch_validation as module
+
+    payload = json.loads(json.dumps(module.PINNED_BASELINE_PAYLOAD, ensure_ascii=False))
+    payload["scope"] = {
+        key: str(candidate_result.scope[key]) for key in payload["scope"]
     }
-    payload["contract_digest"] = compute_performance_record_digest(payload)
-    return _write_json(path, payload)
+    payload["manifest_sha256"] = candidate_result.manifest_sha256
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    monkeypatch.setattr(module, "PINNED_BASELINE_PAYLOAD", payload)
+    monkeypatch.setattr(module, "PINNED_BASELINE_CONTRACT_SHA256", digest)
+    return _write_json(path, module.pinned_baseline_contract())
 
 
 @pytest.mark.parametrize(("candidate", "passed"), [("2283.79", True), ("2283.80", False)])
-def test_performance_threshold_is_decimal_and_inclusive(tmp_path, candidate, passed):
+def test_performance_threshold_is_decimal_and_inclusive(
+    tmp_path, monkeypatch, candidate, passed
+):
     _root, _manifest_path, candidate_path, result = _candidate_report(
         tmp_path, seconds=candidate
     )
-    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    baseline = _baseline_contract(tmp_path / "baseline.json", result, monkeypatch)
 
     verdict = compare_performance(
         baseline,
@@ -521,15 +619,15 @@ def test_performance_threshold_is_decimal_and_inclusive(tmp_path, candidate, pas
     assert verdict.target_seconds == "2283.79"
     assert verdict.passed is passed
     assert verdict.scope_digest == result.scope_digest
-    assert verdict.baseline_revision == "baseline-d46a504"
+    assert verdict.baseline_revision == "unrecorded"
     assert verdict.candidate_revision == REVISION
 
 
-def test_forged_caller_created_candidate_report_cannot_pass(tmp_path):
+def test_forged_caller_created_candidate_report_cannot_pass(tmp_path, monkeypatch):
     _root, _manifest_path, report_path, result = _candidate_report(
         tmp_path, seconds="2283.79"
     )
-    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    baseline = _baseline_contract(tmp_path / "baseline.json", result, monkeypatch)
     forged = json.loads(report_path.read_text(encoding="utf-8"))
     forged["validation_digest"] = "f" * 64
     _write_json(report_path, forged)
@@ -540,11 +638,11 @@ def test_forged_caller_created_candidate_report_cannot_pass(tmp_path):
     assert exc_info.value.code == "candidate_validation_report_mismatch"
 
 
-def test_independent_candidate_metrics_json_is_rejected(tmp_path):
+def test_independent_candidate_metrics_json_is_rejected(tmp_path, monkeypatch):
     _root, _manifest_path, _report_path, result = _candidate_report(
         tmp_path / "real", seconds="2283.79"
     )
-    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    baseline = _baseline_contract(tmp_path / "baseline.json", result, monkeypatch)
     arbitrary = _write_json(tmp_path / "candidate.json", {
         "run_id": "invented",
         "elapsed_seconds": "1.00",
@@ -557,11 +655,11 @@ def test_independent_candidate_metrics_json_is_rejected(tmp_path):
     assert exc_info.value.code == "candidate_validation_report_invalid"
 
 
-def test_candidate_timing_tampering_invalidates_revalidation(tmp_path):
+def test_candidate_timing_tampering_invalidates_revalidation(tmp_path, monkeypatch):
     root, _manifest_path, report_path, result = _candidate_report(
         tmp_path, seconds="2283.79"
     )
-    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    baseline = _baseline_contract(tmp_path / "baseline.json", result, monkeypatch)
     evidence_path = root / "diagnostics" / "run_evidence.json"
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     evidence["elapsed_seconds"] = "1.00"
@@ -575,24 +673,57 @@ def test_candidate_timing_tampering_invalidates_revalidation(tmp_path):
     assert exc_info.value.code == "candidate_validation_report_mismatch"
 
 
-@pytest.mark.parametrize("field", ["hardware_fingerprint", "account_domain", "run_mode"])
-def test_baseline_scope_or_hardware_mismatch_is_rejected(tmp_path, field):
+@pytest.mark.parametrize("field", ["hardware_mode", "account_domain", "run_mode"])
+def test_baseline_scope_or_hardware_mismatch_is_rejected(
+    tmp_path, monkeypatch, field
+):
     _root, _manifest_path, report_path, result = _candidate_report(
         tmp_path, seconds="2283.79"
     )
-    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    baseline = _baseline_contract(tmp_path / "baseline.json", result, monkeypatch)
     payload = json.loads(baseline.read_text(encoding="utf-8"))
     payload["scope"][field] = "different"
-    if field in {"hardware_mode", "hardware_fingerprint"}:
-        payload[field] = "different"
-    payload["scope_digest"] = compute_evidence_scope_digest(payload["scope"])
-    payload["contract_digest"] = compute_performance_record_digest(payload)
+    canonical = {key: value for key, value in payload.items() if key != "contract_sha256"}
+    payload["contract_sha256"] = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     _write_json(baseline, payload)
 
     with pytest.raises(BatchValidationError) as exc_info:
         compare_performance(baseline, report_path, revision_resolver=lambda: REVISION)
 
-    assert exc_info.value.code == "performance_contract_mismatch"
+    assert exc_info.value.code == "invalid_baseline_contract"
+
+
+def test_caller_cannot_replace_pinned_baseline_with_fake_5000_seconds(
+    tmp_path, monkeypatch
+):
+    _root, _manifest_path, report_path, result = _candidate_report(
+        tmp_path, seconds="3000.00"
+    )
+    fake = _baseline_contract(tmp_path / "fake-baseline.json", result, monkeypatch)
+    payload = json.loads(fake.read_text(encoding="utf-8"))
+    payload["elapsed_seconds"] = "5000.00"
+    canonical = {key: value for key, value in payload.items() if key != "contract_sha256"}
+    payload["contract_sha256"] = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    _write_json(fake, payload)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        compare_performance(fake, report_path, revision_resolver=lambda: REVISION)
+
+    assert exc_info.value.code == "invalid_baseline_contract"
 
 
 def test_cli_remains_path_only_and_credential_free(tmp_path):

@@ -48,6 +48,8 @@ def _empty_run_context():
         "autostart_mode": "",
         "autostart_delay_ms": 0,
         "autostart_token": "",
+        "validation_required": False,
+        "manifest_included_count": 0,
     }
 
 
@@ -115,6 +117,13 @@ def load_run_context():
     except (TypeError, ValueError):
         autostart_delay_ms = 0
     autostart_token = str(file_context.get("autostart_token", "")).strip() if autostart_enabled else ""
+    validation_required = bool(file_context.get("validation_required", False))
+    try:
+        manifest_included_count = max(
+            0, int(file_context.get("manifest_included_count", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        manifest_included_count = 0
 
     return {
         "enabled": enabled,
@@ -136,6 +145,10 @@ def load_run_context():
         "autostart_delay_ms": autostart_delay_ms if controlled_run else 0,
         "autostart_token": autostart_token if controlled_run else "",
         "controlled_run": controlled_run,
+        "validation_required": bool(validation_required and controlled_run),
+        "manifest_included_count": (
+            manifest_included_count if validation_required and controlled_run else 0
+        ),
     }
 
 
@@ -183,4 +196,8 @@ def serialize_run_context(context):
         "autostart_mode": context.get("autostart_mode", ""),
         "autostart_delay_ms": int(context.get("autostart_delay_ms", 0) or 0),
         "autostart_token": context.get("autostart_token", ""),
+        "validation_required": bool(context.get("validation_required", False)),
+        "manifest_included_count": int(
+            context.get("manifest_included_count", 0) or 0
+        ),
     }
