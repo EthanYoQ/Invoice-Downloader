@@ -342,6 +342,71 @@ def test_proxy_get_failover_pins_each_connect_target_with_original_host_and_tls_
     assert all(options["server_hostname"] == "invoice.example" for _, options in proxy_factories)
 
 
+def test_proxy_failure_can_fallback_to_verified_direct_source_address():
+    class AlwaysFailManager:
+        def request(self, method, url, **kwargs):
+            raise urllib3.exceptions.ConnectTimeoutError(
+                None, "SYNTHETIC_PROXY_FAILURE"
+            )
+
+    successful_raw = FakeRawResponse(data=b"direct-source")
+    successful_manager = FakeManager(successful_raw)
+    direct_factories = []
+
+    def pool_factory(**kwargs):
+        direct_factories.append(kwargs)
+        return successful_manager
+
+    transport = PinnedHttpTransport(
+        pool_manager_factory=pool_factory,
+        proxy_manager_factory=lambda proxy_url, **kwargs: AlwaysFailManager(),
+        source_address_resolver=lambda: [
+            "198.18.0.1",
+            "172.20.128.1",
+            "192.168.50.239",
+        ],
+    )
+
+    response = transport.request(
+        requests.Session(),
+        "GET",
+        proxy_target(),
+        allow_direct_source_fallback=True,
+        max_response_bytes=1024,
+    )
+
+    assert response.content == b"direct-source"
+    assert direct_factories[0]["source_address"] == ("192.168.50.239", 0)
+    assert all(
+        options["source_address"][0] != "198.18.0.1"
+        for options in direct_factories
+    )
+    assert direct_factories[0]["assert_hostname"] == "invoice.example"
+    assert successful_manager.calls[0][1].startswith(
+        "https://93.184.216.34/"
+    )
+
+
+def test_proxy_failure_does_not_bypass_proxy_without_explicit_opt_in():
+    class AlwaysFailManager:
+        def request(self, method, url, **kwargs):
+            raise urllib3.exceptions.ConnectTimeoutError(
+                None, "SYNTHETIC_PROXY_FAILURE"
+            )
+
+    direct_factories = []
+    transport = PinnedHttpTransport(
+        pool_manager_factory=lambda **kwargs: direct_factories.append(kwargs),
+        proxy_manager_factory=lambda proxy_url, **kwargs: AlwaysFailManager(),
+        source_address_resolver=lambda: ["192.168.50.239"],
+    )
+
+    with pytest.raises(Exception, match="pinned transport connection failed"):
+        transport.request(requests.Session(), "GET", proxy_target())
+
+    assert direct_factories == []
+
+
 def test_post_connect_failure_is_not_replayed_to_second_ip_and_error_is_sanitized():
     class AlwaysFailManager:
         def __init__(self):

@@ -1,7 +1,8 @@
 import ipaddress
 import json
+import socket
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -92,11 +93,60 @@ class PinnedHttpTransport:
         self,
         pool_manager_factory=None,
         proxy_manager_factory=None,
+        source_address_resolver=None,
     ):
         self._pool_manager_factory = pool_manager_factory or urllib3.PoolManager
         self._proxy_manager_factory = proxy_manager_factory or urllib3.ProxyManager
+        self._source_address_resolver = (
+            source_address_resolver or self._default_source_addresses
+        )
         self._managers = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _default_source_addresses():
+        try:
+            values = {
+                item[4][0]
+                for item in socket.getaddrinfo(
+                    socket.gethostname(),
+                    None,
+                    family=socket.AF_INET,
+                    type=socket.SOCK_STREAM,
+                )
+            }
+        except OSError:
+            return ()
+        return tuple(values)
+
+    def _eligible_direct_sources(self):
+        benchmark = ipaddress.ip_network("198.18.0.0/15")
+        candidates = []
+        for value in self._source_address_resolver() or ():
+            try:
+                address = ipaddress.ip_address(str(value))
+            except ValueError:
+                continue
+            if (
+                address.version != 4
+                or not address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_unspecified
+                or address in benchmark
+            ):
+                continue
+            candidates.append(address.compressed)
+
+        def priority(value):
+            address = ipaddress.ip_address(value)
+            if address in ipaddress.ip_network("192.168.0.0/16"):
+                return 0, value
+            if address in ipaddress.ip_network("10.0.0.0/8"):
+                return 1, value
+            return 2, value
+
+        return tuple(sorted(dict.fromkeys(candidates), key=priority))
 
     @staticmethod
     def build_plan(
@@ -157,13 +207,14 @@ class PinnedHttpTransport:
             proxy_connect_authority=proxy_connect_authority,
         )
 
-    def _manager_for(self, target, plan):
+    def _manager_for(self, target, plan, source_address=None):
         key = (
             urlsplit(plan.original_url).scheme.lower(),
             target.host,
             target.port,
             plan.selected_ip,
             plan.proxy_url,
+            source_address,
         )
         with self._lock:
             manager = self._managers.get(key)
@@ -171,6 +222,8 @@ class PinnedHttpTransport:
                 return manager
 
             kwargs = {"num_pools": 4}
+            if source_address:
+                kwargs["source_address"] = (source_address, 0)
             if urlsplit(plan.original_url).scheme.lower() == "https":
                 kwargs.update(
                     {
@@ -277,6 +330,8 @@ class PinnedHttpTransport:
         decode_content=True,
         max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
         read_body=True,
+        allow_direct_source_fallback=False,
+        _source_address=None,
     ):
         prepared = self._prepare_request(
             session,
@@ -305,7 +360,9 @@ class PinnedHttpTransport:
                     selected_ip=selected_ip,
                     original_url=prepared.url,
                 )
-                manager = self._manager_for(target, plan)
+                manager = self._manager_for(
+                    target, plan, source_address=_source_address
+                )
                 wire_headers = CaseInsensitiveDict(prepared.headers)
                 wire_headers["Host"] = plan.host_header
                 raw = manager.request(
@@ -350,8 +407,36 @@ class PinnedHttpTransport:
             except self.RETRYABLE_TRANSPORT_ERRORS:
                 if selected_ip != addresses[-1]:
                     continue
-                raise PinnedHttpConnectionError() from None
+                break
             finally:
                 self._dispose_raw_response(raw, reusable=body_consumed)
 
+        if (
+            allow_direct_source_fallback
+            and target.proxy_endpoint is not None
+            and method_name in {"GET", "HEAD"}
+        ):
+            direct_target = replace(target, proxy_endpoint=None)
+            for source_address in self._eligible_direct_sources():
+                try:
+                    return self.request(
+                        session,
+                        method,
+                        direct_target,
+                        headers=headers,
+                        body=body,
+                        data=data,
+                        json=json,
+                        files=files,
+                        params=params,
+                        timeout=timeout,
+                        suppress_auth=suppress_auth,
+                        decode_content=decode_content,
+                        max_response_bytes=max_response_bytes,
+                        read_body=read_body,
+                        allow_direct_source_fallback=False,
+                        _source_address=source_address,
+                    )
+                except PinnedHttpConnectionError:
+                    continue
         raise PinnedHttpConnectionError()

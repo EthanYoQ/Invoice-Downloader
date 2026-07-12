@@ -54,7 +54,12 @@ def infer_direct_invoice_family(url):
         return "chinatax_direct_invoice"
     if host == "fp.bwjf.cn" and (path.startswith("/u/") or path.startswith("/downsigninvoice")):
         return "bwjf_signed_invoice"
-    if host == "sdapi.fpyun.com.cn" and path == "/invoice/qd/download/getinvoicefile":
+    if (
+        parsed.scheme.lower() == "https"
+        and parsed.port in {None, 443}
+        and host == "sdapi.fpyun.com.cn"
+        and path == "/invoice/qd/download/getinvoicefile"
+    ):
         return "fpyun_direct_invoice"
     if host == "nnfp.jss.com.cn":
         if path == "/scan-invoice/printqrcode" or path.startswith("/invoice/scan/"):

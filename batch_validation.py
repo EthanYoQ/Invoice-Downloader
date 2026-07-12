@@ -24,6 +24,7 @@ from run_evidence import (
     compute_lineage_digest,
     compute_scope_digest as compute_evidence_scope_digest,
     default_revision,
+    validate_finalized_run_evidence,
 )
 from artifact_verifier import verify_final_artifact
 
@@ -634,6 +635,10 @@ class BatchValidator:
         inventory: InventorySnapshot,
         scope: Mapping[str, str],
     ) -> list[dict[str, Any]]:
+        try:
+            validate_finalized_run_evidence(evidence, Path(inventory.root).parent)
+        except ValueError as exc:
+            raise BatchValidationError(str(exc) or "invalid_run_evidence") from exc
         if (
             evidence.get("validation_required") is not True
             or evidence.get("manifest_included_count") != len(truth.included)
@@ -816,6 +821,14 @@ class BatchValidator:
             raise BatchValidationError("invalid_audit_result")
         if canonical_windows_path(str(audit.get("run_root") or "")) != canonical_windows_path(str(root)):
             raise BatchValidationError("scope_mismatch", "fresh audit root")
+        authority = audit.get("audit_authority")
+        if not isinstance(authority, Mapping):
+            raise BatchValidationError("invalid_audit_result")
+        if authority.get("authoritative") is not True:
+            reasons = authority.get("reasons", [])
+            if isinstance(reasons, list) and reasons:
+                raise BatchValidationError(str(reasons[0]))
+            raise BatchValidationError("strict_audit_not_authoritative")
         counts = cls._strict_counts(audit)
         if any(count != 0 for count in counts.values()):
             raise BatchValidationError("strict_audit_failed")

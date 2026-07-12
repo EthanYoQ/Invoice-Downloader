@@ -366,8 +366,14 @@ class SessionFakePinnedTransport:
         suppress_auth=False,
         decode_content=True,
         max_response_bytes=None,
+        allow_direct_source_fallback=False,
     ):
-        del suppress_auth, decode_content, max_response_bytes
+        del (
+            suppress_auth,
+            decode_content,
+            max_response_bytes,
+            allow_direct_source_fallback,
+        )
         kwargs = {
             "headers": dict(headers or {}),
             "allow_redirects": False,
@@ -476,6 +482,233 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
 
         self.assertEqual(result.content, b"%PDF-1.5\npublic")
         self.assertEqual(len(transport.calls), 1)
+
+    def test_direct_source_fallback_is_scoped_to_fpyun_download_host(self):
+        response = FakePinnedResponse(
+            "https://sdapi.fpyun.com.cn/invoice.pdf",
+            content=b"%PDF-1.5\npublic",
+            headers={"Content-Type": "application/pdf"},
+        )
+        transport = RecordingPinnedTransport(response=response)
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+
+        converter._probe_direct_invoice_artifact(
+            object(),
+            "https://sdapi.fpyun.com.cn/invoice/qd/download/"
+            "getInvoiceFile?fptqm=opaque&type=1",
+            str(Path(converter.staging_dir) / "fpyun"),
+        )
+        converter._probe_direct_invoice_artifact(
+            object(),
+            "https://public.example/invoice.pdf",
+            str(Path(converter.staging_dir) / "ordinary"),
+        )
+
+        assert transport.calls[0][3]["allow_direct_source_fallback"] is True
+        assert transport.calls[1][3]["allow_direct_source_fallback"] is False
+
+    def test_direct_source_fallback_requires_exact_secure_fpyun_entry(self):
+        response = FakePinnedResponse(
+            "https://sdapi.fpyun.com.cn/other",
+            content=b"<html></html>",
+            headers={"Content-Type": "text/html"},
+        )
+        transport = RecordingPinnedTransport(response=response)
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+
+        converter._probe_direct_invoice_artifact(
+            object(),
+            "https://sdapi.fpyun.com.cn/other?fptqm=opaque&type=1",
+            str(Path(converter.staging_dir) / "wrong-path"),
+        )
+
+        assert transport.calls[0][3]["allow_direct_source_fallback"] is False
+
+    def test_http_fpyun_entry_is_not_a_direct_invoice_provider(self):
+        assert infer_direct_invoice_family(
+            "http://sdapi.fpyun.com.cn/invoice/qd/download/"
+            "getInvoiceFile?fptqm=opaque&type=1"
+        ) == ""
+
+    def test_fpyun_legacy_redirect_is_pinned_and_final_download_is_upgraded(self):
+        class RedirectTransport:
+            def __init__(self):
+                self.targets = []
+
+            def request(self, session, method, target, **kwargs):
+                self.targets.append(target)
+                if len(self.targets) == 1:
+                    return FakePinnedResponse(
+                        target.url,
+                        status_code=302,
+                        headers={
+                            "Location": (
+                                "http://93.184.216.34:7100/qd/download/"
+                                "getInvoiceFile?fptqm=opaque&type=1"
+                            )
+                        },
+                    )
+                if len(self.targets) == 2:
+                    return FakePinnedResponse(
+                        target.url,
+                        status_code=302,
+                        headers={
+                            "Location": (
+                                "http://fp.baiwang.com/format/d?param=opaque"
+                            )
+                        },
+                    )
+                return FakePinnedResponse(
+                    target.url,
+                    content=b"%PDF-1.5\ninvoice",
+                    headers={"Content-Type": "application/pdf"},
+                )
+
+        transport = RedirectTransport()
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+
+        artifacts, logs = converter._probe_direct_invoice_artifact(
+            object(),
+            "https://sdapi.fpyun.com.cn/invoice/qd/download/"
+            "getInvoiceFile?fptqm=opaque&type=1",
+            str(Path(converter.staging_dir) / "fpyun"),
+        )
+
+        assert logs == []
+        assert len(artifacts) == 1
+        assert transport.targets[1].host == PUBLIC_ADDRESS
+        assert transport.targets[1].port == 7100
+        assert transport.targets[2].url.startswith(
+            "https://fp.baiwang.com/format/d?"
+        )
+
+    def test_fpyun_direct_source_fallback_is_limited_to_validated_chain_hops(self):
+        class RedirectTransport:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, session, method, target, **kwargs):
+                self.calls.append((target, kwargs))
+                if len(self.calls) == 1:
+                    return FakePinnedResponse(
+                        target.url,
+                        status_code=302,
+                        headers={
+                            "Location": (
+                                "http://93.184.216.34:7100/qd/download/"
+                                "getInvoiceFile?fptqm=opaque&type=1"
+                            )
+                        },
+                    )
+                if len(self.calls) == 2:
+                    return FakePinnedResponse(
+                        target.url,
+                        status_code=302,
+                        headers={"Location": "http://fp.baiwang.com/format/d?param=opaque"},
+                    )
+                return FakePinnedResponse(
+                    target.url,
+                    content=b"%PDF-1.5\ninvoice",
+                    headers={"Content-Type": "application/pdf"},
+                )
+
+        transport = RedirectTransport()
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+
+        artifacts, logs = converter._probe_direct_invoice_artifact(
+            object(),
+            "https://sdapi.fpyun.com.cn/invoice/qd/download/"
+            "getInvoiceFile?fptqm=opaque&type=1",
+            str(Path(converter.staging_dir) / "fpyun"),
+        )
+
+        assert logs == []
+        assert len(artifacts) == 1
+        assert transport.calls[0][1]["allow_direct_source_fallback"] is True
+        assert transport.calls[1][1]["allow_direct_source_fallback"] is True
+        assert transport.calls[2][1]["allow_direct_source_fallback"] is True
+
+    def test_fpyun_final_baiwang_download_is_terminal(self):
+        class RedirectTransport:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, session, method, target, **kwargs):
+                self.calls.append((target, kwargs))
+                if len(self.calls) == 1:
+                    return FakePinnedResponse(
+                        target.url,
+                        status_code=302,
+                        headers={"Location": "https://fp.baiwang.com/format/d?param=opaque"},
+                    )
+                return FakePinnedResponse(
+                    target.url,
+                    status_code=302,
+                    headers={"Location": "https://unrelated.example/invoice.pdf"},
+                )
+
+        transport = RedirectTransport()
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+
+        artifacts, logs = converter._probe_direct_invoice_artifact(
+            object(),
+            "https://sdapi.fpyun.com.cn/invoice/qd/download/"
+            "getInvoiceFile?fptqm=opaque&type=1",
+            str(Path(converter.staging_dir) / "fpyun"),
+        )
+
+        assert artifacts == []
+        assert logs[0]["kind"] == "URL_POLICY_REJECTED"
+        assert len(transport.calls) == 2
+
+    def test_fpyun_legacy_redirect_rejects_changed_query(self):
+        transport = RecordingPinnedTransport(
+            response=FakePinnedResponse(
+                "https://sdapi.fpyun.com.cn/start",
+                status_code=302,
+                headers={
+                    "Location": (
+                        "http://93.184.216.34:7100/qd/download/"
+                        "getInvoiceFile?fptqm=changed&type=1"
+                    )
+                },
+            )
+        )
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+            pinned_transport=transport,
+        )
+
+        artifacts, logs = converter._probe_direct_invoice_artifact(
+            object(),
+            "https://sdapi.fpyun.com.cn/invoice/qd/download/"
+            "getInvoiceFile?fptqm=opaque&type=1",
+            str(Path(converter.staging_dir) / "fpyun"),
+        )
+
+        assert artifacts == []
+        assert logs[0]["kind"] == "URL_POLICY_REJECTED"
 
     def test_public_request_buffers_body_then_closes_source_response(self):
         converter = PDFConverter(
@@ -1391,6 +1624,53 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
             pdf_converter.requests = original_requests
         self.assertEqual(result["status"], "downloaded")
         self.assertTrue(result["pdf_path"].endswith(".pdf"))
+
+    def test_direct_invoice_recovery_retries_transient_transport_failure(self):
+        attempts = []
+
+        class FlakySession(FakeSession):
+            def get(self, url, **kwargs):
+                attempts.append(url)
+                if len(attempts) < 3:
+                    raise ConnectionError("transient transport failure")
+                return FakeResponse(
+                    url,
+                    b"%PDF-1.5\nrecovered invoice",
+                    {"Content-Type": "application/pdf"},
+                )
+
+        class FlakyRequests:
+            @staticmethod
+            def Session():
+                return FlakySession()
+
+        original_requests = pdf_converter.requests
+        pdf_converter.requests = FlakyRequests
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+        )
+        try:
+            result = converter._recover_direct_invoice_group(
+                [
+                    "https://sdapi.fpyun.com.cn/invoice/qd/download/"
+                    "getInvoiceFile?fptqm=opaque&type=1"
+                ],
+                "发票号码:26110000000000000001",
+                "101",
+                str(Path(converter.staging_dir) / "101"),
+                {
+                    "provider_family": "fpyun_direct_invoice",
+                    "provider_expected_fields": {
+                        "invoice_number": "26110000000000000001"
+                    },
+                },
+            )
+        finally:
+            pdf_converter.requests = original_requests
+
+        self.assertEqual(result["status"], "downloaded")
+        self.assertEqual(len(attempts), 3)
 
     def test_baiwang_preview_invoice_downloads_pdf_without_chromium(self):
         original_requests = pdf_converter.requests

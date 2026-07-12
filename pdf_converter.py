@@ -1,9 +1,10 @@
 import json
+import ipaddress
 import logging
 import os
 import re
 import shutil
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote, urljoin, urlparse
 
 import fitz  # PyMuPDF
 
@@ -53,6 +54,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 class PDFConverter:
+    DIRECT_INVOICE_ALLOWED_HOST_PORTS = frozenset(
+        {("dppt.beijing.chinatax.gov.cn", 8443)}
+    )
     DIRECT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
     BROWSER_DOCUMENT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
     BROWSER_PASSIVE_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -98,7 +102,9 @@ class PDFConverter:
         self.timeout_ms = timeout_ms
         self.generic_timeout_ms = max(8000, min(int(timeout_ms or 0) or 30000, 12000))
         self.provider_settle_timeout_ms = max(1500, min(int(timeout_ms or 0) or 30000, 4000))
-        self.url_policy = url_policy or PublicUrlPolicy()
+        self.url_policy = url_policy or PublicUrlPolicy(
+            allowed_host_ports=self.DIRECT_INVOICE_ALLOWED_HOST_PORTS
+        )
         self.pinned_transport = pinned_transport or PinnedHttpTransport()
         self._browser_request_contexts = {}
         self._browser_effective_request_contexts = {}
@@ -303,6 +309,42 @@ class PDFConverter:
             return "GET"
         return method
 
+    @staticmethod
+    def _is_secure_fpyun_entry(url):
+        parsed = urlparse(str(url or ""))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        return (
+            parsed.scheme.lower() == "https"
+            and (parsed.hostname or "").lower() == "sdapi.fpyun.com.cn"
+            and parsed.port in {None, 443}
+            and parsed.path == "/invoice/qd/download/getInvoiceFile"
+            and bool(query.get("fptqm", [""])[0])
+        )
+
+    @staticmethod
+    def _allows_fpyun_direct_source(target, stage):
+        parsed = urlparse(target.url)
+        if stage == 0:
+            return PDFConverter._is_secure_fpyun_entry(target.url)
+        if stage == 1:
+            try:
+                address = ipaddress.ip_address(target.host)
+            except ValueError:
+                return False
+            return (
+                parsed.scheme.lower() == "http"
+                and target.port == 7100
+                and parsed.path == "/qd/download/getInvoiceFile"
+                and address.is_global
+            )
+        return (
+            stage == 2
+            and parsed.scheme.lower() == "https"
+            and target.host == "fp.baiwang.com"
+            and target.port == 443
+            and parsed.path == "/format/d"
+        )
+
     def _request_public(self, session, method, url, max_redirects=10, **kwargs):
         current = self.url_policy.validate(url)
         request_method = str(method or "GET").upper()
@@ -313,9 +355,26 @@ class PDFConverter:
         max_response_bytes = request_kwargs.pop(
             "max_response_bytes", self.DIRECT_MAX_RESPONSE_BYTES
         )
+        allow_direct_source_fallback = bool(
+            request_kwargs.pop("allow_direct_source_fallback", False)
+        )
+        allow_fpyun_legacy_redirect = bool(
+            request_kwargs.pop("allow_fpyun_legacy_redirect", False)
+        )
+        initial_query = tuple(
+            parse_qsl(urlparse(str(url or "")).query, keep_blank_values=True)
+        )
+        fpyun_redirect_stage = 0
         suppress_auth = False
 
         for redirect_count in range(max_redirects + 1):
+            current_allows_direct_source = (
+                allow_direct_source_fallback
+                and allow_fpyun_legacy_redirect
+                and self._allows_fpyun_direct_source(
+                    current, fpyun_redirect_stage
+                )
+            )
             response = self.pinned_transport.request(
                 session,
                 request_method,
@@ -328,15 +387,94 @@ class PDFConverter:
                 timeout=timeout,
                 suppress_auth=suppress_auth,
                 max_response_bytes=max_response_bytes,
+                allow_direct_source_fallback=current_allows_direct_source,
             )
             status = int(getattr(response, "status_code", 0) or 0)
             response_headers = getattr(response, "headers", {}) or {}
             location = self._header_value(response_headers, "location")
             if status not in {301, 302, 303, 307, 308} or not location:
                 return response
+            if allow_fpyun_legacy_redirect and fpyun_redirect_stage == 2:
+                response.close()
+                raise PublicUrlPolicyError(
+                    current.url, "fpyun final download must not redirect"
+                )
             if redirect_count >= max_redirects:
+                response.close()
                 raise PublicUrlPolicyError(current.url, "too many redirects")
-            next_target = self.url_policy.resolve_redirect(current, location)
+            redirected_url = urljoin(current.url, str(location or ""))
+            redirected = urlparse(redirected_url)
+            if (
+                allow_fpyun_legacy_redirect
+                and fpyun_redirect_stage == 0
+                and current.host == "sdapi.fpyun.com.cn"
+                and current.url.startswith("https://")
+            ):
+                if (
+                    redirected.scheme.lower() == "https"
+                    and (redirected.hostname or "").lower()
+                    == "fp.baiwang.com"
+                    and redirected.port in {None, 443}
+                    and redirected.path == "/format/d"
+                ):
+                    next_target = self.url_policy.validate(redirected_url)
+                    fpyun_redirect_stage = 2
+                else:
+                    try:
+                        redirect_address = ipaddress.ip_address(
+                            redirected.hostname or ""
+                        )
+                    except ValueError as exc:
+                        raise PublicUrlPolicyError(
+                            redirected_url,
+                            "fpyun legacy redirect must use a public literal address",
+                        ) from exc
+                    redirect_query = tuple(
+                        parse_qsl(redirected.query, keep_blank_values=True)
+                    )
+                    if (
+                        redirected.scheme.lower() != "http"
+                        or redirected.port != 7100
+                        or redirected.path != "/qd/download/getInvoiceFile"
+                        or not redirect_address.is_global
+                        or redirect_query != initial_query
+                    ):
+                        raise PublicUrlPolicyError(
+                            redirected_url,
+                            "fpyun legacy redirect contract mismatch",
+                        )
+                    next_target = self.url_policy.validate(
+                        redirected_url,
+                        allowed_scheme_host_ports={
+                            ("http", redirect_address.compressed, 7100)
+                        },
+                    )
+                    fpyun_redirect_stage = 1
+            elif (
+                allow_fpyun_legacy_redirect
+                and fpyun_redirect_stage == 1
+                and current.url.startswith("http://")
+                and current.port == 7100
+            ):
+                if (
+                    redirected.scheme.lower() != "http"
+                    or (redirected.hostname or "").lower() != "fp.baiwang.com"
+                    or redirected.port not in {None, 80}
+                    or redirected.path != "/format/d"
+                ):
+                    raise PublicUrlPolicyError(
+                        redirected_url,
+                        "fpyun legacy handoff contract mismatch",
+                    )
+                next_target = self.url_policy.validate(
+                    redirected._replace(
+                        scheme="https",
+                        netloc="fp.baiwang.com",
+                    ).geturl()
+                )
+                fpyun_redirect_stage = 2
+            else:
+                next_target = self.url_policy.resolve_redirect(current, location)
             next_method = self._redirect_method(request_method, status)
             changed_to_get = request_method != next_method and next_method == "GET"
             cross_origin = self._origin(current) != self._origin(next_target)
@@ -1021,8 +1159,16 @@ class PDFConverter:
             )
         }
         try:
+            allow_direct_source_fallback = self._is_secure_fpyun_entry(url)
             response = self._request_public(
-                session, "GET", url, timeout=20, headers=headers, stream=True
+                session,
+                "GET",
+                url,
+                timeout=20,
+                headers=headers,
+                stream=True,
+                allow_direct_source_fallback=allow_direct_source_fallback,
+                allow_fpyun_legacy_redirect=allow_direct_source_fallback,
             )
         except PublicUrlPolicyError as exc:
             return [], [self._policy_rejection_log(exc, "direct_invoice_probe")]
@@ -1071,6 +1217,23 @@ class PDFConverter:
             ], []
         finally:
             response.close()
+
+    def _probe_direct_invoice_artifact_with_retry(
+        self, session, url, artifact_prefix, max_attempts=3
+    ):
+        logs = []
+        for _attempt in range(max(1, int(max_attempts))):
+            artifacts, attempt_logs = self._probe_direct_invoice_artifact(
+                session, url, artifact_prefix
+            )
+            logs.extend(attempt_logs)
+            if artifacts:
+                return artifacts, logs
+            if not attempt_logs or any(
+                item.get("kind") != "direct_probe_error" for item in attempt_logs
+            ):
+                break
+        return [], logs
 
     def _probe_nuonuo_scan_invoice_artifacts(self, session, url, artifact_prefix):
         artifacts = []
@@ -1627,7 +1790,11 @@ class PDFConverter:
                     )
                     artifacts.extend(nuonuo_artifacts)
                     network_logs.extend(nuonuo_logs)
-                direct_artifacts, direct_logs = self._probe_direct_invoice_artifact(session, url, artifact_prefix)
+                direct_artifacts, direct_logs = (
+                    self._probe_direct_invoice_artifact_with_retry(
+                        session, url, artifact_prefix
+                    )
+                )
                 artifacts.extend(direct_artifacts)
                 network_logs.extend(direct_logs)
 

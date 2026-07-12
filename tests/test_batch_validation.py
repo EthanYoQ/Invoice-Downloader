@@ -265,7 +265,12 @@ def test_forged_supplied_success_cannot_hide_missing_artifact(tmp_path):
     with pytest.raises(BatchValidationError) as exc_info:
         _validator().validate(_manifest(), root)
 
-    assert exc_info.value.code in {"strict_audit_failed", "stale_supplied_audit", "invalid_artifact_assignment"}
+    assert exc_info.value.code in {
+        "strict_audit_failed",
+        "stale_supplied_audit",
+        "invalid_artifact_assignment",
+        "lineage_output_mismatch",
+    }
 
 
 @pytest.mark.parametrize(
@@ -511,6 +516,7 @@ def test_case_variant_assignments_are_duplicate_before_filesystem_lookup(tmp_pat
     def forged_runner(_manifest_payload, _root):
         return {
             "run_root": str(root.resolve()),
+            "audit_authority": {"authoritative": True, "reasons": []},
             "truth_summary": _manifest(rows=2)["summary"],
             "artifact_count": 2,
             "p0_conclusion": {"count": 0, "passed": True, "bad_rows": []},
@@ -527,6 +533,22 @@ def test_case_variant_assignments_are_duplicate_before_filesystem_lookup(tmp_pat
         _validator(audit_runner=forged_runner).validate(_manifest(rows=2), root)
 
     assert exc_info.value.code == "duplicate_artifact_assignment"
+
+
+def test_fresh_audit_without_authority_is_rejected(tmp_path):
+    root = _run_root(tmp_path)
+
+    def missing_authority_runner(manifest, run_root):
+        from strict_truth_audit import compare
+
+        result = compare(manifest, run_root)
+        result.pop("audit_authority")
+        return result
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator(audit_runner=missing_authority_runner).validate(_manifest(), root)
+
+    assert exc_info.value.code == "invalid_audit_result"
 
 
 def test_reparse_component_is_rejected_without_platform_skip(tmp_path):

@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import re
 import shutil
 import subprocess
@@ -77,6 +77,11 @@ def _full_revision(value: Any) -> str:
     return text if re.fullmatch(r"[0-9a-f]{40}", text) else ""
 
 
+def _full_sha256(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
+
+
 def default_revision(*, identity_paths: tuple[Path, ...] | None = None) -> str:
     candidates = identity_paths if identity_paths is not None else _default_identity_paths()
     for path in candidates:
@@ -137,6 +142,227 @@ def compute_evidence_digest(evidence: Mapping[str, Any]) -> str:
     return _sha256_json(
         {key: value for key, value in evidence.items() if key != "evidence_digest"}
     )
+
+
+def validate_finalized_run_evidence(
+    evidence: Mapping[str, Any], run_root: Path
+) -> dict[str, str]:
+    """Validate immutable production evidence and return canonical lineage hashes."""
+
+    required = {
+        "schema_version",
+        "run_id",
+        "run_root",
+        "candidate_revision",
+        "candidate_version",
+        "validation_required",
+        "manifest_included_count",
+        "scope",
+        "scope_digest",
+        "hardware_mode",
+        "hardware_fingerprint",
+        "started_monotonic_seconds",
+        "ended_monotonic_seconds",
+        "elapsed_seconds",
+        "started_at_utc",
+        "ended_at_utc",
+        "lineage",
+        "lineage_digest",
+        "output_inventory",
+        "inventory_sha256",
+        "evidence_digest",
+    }
+    if not isinstance(evidence, Mapping) or not required.issubset(evidence):
+        raise ValueError("invalid_run_evidence")
+    root = Path(run_root).resolve(strict=False)
+    try:
+        evidence_root = Path(str(evidence["run_root"])).resolve(strict=False)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("invalid_run_evidence") from exc
+    if (
+        evidence.get("schema_version") != 1
+        or str(evidence_root).casefold() != str(root).casefold()
+        or not str(evidence.get("run_id") or "").strip()
+        or not _full_revision(evidence.get("candidate_revision"))
+        or not str(evidence.get("candidate_version") or "").strip()
+    ):
+        raise ValueError("invalid_run_evidence")
+    try:
+        included_count = int(evidence.get("manifest_included_count"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_run_evidence") from exc
+    if evidence.get("validation_required") is not True or included_count <= 0:
+        raise ValueError("validation_evidence_scope_mismatch")
+    if str(evidence.get("evidence_digest") or "") != compute_evidence_digest(evidence):
+        raise ValueError("run_evidence_digest_mismatch")
+
+    scope = evidence.get("scope")
+    if (
+        not isinstance(scope, Mapping)
+        or not scope
+        or not all(str(value or "").strip() for value in scope.values())
+        or str(evidence.get("scope_digest") or "") != compute_scope_digest(scope)
+        or str(evidence.get("hardware_mode") or "")
+        != str(scope.get("hardware_mode") or "")
+        or str(evidence.get("hardware_fingerprint") or "")
+        != str(scope.get("hardware_fingerprint") or "")
+    ):
+        raise ValueError("run_evidence_scope_mismatch")
+    try:
+        start = Decimal(str(evidence["started_monotonic_seconds"]))
+        end = Decimal(str(evidence["ended_monotonic_seconds"]))
+        elapsed = Decimal(str(evidence["elapsed_seconds"]))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("invalid_timing_boundary") from exc
+    if (
+        not all(value.is_finite() and value >= 0 for value in (start, end, elapsed))
+        or end < start
+        or elapsed != end - start
+    ):
+        raise ValueError("invalid_timing_boundary")
+    try:
+        wall_start = dt.datetime.fromisoformat(
+            str(evidence["started_at_utc"]).replace("Z", "+00:00")
+        )
+        wall_end = dt.datetime.fromisoformat(
+            str(evidence["ended_at_utc"]).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_run_time") from exc
+    if wall_start.tzinfo is None or wall_end.tzinfo is None or wall_end < wall_start:
+        raise ValueError("invalid_run_time")
+
+    output_root = root / "output"
+    if not output_root.is_dir():
+        raise ValueError("lineage_output_mismatch")
+    lineage_preview = evidence.get("lineage")
+    if isinstance(lineage_preview, list):
+        resolved_output_root = output_root.resolve(strict=False)
+        for row in lineage_preview:
+            if not isinstance(row, Mapping):
+                continue
+            relative = str(row.get("output_relative_path") or "").strip()
+            if not relative:
+                continue
+            path = (resolved_output_root / Path(relative)).resolve(strict=False)
+            try:
+                path.relative_to(resolved_output_root)
+            except ValueError as exc:
+                raise ValueError("lineage_output_escape") from exc
+            if not path.is_file():
+                raise ValueError("lineage_output_mismatch")
+            try:
+                expected_size = int(row.get("output_size"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("lineage_output_mismatch") from exc
+            actual_hash, actual_size = _sha256_file(path)
+            if (
+                str(row.get("output_sha256") or "").lower() != actual_hash
+                or expected_size != actual_size
+            ):
+                raise ValueError("lineage_output_mismatch")
+    actual_inventory = []
+    for path in sorted(
+        (item for item in output_root.rglob("*") if item.is_file()),
+        key=lambda item: item.relative_to(output_root).as_posix().casefold(),
+    ):
+        digest, size = _sha256_file(path)
+        actual_inventory.append(
+            {
+                "relative_path": path.relative_to(output_root).as_posix(),
+                "size": size,
+                "sha256": digest,
+            }
+        )
+    raw_inventory = evidence.get("output_inventory")
+    if not isinstance(raw_inventory, list):
+        raise ValueError("run_evidence_inventory_mismatch")
+    try:
+        supplied_inventory_digest = compute_inventory_digest(raw_inventory)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("run_evidence_inventory_mismatch") from exc
+    actual_inventory_digest = compute_inventory_digest(actual_inventory)
+    if (
+        supplied_inventory_digest != actual_inventory_digest
+        or str(evidence.get("inventory_sha256") or "") != actual_inventory_digest
+    ):
+        raise ValueError("run_evidence_inventory_mismatch")
+
+    lineage = evidence.get("lineage")
+    if not isinstance(lineage, list) or not lineage:
+        raise ValueError("missing_document_lineage")
+    try:
+        lineage_digest = compute_lineage_digest(lineage)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid_document_lineage") from exc
+    if str(evidence.get("lineage_digest") or "") != lineage_digest:
+        raise ValueError("lineage_digest_mismatch")
+    allowed_fields = {
+        "run_id",
+        "document_id",
+        "source_email_uid",
+        "source_chain_sha256s",
+        "output_relative_path",
+        "output_sha256",
+        "output_size",
+        "artifact_role",
+        "transformation_type",
+        "provider_type",
+    }
+    inventory_by_relative = {
+        str(item["relative_path"]).replace("\\", "/").casefold(): item
+        for item in actual_inventory
+    }
+    bindings = {}
+    document_ids = set()
+    run_id = str(evidence["run_id"])
+    for row in lineage:
+        if not isinstance(row, Mapping):
+            raise ValueError("invalid_document_lineage")
+        if set(row) != allowed_fields:
+            raise ValueError("lineage_contains_forbidden_identity")
+        document_id = str(row.get("document_id") or "").strip()
+        source_uid = str(row.get("source_email_uid") or "").strip()
+        source_chain = row.get("source_chain_sha256s")
+        relative = str(row.get("output_relative_path") or "").replace("\\", "/")
+        expected_hash = str(row.get("output_sha256") or "").lower()
+        if (
+            str(row.get("run_id") or "") != run_id
+            or not document_id
+            or document_id in document_ids
+            or not source_uid
+            or not isinstance(source_chain, list)
+            or not source_chain
+            or not all(_full_sha256(value) for value in source_chain)
+            or not all(
+                str(row.get(field) or "").strip()
+                for field in ("artifact_role", "transformation_type", "provider_type")
+            )
+        ):
+            raise ValueError("invalid_document_lineage")
+        path = (output_root / Path(relative)).resolve(strict=False)
+        try:
+            path.relative_to(output_root.resolve(strict=False))
+        except ValueError as exc:
+            raise ValueError("lineage_output_escape") from exc
+        inventory_row = inventory_by_relative.get(relative.casefold())
+        try:
+            expected_size = int(row.get("output_size"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("lineage_output_mismatch") from exc
+        if (
+            inventory_row is None
+            or not path.is_file()
+            or expected_hash != str(inventory_row["sha256"]).lower()
+            or expected_size != int(inventory_row["size"])
+        ):
+            raise ValueError("lineage_output_mismatch")
+        canonical = str(path).casefold()
+        if canonical in bindings:
+            raise ValueError("duplicate_lineage_assignment")
+        document_ids.add(document_id)
+        bindings[canonical] = expected_hash
+    return bindings
 
 
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> Path:

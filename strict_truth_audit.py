@@ -9,10 +9,13 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
+import fitz
+
+from run_evidence import validate_finalized_run_evidence
 from truth_contracts import TruthContractError, TruthManifest
 
 
-CAPTURE_KINDS = {"archive", "manual_check", "manual_review"}
+CAPTURE_KINDS = {"archive", "archived", "manual_check", "manual_review"}
 OCR_COMPAT_TRANSLATION = str.maketrans({"⻔": "门", "⻝": "食", "⻨": "麦", "⻆": "角"})
 ARCHIVE_FOLDERS = {
     "打车": "打车",
@@ -153,7 +156,44 @@ def amount_candidates_for_field_check(row: dict, artifact: dict) -> list[str]:
     return candidates
 
 
-def load_artifacts(run_root: Path) -> list[dict]:
+def extract_output_pdf_fields(path: Path) -> dict:
+    try:
+        with fitz.open(path) as document:
+            text = "\n".join(
+                document.load_page(index).get_text("text") or ""
+                for index in range(min(2, len(document)))
+            )
+    except Exception:
+        return {}
+
+    fields = parse_final_archive_fields(str(path))
+    invoice_match = re.search(
+        r"(?:发票号码|Invoice\s*Number)\s*[:：]?\s*([0-9]{8,20})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not invoice_match:
+        invoice_match = re.search(r"(?<!\d)(\d{20})(?!\d)", text)
+    if invoice_match:
+        fields["invoice_number"] = norm_invoice(invoice_match.group(1))
+    return fields
+
+
+def load_lineage_bindings(run_root: Path) -> tuple[dict[str, str] | None, list[str]]:
+    evidence_path = run_root / "diagnostics" / "run_evidence.json"
+    if not evidence_path.is_file():
+        return None, ["missing_run_evidence"]
+    try:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, ["invalid_run_evidence"]
+    try:
+        return validate_finalized_run_evidence(evidence, run_root), []
+    except ValueError as exc:
+        return None, [str(exc) or "invalid_run_evidence"]
+
+
+def load_artifacts(run_root: Path) -> tuple[list[dict], dict[str, str], dict]:
     events = read_jsonl(run_root / "monitoring" / "artifact_events.jsonl")
     traces = read_jsonl(run_root / "diagnostics" / "debug_trace.jsonl")
     by_doc = {}
@@ -223,13 +263,65 @@ def load_artifacts(run_root: Path) -> list[dict]:
 
     output_root = run_root / "output"
     file_hashes = {}
+    lineage_bindings, authority_reasons = load_lineage_bindings(run_root)
     if output_root.exists():
-        for path in output_root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in {".pdf", ".xml", ".ofd"}:
-                try:
-                    file_hashes[sha256_file(path)] = str(path)
-                except OSError:
-                    pass
+        resolved_output_root = output_root.resolve()
+        artifacts_by_path = {
+            str(Path(item.get("path", "")).resolve()).lower(): item
+            for item in by_doc.values()
+            if item.get("path")
+        }
+        if lineage_bindings is not None:
+            for resolved in lineage_bindings:
+                if resolved in artifacts_by_path:
+                    continue
+                path = Path(resolved)
+                item = by_doc.setdefault(
+                    f"lineage:{resolved}",
+                    {
+                        "document_id": f"lineage:{resolved}",
+                        "kind": "archive",
+                        "path": str(path),
+                        "category": path.parent.name,
+                        "display_type": path.parent.name,
+                    },
+                )
+                artifacts_by_path[resolved] = item
+        lineage_backed_items = set()
+        for resolved, item in artifacts_by_path.items():
+            path = Path(resolved)
+            try:
+                is_run_output = path.is_relative_to(resolved_output_root)
+            except ValueError:
+                is_run_output = False
+            if not is_run_output or not path.is_file():
+                continue
+            try:
+                digest = sha256_file(path)
+            except OSError:
+                digest = ""
+            if lineage_bindings is not None:
+                expected_hash = lineage_bindings.get(resolved)
+                if not expected_hash or digest != expected_hash:
+                    if "lineage_output_mismatch" not in authority_reasons:
+                        authority_reasons.append("lineage_output_mismatch")
+                    continue
+                lineage_backed_items.add(id(item))
+            if path.suffix.lower() in {".pdf", ".xml", ".ofd"}:
+                if digest:
+                    file_hashes[digest] = str(path)
+            if path.suffix.lower() != ".pdf":
+                continue
+            fields = extract_output_pdf_fields(path)
+            for key in ("invoice_number", "date", "amount", "seller"):
+                if fields.get(key) and not item.get(key):
+                    item[key] = fields[key]
+        if lineage_bindings is not None:
+            by_doc = {
+                key: item
+                for key, item in by_doc.items()
+                if id(item) in lineage_backed_items
+            }
     for item in by_doc.values():
         p = Path(item.get("path", ""))
         if p.exists() and p.is_file():
@@ -237,7 +329,11 @@ def load_artifacts(run_root: Path) -> list[dict]:
                 item["sha256"] = sha256_file(p)
             except OSError:
                 item["sha256"] = ""
-    return list(by_doc.values()), file_hashes
+    authority = {
+        "authoritative": not authority_reasons,
+        "reasons": authority_reasons,
+    }
+    return list(by_doc.values()), file_hashes, authority
 
 
 def match_truth(row: dict, artifacts: list[dict], output_hashes: dict) -> tuple[dict | None, str]:
@@ -742,7 +838,7 @@ def evaluate_p2_pairs(manifest: dict, matched_by_truth_id: dict[str, dict]) -> d
 def compare(manifest: dict, run_root: Path) -> dict:
     included_rows = manifest.get("included", [])
     validate_truth_ids(included_rows)
-    artifacts, output_hashes = load_artifacts(run_root)
+    artifacts, output_hashes, authority = load_artifacts(run_root)
     assignments = assign_truth_matches(included_rows, artifacts, output_hashes)
     p0_rows = []
     matched_rows = []
@@ -801,13 +897,23 @@ def compare(manifest: dict, run_root: Path) -> dict:
         if mismatches:
             field_mismatch_rows.append({**matched, "mismatches": mismatches})
 
+    p2_conclusion = evaluate_p2_pairs(manifest, matched_by_truth_id)
     return {
         "run_root": str(run_root),
+        "audit_authority": authority,
+        "gate_passed": bool(
+            authority["authoritative"]
+            and not p0_rows
+            and not user_p1_rows
+            and not field_mismatch_rows
+            and not manual_check_rows
+            and p2_conclusion["count"] == 0
+        ),
         "truth_summary": manifest.get("summary", {}),
         "artifact_count": len(artifacts),
         "p0_conclusion": {
             "count": len(p0_rows),
-            "passed": len(p0_rows) == 0,
+            "passed": bool(authority["authoritative"] and len(p0_rows) == 0),
             "bad_rows": p0_rows,
         },
         "user_p1_conclusion": {
@@ -816,7 +922,7 @@ def compare(manifest: dict, run_root: Path) -> dict:
             "category_rows": user_p1_rows,
             "field_mismatch_rows": field_mismatch_rows,
         },
-        "p2_conclusion": evaluate_p2_pairs(manifest, matched_by_truth_id),
+        "p2_conclusion": p2_conclusion,
         "manual_check_rows": manual_check_rows,
         "matched_rows": matched_rows,
     }
@@ -826,6 +932,8 @@ def write_markdown(result: dict, path: Path):
     lines = [
         "# Strict Truth Audit",
         "",
+        f"- Authoritative: `{result.get('audit_authority', {}).get('authoritative', False)}`",
+        f"- Authority reasons: `{', '.join(result.get('audit_authority', {}).get('reasons', [])) or 'none'}`",
         f"- P0 passed: `{result['p0_conclusion']['passed']}`",
         f"- P0 count: `{result['p0_conclusion']['count']}`",
         f"- User P1 count: `{result['user_p1_conclusion']['count']}`",
@@ -949,7 +1057,11 @@ def main():
     result["generated_at_utc"] = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     result["run_id"] = audit_run_id(Path(args.run_root))
     result["candidate_revision"] = candidate_revision(Path(args.run_root))
-    result["exit_code"] = strict_exit_code(summary_counts)
+    result["exit_code"] = (
+        strict_exit_code(summary_counts)
+        if result.get("audit_authority", {}).get("authoritative")
+        else 1
+    )
     write_json_atomic(output, result)
     markdown_output = output.with_suffix(".md")
     write_markdown(result, markdown_output)
@@ -963,6 +1075,8 @@ def main():
         "p2_count": result["p2_conclusion"]["count"],
         "p2_passed": result["p2_conclusion"]["passed"],
         "manual_check_count": len(result["manual_check_rows"]),
+        "authoritative": result.get("audit_authority", {}).get("authoritative", False),
+        "authority_reasons": result.get("audit_authority", {}).get("reasons", []),
         "output": str(output),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

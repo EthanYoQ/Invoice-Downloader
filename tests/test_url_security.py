@@ -66,6 +66,47 @@ def test_rejects_non_http_credentials_and_disallowed_ports(url):
         policy.validate(url)
 
 
+def test_nonstandard_port_allowlist_is_scoped_to_exact_https_host():
+    policy = direct_policy(
+        resolver=resolver_for({}),
+        allowed_host_ports={("dppt.beijing.chinatax.gov.cn", 8443)},
+    )
+
+    validated = policy.validate(
+        "https://dppt.beijing.chinatax.gov.cn:8443/kpfw/invoice.pdf"
+    )
+
+    assert validated.host == "dppt.beijing.chinatax.gov.cn"
+    assert validated.port == 8443
+    with pytest.raises(PublicUrlPolicyError, match="port is not allowed"):
+        policy.validate("https://public.example:8443/invoice.pdf")
+    with pytest.raises(PublicUrlPolicyError, match="port is not allowed"):
+        policy.validate("http://dppt.beijing.chinatax.gov.cn:8443/invoice.pdf")
+
+
+def test_per_request_port_exception_is_exact_and_not_persistent():
+    policy = direct_policy(resolver=resolver_for({}))
+    target = "http://93.184.216.34:7100/qd/download/getInvoiceFile"
+
+    validated = policy.validate(
+        target,
+        allowed_scheme_host_ports={
+            ("http", "93.184.216.34", 7100)
+        },
+    )
+
+    assert validated.port == 7100
+    with pytest.raises(PublicUrlPolicyError, match="port is not allowed"):
+        policy.validate(target)
+    with pytest.raises(PublicUrlPolicyError, match="port is not allowed"):
+        policy.validate(
+            "http://93.184.216.35:7100/qd/download/getInvoiceFile",
+            allowed_scheme_host_ports={
+                ("http", "93.184.216.34", 7100)
+            },
+        )
+
+
 def test_rejects_hostname_when_any_dns_result_is_non_public():
     policy = direct_policy(
         resolver=resolver_for({"mixed.example": [PUBLIC_V4, "10.0.0.8"]})

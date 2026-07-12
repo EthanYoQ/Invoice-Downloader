@@ -243,11 +243,16 @@ class PublicUrlPolicy:
         proxy_endpoint=_AUTO_PROXY,
         proxy_resolver: Resolver | None = None,
         proxy_bypass_checker=None,
+        allowed_host_ports=None,
     ):
         self._resolver = resolver or _default_resolver
         self._public_resolver = public_resolver or CachedDohResolver()
         self._peer_getter = peer_getter or _default_peer_getter
         self._proxy_bypass_checker = proxy_bypass_checker or proxy_bypass
+        self._allowed_host_ports = frozenset(
+            (_canonical_hostname(host), int(port))
+            for host, port in (allowed_host_ports or ())
+        )
         endpoint_resolver = proxy_resolver or _default_resolver
         self._proxy_endpoints = {
             scheme: endpoint
@@ -274,7 +279,9 @@ class PublicUrlPolicy:
             raise PublicUrlPolicyError(url, "hostname did not resolve")
         return result
 
-    def validate(self, url: str) -> ValidatedPublicUrl:
+    def validate(
+        self, url: str, *, allowed_scheme_host_ports=None
+    ) -> ValidatedPublicUrl:
         raw_url = str(url or "").strip()
         try:
             parsed = urlsplit(raw_url)
@@ -301,7 +308,20 @@ class PublicUrlPolicy:
             port = parsed.port or self._DEFAULT_PORTS[scheme]
         except ValueError as exc:
             raise PublicUrlPolicyError(raw_url, "port is invalid") from exc
-        if port != self._DEFAULT_PORTS[scheme]:
+        request_port_exceptions = frozenset(
+            (
+                str(allowed_scheme).lower(),
+                _canonical_hostname(allowed_host),
+                int(allowed_port),
+            )
+            for allowed_scheme, allowed_host, allowed_port
+            in (allowed_scheme_host_ports or ())
+        )
+        nonstandard_port_allowed = (
+            (scheme == "https" and (host, port) in self._allowed_host_ports)
+            or (scheme, host, port) in request_port_exceptions
+        )
+        if port != self._DEFAULT_PORTS[scheme] and not nonstandard_port_allowed:
             raise PublicUrlPolicyError(raw_url, "port is not allowed")
 
         proxy = self._proxy_endpoints.get(scheme)
