@@ -139,6 +139,54 @@ def test_regenerated_pdf_requires_explicit_semantic_source_identity(tmp_path: Pa
     }
 
 
+def test_semantic_identity_rejects_invoice_number_only_referenced_in_remarks(
+    tmp_path: Path,
+):
+    truth = _truth(invoice_number="26110000000000000001")
+    path = _pdf(
+        tmp_path / "wrong-invoice.pdf",
+        "Invoice Number: 99999999999999999999\n"
+        "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
+        "Seller: Standard Merchant\n"
+        "Remark - related invoice: 26110000000000000001",
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_NOT_LABELED"
+
+
+def test_semantic_receipt_accepts_labeled_order_and_document_numbers(tmp_path: Path):
+    truth = _truth(
+        invoice_number="778080227734",
+        invoice_code="MTFKT9WLF9",
+        seller="Cloud Merchant",
+    )
+    path = _pdf(
+        tmp_path / "receipt.pdf",
+        "Document No: 778080227734\nOrder Number: MTFKT9WLF9\n"
+        "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
+        "Seller: Cloud Merchant",
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is True
+
+
 def test_white_on_white_and_near_blank_pdf_fail_visual_verification(tmp_path: Path):
     white = _styled_pdf(
         tmp_path / "white-text.pdf",

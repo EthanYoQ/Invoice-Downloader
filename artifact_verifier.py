@@ -180,6 +180,36 @@ def _visible_hit(document: Any, expected: Any) -> _PdfFieldHit | None:
     )
 
 
+def _visible_labeled_value(
+    document: Any, expected: Any, labels: tuple[str, ...]
+) -> bool:
+    value_hits = [hit for hit in _find_hits(document, expected) if _hit_is_visible(document, hit)]
+    label_hits = [
+        hit
+        for label in labels
+        for hit in _find_hits(document, label)
+        if _hit_is_visible(document, hit)
+    ]
+    for label_hit in label_hits:
+        label_x0, label_y0, label_x1, label_y1 = label_hit.bbox
+        label_height = max(1.0, label_y1 - label_y0)
+        label_center = (label_y0 + label_y1) / 2
+        page_width = float(document[label_hit.page_index].rect.width)
+        for value_hit in value_hits:
+            if value_hit.page_index != label_hit.page_index:
+                continue
+            value_x0, value_y0, _value_x1, value_y1 = value_hit.bbox
+            value_height = max(1.0, value_y1 - value_y0)
+            value_center = (value_y0 + value_y1) / 2
+            if (
+                abs(value_center - label_center) <= max(label_height, value_height)
+                and value_x0 >= label_x0
+                and value_x0 - label_x1 <= page_width * 0.5
+            ):
+                return True
+    return False
+
+
 def _date_aliases(value: Any) -> tuple[str, ...]:
     normalized = _date(value)
     if not normalized:
@@ -235,7 +265,12 @@ def _is_route_role(value: Any) -> bool:
     return any(token in role for token in ("trip", "itinerary", "route", "行程", "车票"))
 
 
-def _verify_pdf(path: Path, truth: Mapping[str, Any]) -> ArtifactVerification:
+def _verify_pdf(
+    path: Path,
+    truth: Mapping[str, Any],
+    *,
+    require_labeled_identity: bool = False,
+) -> ArtifactVerification:
     try:
         import fitz
 
@@ -255,10 +290,35 @@ def _verify_pdf(path: Path, truth: Mapping[str, Any]) -> ArtifactVerification:
             if expected_number:
                 if _visible_hit(document, expected_number) is None:
                     return _failure("FINAL_FIELD_NOT_VISIBLE")
+                if require_labeled_identity and not _visible_labeled_value(
+                    document,
+                    expected_number,
+                    (
+                        "发票号码",
+                        "invoice number",
+                        "invoice no",
+                        "文稿编号",
+                        "document number",
+                        "document no",
+                    ),
+                ):
+                    return _failure("FINAL_FIELD_NOT_LABELED")
                 matched.append("invoice_number")
             if expected_code:
                 if _visible_hit(document, expected_code) is None:
                     return _failure("FINAL_FIELD_NOT_VISIBLE")
+                if require_labeled_identity and not _visible_labeled_value(
+                    document,
+                    expected_code,
+                    (
+                        "发票代码",
+                        "invoice code",
+                        "订单号",
+                        "order number",
+                        "order no",
+                    ),
+                ):
+                    return _failure("FINAL_FIELD_NOT_LABELED")
                 matched.append("invoice_code")
 
             date_hit = _visible_date_hit(document, truth.get("invoice_date"))
@@ -394,7 +454,11 @@ def verify_final_artifact(
     path = Path(output_path)
     suffix = path.suffix.casefold()
     if suffix == ".pdf":
-        verification = _verify_pdf(path, truth)
+        verification = _verify_pdf(
+            path,
+            truth,
+            require_labeled_identity=semantic_source_identity,
+        )
         if semantic_source_identity and verification.passed:
             return ArtifactVerification(
                 passed=True,

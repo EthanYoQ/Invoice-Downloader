@@ -30,6 +30,13 @@ from artifact_verifier import verify_final_artifact
 
 
 UTC = dt.timezone.utc
+SEMANTIC_LINEAGE_PROFILES = frozenset(
+    {
+        ("attachment", "local"),
+        ("url", "chinatax_direct_invoice"),
+        ("url", "kpbyd_direct_invoice"),
+    }
+)
 PERFORMANCE_SCOPE_FIELDS = (
     "date_from",
     "date_to",
@@ -775,12 +782,18 @@ class BatchValidator:
             source_lineage_matches = (
                 truth_row.artifact_sha256.lower() in strong_hashes
             )
+            semantic_profile_approved = (
+                str(lineage_row["transformation_type"] or "").strip(),
+                str(lineage_row["provider_type"] or "").strip(),
+            ) in SEMANTIC_LINEAGE_PROFILES
             verification = verify_final_artifact(
                 truth_row.to_mapping(),
                 assignment["matched_path"],
                 output_sha256=str(lineage_row["output_sha256"]),
                 source_chain_sha256s=list(lineage_row["source_chain_sha256s"]),
-                allow_semantic_source_identity=not source_lineage_matches,
+                allow_semantic_source_identity=(
+                    not source_lineage_matches and semantic_profile_approved
+                ),
             )
             if not verification.passed:
                 if not source_lineage_matches:
