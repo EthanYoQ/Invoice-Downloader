@@ -595,10 +595,9 @@ class AppArchiveAdapter:
         self._append_success_state(outcome, info_json, mapped_folder, path)
         return ArchiveDecision(path=path, status="archived")
 
-    def finalize(self, report: ArchiveReport, root: Path) -> None:
+    def finalize(self, report: ArchiveReport, root: Path) -> dict[str, str] | None:
         if self.pairing_finalizer is not None:
-            self.pairing_finalizer(report, root)
-            return
+            return self.pairing_finalizer(report, root)
         reconcile_archive_pairs(
             root,
             event_sink=lambda event: self.api._safe_emit_stage_event(
@@ -608,3 +607,11 @@ class AppArchiveAdapter:
             artifact_metadata=self.pairing_metadata,
         )
         self.api._cwt_cancellation_matching(str(root))
+        iterator = getattr(self.trace_store, "iter_records", None)
+        if not callable(iterator):
+            return None
+        return {
+            str(row.get("document_id")): str(row.get("archive_target"))
+            for row in iterator()
+            if row.get("document_id") and row.get("archive_target")
+        }

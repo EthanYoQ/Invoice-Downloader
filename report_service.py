@@ -12,6 +12,10 @@ class RunFinalizationContext:
     run_id: str
     staging_dir: Path
     output_dir: Path
+    run_root: Path | None = None
+    request: Any = None
+    started_monotonic_seconds: str = ""
+    started_at_utc: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,11 +52,13 @@ class ReportService:
         report_callback: Callable[[RunFinalizationContext, Any], Any] | None = None,
         disconnect_callback: Callable[[RunFinalizationContext, Any], Any] | None = None,
         cleanup_callback: Callable[[RunFinalizationContext], Any] | None = None,
+        evidence_writer: Any = None,
         timeout_seconds: float = 120.0,
     ):
         self._report_callback = report_callback
         self._disconnect_callback = disconnect_callback
         self._cleanup_callback = cleanup_callback
+        self._evidence_writer = evidence_writer
         self._timeout_seconds = max(0.001, float(timeout_seconds))
 
     def _bounded(self, name: str, callback: Callable[[], Any]) -> Callable[[], None]:
@@ -88,6 +94,19 @@ class ReportService:
         session: Any,
     ) -> list[tuple[str, Callable[[], None]]]:
         callbacks: list[tuple[str, Callable[[], None]]] = []
+        evidence_captured = False
+        evidence_required = bool(
+            getattr(getattr(context, "request", None), "evidence_required", False)
+        )
+        if evidence_required:
+            if self._evidence_writer is None:
+                raise ValueError("production_evidence_writer_required")
+            def capture_evidence() -> None:
+                nonlocal evidence_captured
+                self._evidence_writer.capture(context, result)
+                evidence_captured = True
+
+            callbacks.append(("evidence_capture", capture_evidence))
         if self._report_callback is not None:
             callbacks.append(
                 ("report", self._bounded("report", lambda: self._report_callback(context, result)))
@@ -100,8 +119,23 @@ class ReportService:
                 )
             )
         if self._cleanup_callback is not None:
+            def cleanup() -> Any:
+                if evidence_required and not evidence_captured:
+                    raise ValueError("lineage_capture_required_before_cleanup")
+                return self._cleanup_callback(context)
+
             callbacks.append(
-                ("cleanup", lambda: self._cleanup_callback(context))
+                ("cleanup", cleanup)
+            )
+        if evidence_required:
+            callbacks.append(
+                (
+                    "evidence_finalize",
+                    self._bounded(
+                        "evidence_finalize",
+                        lambda: self._evidence_writer.finalize(context, result),
+                    ),
+                )
             )
         return callbacks
 

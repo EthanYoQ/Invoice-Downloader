@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from build_identity import load_build_identity
@@ -1043,13 +1044,35 @@ class InvoiceAppAPI:
         locked_to = self._run_context.get("locked_date_to", "") or date_to
         return locked_from, locked_to
 
-    def _safe_write_run_config(self, email_address, auth_code="", api_key=""):
+    def _safe_write_run_config(
+        self,
+        email_address,
+        auth_code="",
+        api_key="",
+        *,
+        request=None,
+    ):
         if not self._run_context.get("enabled"):
             return
         lifecycle_run_id = str(
             self._active_run_handle.run_id if self._active_run_handle is not None else ""
         )
         paths = self._resolve_truth_audit_paths(self._run_context, lifecycle_run_id)
+        from run_evidence import default_hardware, default_revision
+
+        hardware_mode, hardware_fingerprint = default_hardware()
+        before_exclusive = str(getattr(request, "before_exclusive", "") or "")
+        account_channel = str(getattr(request, "channel_id", "") or "")
+        mailbox = str(getattr(request, "mailbox", "") or "INBOX")
+        run_mode = str(getattr(request, "run_mode", "") or "controlled-run")
+        target_identifier = str(
+            getattr(request, "target_identifier", "")
+            or (self._active_run_config or {}).get("company")
+            or ""
+        )
+        candidate_version = str(
+            getattr(request, "candidate_version", "") or "source"
+        )
         self._diag_write_json(
             str(paths.run_config_path),
             {
@@ -1067,6 +1090,15 @@ class InvoiceAppAPI:
                 "date_from": self._effective_date_from,
                 "date_to": self._effective_date_to,
                 "active_run_config": dict(self._active_run_config or {}),
+                "before_exclusive": before_exclusive,
+                "account_channel": account_channel,
+                "mailbox": mailbox,
+                "target_company": target_identifier,
+                "run_mode": run_mode,
+                "hardware_mode": hardware_mode,
+                "hardware_fingerprint": hardware_fingerprint,
+                "candidate_revision": default_revision(),
+                "candidate_version": candidate_version,
                 "controlled_run": True,
                 "stage_map": {
                     "start_processing": "active",
@@ -2033,6 +2065,7 @@ class InvoiceAppAPI:
 
         from email_fetcher import EmailFetcher
         from invoice_extractor import InvoiceExtractor
+        from run_evidence import RunEvidenceWriter
 
         resources = {"fetcher": None, "pipeline": None}
 
@@ -2199,6 +2232,9 @@ class InvoiceAppAPI:
                 disconnect_callback=disconnect_callback,
                 cleanup_callback=cleanup_callback,
                 timeout_seconds=self._truth_audit_timeout_seconds + 1.0,
+                evidence_writer=RunEvidenceWriter(
+                    version_resolver=lambda: request.candidate_version,
+                ),
             ),
             cancel_requested=lambda: bool(self._stop_requested),
             secrets={"auth_code": auth_code, "api_key": api_key},
@@ -3313,6 +3349,25 @@ class InvoiceAppAPI:
                     rules_text=candidate.rules_text,
                     account_id=candidate.account_id,
                     channel_id=candidate.channel_id,
+                    before_exclusive=(
+                        datetime.strptime(candidate.date_to, "%Y-%m-%d")
+                        + timedelta(days=1)
+                    ).strftime("%Y-%m-%d"),
+                    account_domain=candidate.email_domain,
+                    mailbox="INBOX",
+                    target_identifier=active_company,
+                    run_mode=str(
+                        self._run_context.get("autostart_mode")
+                        or ("controlled-run" if self._run_context.get("enabled") else "interactive")
+                    ),
+                    run_root=str(self._run_context.get("run_root") or ""),
+                    evidence_required=bool(
+                        self._run_context.get("enabled")
+                        and self._run_context.get("run_root")
+                    ),
+                    candidate_version=str(
+                        self._run_context.get("candidate_version") or "source"
+                    ),
                 )
                 dependencies = self._build_run_dependencies(
                     request,
@@ -3380,6 +3435,7 @@ class InvoiceAppAPI:
                 secrets.email_address,
                 auth_code=secrets.auth_code,
                 api_key=secrets.api_key,
+                request=request,
             )
             try:
                 self._start_truth_audit_async(secrets.email_address, secrets.auth_code)

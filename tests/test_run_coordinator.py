@@ -45,6 +45,14 @@ def test_run_request_is_frozen_and_contains_no_secret_fields(tmp_path: Path):
         "rules_text",
         "account_id",
         "channel_id",
+        "before_exclusive",
+        "account_domain",
+        "mailbox",
+        "target_identifier",
+        "run_mode",
+        "run_root",
+        "evidence_required",
+        "candidate_version",
     }
     serialized = repr(request) + repr(asdict(request))
     assert "auth_code" not in serialized

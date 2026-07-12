@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -211,7 +211,23 @@ class ArchiveService:
         )
         if self._finalizer is not None:
             try:
-                self._finalizer(report, root)
+                final_paths = self._finalizer(report, root)
+                if isinstance(final_paths, dict):
+                    report = replace(
+                        report,
+                        outcomes=tuple(
+                            replace(
+                                item,
+                                archive_path=str(
+                                    final_paths.get(
+                                        item.outcome.candidate.identity.document_id,
+                                        item.archive_path,
+                                    )
+                                ),
+                            )
+                            for item in report.outcomes
+                        ),
+                    )
             except Exception:
                 report = ArchiveReport(
                     outcomes=report.outcomes,

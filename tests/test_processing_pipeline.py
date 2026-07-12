@@ -500,6 +500,34 @@ def test_trace_sink_failure_does_not_hide_later_terminal_outcomes():
     assert traces == 2
 
 
+def test_archive_finalizer_can_publish_final_renamed_path_for_lineage(tmp_path: Path):
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"invoice")
+    candidate = CandidatePipeline().collect(
+        [{"filepath": str(source), "message_uid": "100"}]
+    )[0]
+    outcome = ExtractionOutcome.resolved(candidate, {"InvoiceNumber": "12345678"})
+
+    def writer(_outcome, root):
+        initial = root / "餐饮" / "before.pdf"
+        initial.parent.mkdir(parents=True)
+        initial.write_bytes(source.read_bytes())
+        return str(initial)
+
+    def finalizer(report, _root):
+        initial = Path(report.outcomes[0].archive_path)
+        renamed = initial.with_name("after.pdf")
+        initial.replace(renamed)
+        return {candidate.identity.document_id: str(renamed)}
+
+    report = ArchiveService(writer=writer, finalizer=finalizer).archive(
+        [outcome], tmp_path / "output"
+    )
+
+    assert report.outcomes[0].archive_path.endswith("after.pdf")
+    assert Path(report.outcomes[0].archive_path).read_bytes() == b"invoice"
+
+
 def test_archive_is_single_threaded_ordered_and_idempotent(tmp_path: Path):
     calls: list[tuple[int, int]] = []
     main_thread = threading.get_ident()

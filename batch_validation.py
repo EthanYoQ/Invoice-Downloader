@@ -19,6 +19,12 @@ from typing import Any, Callable, Mapping
 
 from strict_truth_audit import compare as run_strict_audit
 from truth_contracts import TruthContractError, TruthManifest
+from run_evidence import (
+    compute_evidence_digest,
+    compute_inventory_digest as compute_production_inventory_digest,
+    compute_lineage_digest,
+    compute_scope_digest as compute_evidence_scope_digest,
+)
 
 
 UTC = dt.timezone.utc
@@ -117,6 +123,27 @@ def _default_reparse_checker(path: Path) -> bool:
         raise BatchValidationError("inventory_read_failed", path.name) from exc
     attributes = int(getattr(info, "st_file_attributes", 0) or 0)
     return stat.S_ISLNK(info.st_mode) or bool(attributes & 0x400)
+
+
+def _secure_directory(
+    value: str | Path,
+    *,
+    checker: Callable[[Path], bool],
+    missing_code: str,
+) -> Path:
+    nominal = Path(value).absolute()
+    if not nominal.is_dir():
+        raise BatchValidationError(missing_code)
+    anchor = Path(nominal.anchor)
+    current = anchor
+    for part in nominal.parts[1:]:
+        current = current / part
+        if current.exists() and checker(current):
+            raise BatchValidationError("reparse_point_rejected", current.name)
+    try:
+        return nominal.resolve(strict=True)
+    except OSError as exc:
+        raise BatchValidationError(missing_code) from exc
 
 
 def _sha256_file(path: Path) -> tuple[str, int]:
@@ -233,7 +260,13 @@ def compute_scope_digest(value: Mapping[str, Any]) -> str:
 
 
 def compute_performance_record_digest(value: Mapping[str, Any]) -> str:
-    return _sha256_json({key: item for key, item in value.items() if key != "record_digest"})
+    return _sha256_json(
+        {
+            key: item
+            for key, item in value.items()
+            if key not in {"record_digest", "contract_digest"}
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -246,6 +279,11 @@ class BatchValidationResult:
     manifest_sha256: str
     inventory_sha256: str
     scope_digest: str
+    evidence_digest: str
+    lineage_digest: str
+    strict_digest: str
+    validation_digest: str
+    manifest_path: str
     validation_started_at_utc: str
     audit_started_at_utc: str
     audit_completed_at_utc: str
@@ -265,6 +303,11 @@ class BatchValidationResult:
             "manifest_sha256": self.manifest_sha256,
             "inventory_sha256": self.inventory_sha256,
             "scope_digest": self.scope_digest,
+            "evidence_digest": self.evidence_digest,
+            "lineage_digest": self.lineage_digest,
+            "strict_digest": self.strict_digest,
+            "validation_digest": self.validation_digest,
+            "manifest_path": self.manifest_path,
             "validation_started_at_utc": self.validation_started_at_utc,
             "audit_started_at_utc": self.audit_started_at_utc,
             "audit_completed_at_utc": self.audit_completed_at_utc,
@@ -310,6 +353,7 @@ class BatchValidator:
     CONFIG_PATH = Path("monitoring/run_config.json")
     EVIDENCE_PATH = Path("diagnostics/run_evidence.json")
     SUPPLIED_AUDIT_PATH = Path("diagnostics/strict_truth_audit.json")
+    REPORT_PATH = Path("diagnostics/batch_validation.json")
 
     def __init__(
         self,
@@ -330,15 +374,20 @@ class BatchValidator:
         run_root: str | Path,
     ) -> BatchValidationResult:
         validation_started = self._now()
+        manifest_path = ""
+        if isinstance(manifest, (str, Path)):
+            manifest_path = str(Path(manifest).resolve(strict=True))
         try:
             truth = self._truth(manifest)
         except TruthContractError as exc:
             raise BatchValidationError(exc.code, exc.detail) from exc
         truth_mapping = truth.to_mapping()
         manifest_sha256 = _sha256_json(truth_mapping)
-        root = Path(run_root).absolute()
-        if not root.is_dir():
-            raise BatchValidationError("invalid_run_root")
+        root = _secure_directory(
+            run_root,
+            checker=self._reparse_checker,
+            missing_code="invalid_run_root",
+        )
         config = _load_json(root / self.CONFIG_PATH, "missing_run_config")
         evidence = _load_json(root / self.EVIDENCE_PATH, "missing_run_evidence")
         revision = str(self._revision_resolver() or "").strip()
@@ -362,19 +411,44 @@ class BatchValidator:
             raise BatchValidationError("inventory_changed_during_validation")
         inventory = post_audit_inventory
         counts, assignments = self._validate_fresh_audit(fresh, truth, root, inventory)
-        self._validate_supplied_audit(
-            root,
-            run_id=run_id,
-            revision=revision,
-            manifest_sha256=manifest_sha256,
+        assignments = self._validate_production_lineage(
+            evidence,
+            truth=truth,
+            assignments=assignments,
             inventory=inventory,
-            run_end=run_end,
-            invocation_start=validation_started,
+            scope=scope,
         )
         validation_completed = self._now()
         if validation_completed < audit_completed:
             raise BatchValidationError("invalid_validator_clock")
         scope_digest = _sha256_json(scope)
+        strict_digest = _sha256_json(
+            {
+                "counts": counts,
+                "assignments": [
+                    {
+                        "truth_id": row["truth_id"],
+                        "canonical_path": row["canonical_path"],
+                        "artifact_sha256": row["artifact_sha256"],
+                        "document_id": row["document_id"],
+                    }
+                    for row in assignments
+                ],
+            }
+        )
+        validation_binding = {
+            "run_id": run_id,
+            "run_root": str(root),
+            "candidate_revision": revision,
+            "candidate_version": version,
+            "manifest_sha256": manifest_sha256,
+            "inventory_sha256": inventory.digest,
+            "scope_digest": scope_digest,
+            "evidence_digest": str(evidence["evidence_digest"]),
+            "lineage_digest": str(evidence["lineage_digest"]),
+            "strict_digest": strict_digest,
+        }
+        validation_digest = _sha256_json(validation_binding)
         fresh_bound = {
             "run_id": run_id,
             "run_root": str(root),
@@ -398,6 +472,11 @@ class BatchValidator:
             manifest_sha256=manifest_sha256,
             inventory_sha256=inventory.digest,
             scope_digest=scope_digest,
+            evidence_digest=str(evidence["evidence_digest"]),
+            lineage_digest=str(evidence["lineage_digest"]),
+            strict_digest=strict_digest,
+            validation_digest=validation_digest,
+            manifest_path=manifest_path,
             validation_started_at_utc=_utc_text(validation_started),
             audit_started_at_utc=_utc_text(audit_started),
             audit_completed_at_utc=_utc_text(audit_completed),
@@ -488,6 +567,10 @@ class BatchValidator:
             raise BatchValidationError("scope_mismatch", "run evidence root")
         if evidence.get("candidate_revision") != revision or evidence.get("candidate_version") != version:
             raise BatchValidationError("version_mismatch")
+        if int(evidence.get("schema_version", 0) or 0) != 1:
+            raise BatchValidationError("invalid_run_evidence_schema")
+        if str(evidence.get("evidence_digest") or "") != compute_evidence_digest(evidence):
+            raise BatchValidationError("run_evidence_digest_mismatch")
         start = _decimal(evidence.get("started_monotonic_seconds"), code="invalid_timing_boundary")
         end = _decimal(evidence.get("ended_monotonic_seconds"), code="invalid_timing_boundary")
         elapsed = _decimal(evidence.get("elapsed_seconds"), code="invalid_timing_boundary")
@@ -498,6 +581,139 @@ class BatchValidator:
         if wall_end < wall_start:
             raise BatchValidationError("invalid_run_time")
         return wall_end
+
+    @staticmethod
+    def _validate_production_lineage(
+        evidence: Mapping[str, Any],
+        *,
+        truth: TruthManifest,
+        assignments: list[dict[str, Any]],
+        inventory: InventorySnapshot,
+        scope: Mapping[str, str],
+    ) -> list[dict[str, Any]]:
+        evidence_scope = evidence.get("scope")
+        if not isinstance(evidence_scope, Mapping) or dict(evidence_scope) != dict(scope):
+            raise BatchValidationError("run_evidence_scope_mismatch")
+        if (
+            str(evidence.get("hardware_mode") or "")
+            != str(evidence_scope.get("hardware_mode") or "")
+            or str(evidence.get("hardware_fingerprint") or "")
+            != str(evidence_scope.get("hardware_fingerprint") or "")
+        ):
+            raise BatchValidationError("run_evidence_scope_mismatch")
+        if str(evidence.get("scope_digest") or "") != compute_evidence_scope_digest(evidence_scope):
+            raise BatchValidationError("run_evidence_scope_mismatch")
+        raw_inventory = evidence.get("output_inventory")
+        if not isinstance(raw_inventory, list):
+            raise BatchValidationError("run_evidence_inventory_mismatch")
+        try:
+            evidence_inventory_digest = compute_production_inventory_digest(raw_inventory)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BatchValidationError("run_evidence_inventory_mismatch") from exc
+        if (
+            evidence_inventory_digest != inventory.digest
+            or str(evidence.get("inventory_sha256") or "") != inventory.digest
+        ):
+            raise BatchValidationError("run_evidence_inventory_mismatch")
+        expected_inventory = {
+            canonical_windows_path(entry.relative_path): (entry.sha256, entry.size)
+            for entry in inventory.entries
+        }
+        supplied_inventory: dict[str, tuple[str, int]] = {}
+        for item in raw_inventory:
+            if not isinstance(item, Mapping):
+                raise BatchValidationError("run_evidence_inventory_mismatch")
+            canonical = canonical_windows_path(str(item.get("relative_path") or ""))
+            if not canonical or canonical in supplied_inventory:
+                raise BatchValidationError("run_evidence_inventory_mismatch")
+            try:
+                supplied_inventory[canonical] = (
+                    str(item.get("sha256") or "").lower(),
+                    int(item.get("size")),
+                )
+            except (TypeError, ValueError) as exc:
+                raise BatchValidationError("run_evidence_inventory_mismatch") from exc
+        if supplied_inventory != expected_inventory:
+            raise BatchValidationError("run_evidence_inventory_mismatch")
+
+        lineage = evidence.get("lineage")
+        if not isinstance(lineage, list) or not lineage:
+            raise BatchValidationError("missing_document_lineage")
+        if str(evidence.get("lineage_digest") or "") != compute_lineage_digest(lineage):
+            raise BatchValidationError("lineage_digest_mismatch")
+        by_path: dict[str, Mapping[str, Any]] = {}
+        document_ids: set[str] = set()
+        output_root = Path(inventory.root)
+        for row in lineage:
+            if not isinstance(row, Mapping):
+                raise BatchValidationError("invalid_document_lineage")
+            document_id = str(row.get("document_id") or "").strip()
+            relative = str(row.get("output_relative_path") or "").strip()
+            source_uid = str(row.get("source_email_uid") or "").strip()
+            source_chain = row.get("source_chain_sha256s")
+            if (
+                str(row.get("run_id") or "") != str(evidence.get("run_id") or "")
+                or
+                not document_id
+                or document_id in document_ids
+                or not source_uid
+                or not isinstance(source_chain, list)
+                or not source_chain
+            ):
+                raise BatchValidationError("invalid_document_lineage")
+            absolute = output_root / Path(relative)
+            canonical = canonical_windows_path(str(absolute.resolve()))
+            if canonical in by_path:
+                raise BatchValidationError("duplicate_lineage_assignment")
+            entry = inventory.by_canonical_path.get(canonical)
+            if entry is None:
+                raise BatchValidationError("lineage_output_mismatch")
+            try:
+                output_size = int(row.get("output_size"))
+            except (TypeError, ValueError) as exc:
+                raise BatchValidationError("lineage_output_mismatch") from exc
+            if (
+                str(row.get("output_sha256") or "").lower() != entry.sha256
+                or output_size != entry.size
+            ):
+                raise BatchValidationError("lineage_output_mismatch")
+            if not all(
+                isinstance(value, str)
+                and len(value) == 64
+                and all(char in "0123456789abcdefABCDEF" for char in value)
+                for value in source_chain
+            ):
+                raise BatchValidationError("invalid_document_lineage")
+            if not str(row.get("transformation_type") or "") or not str(row.get("provider_type") or ""):
+                raise BatchValidationError("invalid_document_lineage")
+            if not isinstance(row.get("invoice_identity"), Mapping):
+                raise BatchValidationError("invalid_document_lineage")
+            document_ids.add(document_id)
+            by_path[canonical] = row
+
+        truth_by_id = {row.truth_id: row for row in truth.included}
+        bound: list[dict[str, Any]] = []
+        for assignment in assignments:
+            lineage_row = by_path.get(str(assignment["canonical_path"]))
+            if lineage_row is None:
+                raise BatchValidationError("missing_assignment_lineage")
+            truth_row = truth_by_id[str(assignment["truth_id"])]
+            strong_hashes = {
+                str(value).lower()
+                for value in lineage_row["source_chain_sha256s"]
+            }
+            strong_hashes.add(str(lineage_row["output_sha256"]).lower())
+            if truth_row.artifact_sha256.lower() not in strong_hashes:
+                raise BatchValidationError("truth_lineage_mismatch", truth_row.truth_id)
+            bound.append(
+                {
+                    **assignment,
+                    "document_id": str(lineage_row["document_id"]),
+                    "source_email_uid": str(lineage_row["source_email_uid"]),
+                    "lineage_output_sha256": str(lineage_row["output_sha256"]),
+                }
+            )
+        return bound
 
     @staticmethod
     def _strict_counts(audit: Mapping[str, Any]) -> dict[str, int]:
@@ -563,55 +779,20 @@ class BatchValidator:
         counts["matched"] = len(assignments)
         return counts, assignments
 
-    @staticmethod
-    def _validate_supplied_audit(
-        root: Path,
-        *,
-        run_id: str,
-        revision: str,
-        manifest_sha256: str,
-        inventory: InventorySnapshot,
-        run_end: dt.datetime,
-        invocation_start: dt.datetime,
-    ) -> None:
-        path = root / BatchValidator.SUPPLIED_AUDIT_PATH
-        if not path.exists():
-            return
-        supplied = _load_json(path, "stale_supplied_audit")
-        generated = _utc(supplied.get("generated_at_utc"), code="stale_supplied_audit")
-        expected = {
-            "run_id": run_id,
-            "candidate_revision": revision,
-            "manifest_sha256": manifest_sha256,
-            "inventory_sha256": inventory.digest,
-        }
-        if any(str(supplied.get(field) or "") != value for field, value in expected.items()):
-            raise BatchValidationError("stale_supplied_audit")
-        if canonical_windows_path(str(supplied.get("run_root") or "")) != canonical_windows_path(str(root)):
-            raise BatchValidationError("stale_supplied_audit")
-        if generated <= run_end or generated > invocation_start:
-            raise BatchValidationError("stale_supplied_audit")
-        rows = supplied.get("matched_rows")
-        if not isinstance(rows, list):
-            raise BatchValidationError("stale_supplied_audit")
-        inventory_map = inventory.by_canonical_path
-        seen = set()
-        for row in rows:
-            if not isinstance(row, Mapping):
-                raise BatchValidationError("stale_supplied_audit")
-            canonical = canonical_windows_path(str(row.get("matched_path") or ""))
-            if canonical in seen or canonical not in inventory_map:
-                raise BatchValidationError("stale_supplied_audit")
-            seen.add(canonical)
-            if str(row.get("artifact_sha256") or "").lower() != inventory_map[canonical].sha256:
-                raise BatchValidationError("stale_supplied_audit")
 
     def write_report(self, result: BatchValidationResult, run_root: str | Path) -> Path:
-        root = Path(run_root).absolute()
+        root = _secure_directory(
+            run_root,
+            checker=self._reparse_checker,
+            missing_code="invalid_run_root",
+        )
         diagnostics = root / "diagnostics"
         diagnostics.mkdir(parents=True, exist_ok=True)
-        if self._reparse_checker(diagnostics):
-            raise BatchValidationError("output_path_escape")
+        _secure_directory(
+            diagnostics,
+            checker=self._reparse_checker,
+            missing_code="output_path_escape",
+        )
         if not canonical_windows_path(str(diagnostics)).startswith(canonical_windows_path(str(root)) + "/"):
             raise BatchValidationError("output_path_escape")
         output = diagnostics / "batch_validation.json"
@@ -628,37 +809,84 @@ class BatchValidator:
         return output
 
 
-def _performance_elapsed(payload: Mapping[str, Any]) -> Decimal:
-    elapsed = _decimal(payload.get("elapsed_seconds"), code="invalid performance seconds")
-    start = _decimal(payload.get("started_monotonic_seconds"), code="invalid performance seconds")
-    end = _decimal(payload.get("ended_monotonic_seconds"), code="invalid performance seconds")
-    if end < start or end - start != elapsed:
+def _accepted_baseline(payload: Mapping[str, Any]) -> tuple[Decimal, dict[str, str], str]:
+    if int(payload.get("schema_version", 0) or 0) != 1 or payload.get("accepted") is not True:
+        raise BatchValidationError("invalid_baseline_contract")
+    if str(payload.get("contract_digest") or "") != compute_performance_record_digest(payload):
+        raise BatchValidationError("invalid_baseline_contract")
+    required = (
+        "run_id",
+        "run_root",
+        "revision",
+        "inventory_sha256",
+        "strict_digest",
+        "manifest_sha256",
+        "hardware_mode",
+        "hardware_fingerprint",
+    )
+    if not all(str(payload.get(field) or "").strip() for field in required):
+        raise BatchValidationError("invalid_baseline_contract")
+    scope = payload.get("scope")
+    if not isinstance(scope, Mapping) or not all(str(value or "").strip() for value in scope.values()):
+        raise BatchValidationError("invalid_baseline_contract")
+    normalized_scope = {str(key): str(value) for key, value in scope.items()}
+    if str(payload.get("scope_digest") or "") != _sha256_json(normalized_scope):
+        raise BatchValidationError("invalid_baseline_contract")
+    if (
+        normalized_scope.get("hardware_mode") != str(payload.get("hardware_mode"))
+        or normalized_scope.get("hardware_fingerprint")
+        != str(payload.get("hardware_fingerprint"))
+    ):
+        raise BatchValidationError("invalid_baseline_contract")
+    elapsed = _decimal(payload.get("elapsed_seconds"), code="invalid_baseline_contract")
+    if elapsed <= 0:
+        raise BatchValidationError("invalid_baseline_contract")
+    return elapsed, normalized_scope, str(payload["contract_digest"])
+
+
+def _revalidate_candidate_report(
+    report_path: Path,
+    *,
+    revision_resolver: Callable[[], str],
+) -> tuple[BatchValidationResult, Mapping[str, Any], Decimal]:
+    try:
+        report = _load_json(report_path, "candidate_validation_report_invalid")
+        root = Path(str(report.get("run_root") or "")).resolve(strict=True)
+    except (OSError, TypeError, ValueError) as exc:
+        raise BatchValidationError("candidate_validation_report_invalid") from exc
+    expected_report = root / BatchValidator.REPORT_PATH
+    if canonical_windows_path(str(report_path.resolve())) != canonical_windows_path(str(expected_report)):
+        raise BatchValidationError("candidate_validation_report_invalid")
+    manifest_path = str(report.get("manifest_path") or "")
+    if not manifest_path:
+        raise BatchValidationError("candidate_validation_report_invalid")
+    validator = BatchValidator(revision_resolver=revision_resolver)
+    fresh = validator.validate(manifest_path, root)
+    stable_fields = (
+        "run_id",
+        "run_root",
+        "candidate_revision",
+        "candidate_version",
+        "manifest_sha256",
+        "inventory_sha256",
+        "scope_digest",
+        "evidence_digest",
+        "lineage_digest",
+        "strict_digest",
+        "validation_digest",
+    )
+    fresh_mapping = fresh.to_mapping()
+    if any(str(report.get(field) or "") != str(fresh_mapping[field]) for field in stable_fields):
+        raise BatchValidationError("candidate_validation_report_mismatch")
+    evidence = _load_json(root / BatchValidator.EVIDENCE_PATH, "missing_run_evidence")
+    if str(evidence.get("evidence_digest") or "") != fresh.evidence_digest:
+        raise BatchValidationError("candidate_validation_report_mismatch")
+    elapsed = _decimal(evidence.get("elapsed_seconds"), code="invalid_performance_boundaries")
+    start = _decimal(evidence.get("started_monotonic_seconds"), code="invalid_performance_boundaries")
+    end = _decimal(evidence.get("ended_monotonic_seconds"), code="invalid_performance_boundaries")
+    if elapsed <= 0 or end - start != elapsed:
         raise BatchValidationError("invalid_performance_boundaries")
-    return elapsed
-
-
-def _validate_performance_record(payload: Mapping[str, Any], *, candidate: bool, revision: str) -> tuple[Decimal, str, str]:
-    if "scope_id" in payload:
-        raise BatchValidationError("arbitrary_scope_id")
-    scope_digest = compute_scope_digest(payload)
-    if payload.get("scope_digest") != scope_digest:
-        raise BatchValidationError("scope_digest_mismatch")
-    run_id = str(payload.get("run_id") or "").strip()
-    if not run_id:
-        raise BatchValidationError("invalid_performance_run")
-    wall_start = _utc(payload.get("started_at_utc"), code="invalid_performance_time")
-    wall_end = _utc(payload.get("ended_at_utc"), code="invalid_performance_time")
-    if wall_end < wall_start:
-        raise BatchValidationError("invalid_performance_time")
-    record_revision = str(payload.get("revision") or "").strip()
-    if not record_revision:
-        raise BatchValidationError("performance_revision_missing")
-    if candidate and record_revision != revision:
-        raise BatchValidationError("performance_revision_mismatch")
-    record_digest = compute_performance_record_digest(payload)
-    if payload.get("record_digest") != record_digest:
-        raise BatchValidationError("performance_record_digest_mismatch")
-    return _performance_elapsed(payload), scope_digest, record_digest
+    return fresh, evidence, elapsed
 
 
 def compare_performance(
@@ -668,17 +896,17 @@ def compare_performance(
     revision_resolver: Callable[[], str] | None = None,
 ) -> PerformanceVerdict:
     baseline_payload = _load_json(Path(baseline_json), "invalid_baseline_metrics")
-    candidate_payload = _load_json(Path(candidate_json), "invalid_candidate_metrics")
-    revision = str((revision_resolver or resolve_current_revision)() or "").strip()
-    baseline, baseline_scope, baseline_record = _validate_performance_record(
-        baseline_payload, candidate=False, revision=revision,
+    resolver = revision_resolver or resolve_current_revision
+    baseline, baseline_scope, baseline_record = _accepted_baseline(baseline_payload)
+    candidate_result, _candidate_evidence, candidate = _revalidate_candidate_report(
+        Path(candidate_json), revision_resolver=resolver
     )
-    candidate, candidate_scope, candidate_record = _validate_performance_record(
-        candidate_payload, candidate=True, revision=revision,
-    )
+    candidate_scope = dict(candidate_result.scope)
     if baseline_scope != candidate_scope:
         raise BatchValidationError("performance_contract_mismatch")
-    if baseline_payload.get("run_id") == candidate_payload.get("run_id"):
+    if str(baseline_payload.get("manifest_sha256") or "") != candidate_result.manifest_sha256:
+        raise BatchValidationError("performance_contract_mismatch")
+    if baseline_payload.get("run_id") == candidate_result.run_id:
         raise BatchValidationError("performance_run_reused")
     if baseline <= 0:
         raise BatchValidationError("invalid performance seconds")
@@ -691,11 +919,11 @@ def compare_performance(
         target_seconds=format(target, ".2f"),
         speedup_fraction=format(speedup, ".8f"),
         threshold_fraction=format(threshold, ".2f"),
-        scope_digest=baseline_scope,
+        scope_digest=candidate_result.scope_digest,
         baseline_revision=str(baseline_payload["revision"]),
-        candidate_revision=str(candidate_payload["revision"]),
+        candidate_revision=candidate_result.candidate_revision,
         baseline_record_digest=baseline_record,
-        candidate_record_digest=candidate_record,
+        candidate_record_digest=candidate_result.validation_digest,
         passed=candidate <= target,
     )
 

@@ -15,7 +15,12 @@ from batch_validation import (
     compare_performance,
     compute_inventory,
     compute_performance_record_digest,
-    compute_scope_digest,
+)
+from run_evidence import (
+    compute_evidence_digest,
+    compute_inventory_digest as compute_production_inventory_digest,
+    compute_lineage_digest,
+    compute_scope_digest as compute_evidence_scope_digest,
 )
 
 
@@ -79,15 +84,18 @@ def _write_jsonl(path: Path, rows: list[dict]) -> Path:
     return path
 
 
-def _run_root(tmp_path: Path, rows=1) -> Path:
+def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
     root = tmp_path / "run"
     output = root / "output" / "餐饮"
     output.mkdir(parents=True)
     events = []
+    lineage = []
     for index in range(rows):
         suffix = index + 1
         artifact = output / f"invoice-{suffix}.pdf"
         artifact.write_bytes(f"artifact-{suffix}".encode())
+        artifact_bytes = artifact.read_bytes()
+        artifact_sha = __import__("hashlib").sha256(artifact_bytes).hexdigest()
         events.append({
             "kind": "archive",
             "document_id": f"doc-{suffix}",
@@ -97,6 +105,27 @@ def _run_root(tmp_path: Path, rows=1) -> Path:
             "category": "餐饮",
             "final_type": "餐饮",
             "seller": f"标准商户{suffix}",
+        })
+        lineage.append({
+            "run_id": "run-1",
+            "document_id": f"doc-{suffix}",
+            "source_email_uid": str(99 + suffix),
+            "source_chain_sha256s": [f"{suffix:x}" * 64],
+            "output_relative_path": f"餐饮/invoice-{suffix}.pdf",
+            "output_sha256": artifact_sha,
+            "output_size": len(artifact_bytes),
+            "invoice_identity": {
+                "invoice_code": "",
+                "invoice_number": str(12345677 + suffix),
+                "invoice_date": "2026-06-10",
+                "amount": f"{suffix * 100}.00",
+                "seller": f"标准商户{suffix}",
+                "purchaser": "目标公司",
+                "document_type": "餐饮",
+                "category": "餐饮",
+            },
+            "transformation_type": "attachment",
+            "provider_type": "local",
         })
     _write_jsonl(root / "monitoring" / "artifact_events.jsonl", events)
     _write_json(root / "monitoring" / "run_config.json", {
@@ -115,19 +144,48 @@ def _run_root(tmp_path: Path, rows=1) -> Path:
         "candidate_revision": REVISION,
         "candidate_version": VERSION,
     })
-    _write_json(root / "diagnostics" / "run_evidence.json", {
+    scope = {
+        "date_from": "2026-06-01",
+        "date_to": "2026-06-13",
+        "before_exclusive": "2026-06-14",
+        "account_domain": "qq.com",
+        "account_channel": "qq",
+        "mailbox": "INBOX",
+        "target_identifier": "目标公司",
+        "run_mode": "clean-mailbox",
+        "hardware_mode": "windows-desktop-standard",
+        "hardware_fingerprint": "host-fixture-v1",
+    }
+    inventory = [
+        {
+            "relative_path": row["output_relative_path"],
+            "size": row["output_size"],
+            "sha256": row["output_sha256"],
+        }
+        for row in lineage
+    ]
+    evidence = {
+        "schema_version": 1,
         "run_id": "run-1",
         "run_root": str(root.resolve()),
         "started_monotonic_seconds": "100.00",
-        "ended_monotonic_seconds": "2383.79",
-        "elapsed_seconds": "2283.79",
+        "ended_monotonic_seconds": str(Decimal("100.00") + Decimal(elapsed)),
+        "elapsed_seconds": elapsed,
         "started_at_utc": "2026-07-10T23:00:00Z",
         "ended_at_utc": RUN_END,
         "hardware_mode": "windows-desktop-standard",
         "hardware_fingerprint": "host-fixture-v1",
         "candidate_revision": REVISION,
         "candidate_version": VERSION,
-    })
+        "scope": scope,
+        "scope_digest": compute_evidence_scope_digest(scope),
+        "lineage": lineage,
+        "lineage_digest": compute_lineage_digest(lineage),
+        "output_inventory": inventory,
+        "inventory_sha256": compute_production_inventory_digest(inventory),
+    }
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(root / "diagnostics" / "run_evidence.json", evidence)
     return root
 
 
@@ -182,23 +240,23 @@ def test_forged_supplied_success_cannot_hide_missing_artifact(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("overrides", "code"),
+    "overrides",
     [
-        ({"generated_at_utc": "2099-01-01T00:00:00Z"}, "stale_supplied_audit"),
-        ({"run_id": "copied-old-run"}, "stale_supplied_audit"),
-        ({"candidate_revision": "arbitrary-revision"}, "stale_supplied_audit"),
-        ({"matched_rows": [{"truth_id": "t1", "matched_path": "C:/does/not/exist.pdf"}]}, "stale_supplied_audit"),
+        {"generated_at_utc": "2099-01-01T00:00:00Z"},
+        {"run_id": "copied-old-run"},
+        {"candidate_revision": "arbitrary-revision"},
+        {"matched_rows": [{"truth_id": "t1", "matched_path": "C:/does/not/exist.pdf"}]},
     ],
 )
-def test_supplied_audit_is_comparison_only_and_must_be_bound(tmp_path, overrides, code):
+def test_supplied_audit_is_ignored_and_never_used_as_decision_input(tmp_path, overrides):
     root = _run_root(tmp_path)
     initial = _validator().validate(_manifest(), root)
     _write_bound_supplied_audit(root, initial, **overrides)
 
-    with pytest.raises(BatchValidationError) as exc_info:
-        _validator().validate(_manifest(), root)
+    result = _validator().validate(_manifest(), root)
 
-    assert exc_info.value.code == code
+    assert result.passed is True
+    assert [row["truth_id"] for row in result.assignments] == ["t1"]
 
 
 def test_tampered_output_invalidates_old_inventory_binding(tmp_path):
@@ -210,7 +268,90 @@ def test_tampered_output_invalidates_old_inventory_binding(tmp_path):
     with pytest.raises(BatchValidationError) as exc_info:
         _validator().validate(_manifest(), root)
 
-    assert exc_info.value.code == "stale_supplied_audit"
+    assert exc_info.value.code in {"run_evidence_inventory_mismatch", "lineage_output_mismatch"}
+
+
+def test_candidate_run_without_lineage_fails_closed(tmp_path):
+    root = _run_root(tmp_path)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["lineage"] = []
+    evidence["lineage_digest"] = compute_lineage_digest([])
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code == "missing_document_lineage"
+
+
+def test_weak_business_match_cannot_satisfy_truth_without_content_lineage(tmp_path):
+    root = _run_root(tmp_path)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["lineage"][0]["source_chain_sha256s"] = ["f" * 64]
+    evidence["lineage_digest"] = compute_lineage_digest(evidence["lineage"])
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code == "truth_lineage_mismatch"
+
+
+def test_lineage_run_id_is_bound_to_top_level_evidence(tmp_path):
+    root = _run_root(tmp_path)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["lineage"][0]["run_id"] = "copied-other-run"
+    evidence["lineage_digest"] = compute_lineage_digest(evidence["lineage"])
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code == "invalid_document_lineage"
+
+
+def test_top_level_hardware_is_bound_to_evidence_scope(tmp_path):
+    root = _run_root(tmp_path)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["hardware_fingerprint"] = "different-host"
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code == "run_evidence_scope_mismatch"
+
+
+def test_replaced_output_bytes_fail_even_when_weak_fields_still_match(tmp_path):
+    root = _run_root(tmp_path)
+    (root / "output" / "餐饮" / "invoice-1.pdf").write_bytes(b"arbitrary replacement")
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), root)
+
+    assert exc_info.value.code in {"run_evidence_inventory_mismatch", "lineage_output_mismatch"}
+
+
+def test_tampered_supplied_audit_is_ignored_in_favor_of_fresh_evidence(tmp_path):
+    root = _run_root(tmp_path)
+    _write_json(root / "diagnostics" / "strict_truth_audit.json", {
+        "exit_code": 0,
+        "matched_rows": [{"truth_id": "forged", "matched_path": "C:/forged.pdf"}],
+        "generated_at_utc": "2099-01-01T00:00:00Z",
+    })
+
+    result = _validator().validate(_manifest(), root)
+
+    assert result.passed is True
+    assert [row["truth_id"] for row in result.assignments] == ["t1"]
 
 
 def test_output_mutation_during_fresh_audit_is_rejected(tmp_path):
@@ -315,104 +456,141 @@ def test_actual_symlink_or_windows_junction_is_rejected(tmp_path):
     assert exc_info.value.code == "reparse_point_rejected"
 
 
-def _performance_payload(*, seconds: str, revision: str, run_id: str, start: str, end: str) -> dict:
-    value = {
-        "date_from": "2025-11-25",
-        "date_to": "2026-06-14",
-        "before_exclusive": "2026-06-15",
-        "account_domain": "qq.com",
-        "account_channel": "qq",
-        "mailbox": "INBOX",
-        "target_identifier": "辉瑞",
-        "run_mode": "clean-mailbox",
-        "hardware_mode": "windows-desktop-standard",
-        "hardware_fingerprint": "host-fixture-v1",
-        "revision": revision,
-        "run_id": run_id,
-        "started_at_utc": start,
-        "ended_at_utc": end,
-        "started_monotonic_seconds": "100.00",
-        "ended_monotonic_seconds": str(Decimal("100.00") + Decimal(seconds)),
+def test_nominal_run_root_junction_is_rejected(tmp_path):
+    target = _run_root(tmp_path / "target")
+    nominal = tmp_path / "nominal-run"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(nominal), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert created.returncode == 0, created.stderr
+    else:
+        nominal.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        _validator().validate(_manifest(), nominal)
+
+    assert exc_info.value.code == "reparse_point_rejected"
+
+
+def _candidate_report(tmp_path: Path, *, seconds: str):
+    root = _run_root(tmp_path, elapsed=seconds)
+    manifest_path = _write_json(tmp_path / "manifest.json", _manifest())
+    validator = _validator()
+    result = validator.validate(manifest_path, root)
+    report_path = validator.write_report(result, root)
+    return root, manifest_path, report_path, result
+
+
+def _baseline_contract(path: Path, candidate_result, *, seconds="3262.55") -> Path:
+    payload = {
+        "schema_version": 1,
+        "accepted": True,
+        "run_id": "accepted-baseline-run",
+        "run_root": "C:/accepted/baseline/run",
+        "revision": "baseline-d46a504",
         "elapsed_seconds": seconds,
+        "scope": dict(candidate_result.scope),
+        "scope_digest": candidate_result.scope_digest,
+        "hardware_mode": candidate_result.scope["hardware_mode"],
+        "hardware_fingerprint": candidate_result.scope["hardware_fingerprint"],
+        "inventory_sha256": "b" * 64,
+        "strict_digest": "c" * 64,
+        "manifest_sha256": candidate_result.manifest_sha256,
     }
-    value["scope_digest"] = compute_scope_digest(value)
-    value["record_digest"] = compute_performance_record_digest(value)
-    return value
+    payload["contract_digest"] = compute_performance_record_digest(payload)
+    return _write_json(path, payload)
 
 
 @pytest.mark.parametrize(("candidate", "passed"), [("2283.79", True), ("2283.80", False)])
 def test_performance_threshold_is_decimal_and_inclusive(tmp_path, candidate, passed):
-    baseline = _write_json(tmp_path / "baseline.json", _performance_payload(
-        seconds="3262.55", revision="baseline-d46a504", run_id="baseline-run",
-        start="2026-06-24T00:00:00Z", end="2026-06-24T00:54:22.55Z",
-    ))
-    candidate_path = _write_json(tmp_path / "candidate.json", _performance_payload(
-        seconds=candidate, revision=REVISION, run_id="candidate-run",
-        start="2026-07-12T00:00:00Z", end="2026-07-12T00:38:03.80Z",
-    ))
+    _root, _manifest_path, candidate_path, result = _candidate_report(
+        tmp_path, seconds=candidate
+    )
+    baseline = _baseline_contract(tmp_path / "baseline.json", result)
 
-    verdict = compare_performance(baseline, candidate_path, revision_resolver=lambda: REVISION)
+    verdict = compare_performance(
+        baseline,
+        candidate_path,
+        revision_resolver=lambda: REVISION,
+    )
 
     assert verdict.target_seconds == "2283.79"
     assert verdict.passed is passed
-    assert verdict.scope_digest == compute_scope_digest(json.loads(baseline.read_text(encoding="utf-8")))
+    assert verdict.scope_digest == result.scope_digest
     assert verdict.baseline_revision == "baseline-d46a504"
     assert verdict.candidate_revision == REVISION
 
 
-@pytest.mark.parametrize(
-    ("mutation", "code"),
-    [
-        (lambda value: value.update(scope_id="attacker-chosen"), "arbitrary_scope_id"),
-        (lambda value: value.update(scope_digest="0" * 64), "scope_digest_mismatch"),
-        (lambda value: value.update(hardware_fingerprint="other-host"), "scope_digest_mismatch"),
-        (lambda value: value.update(account_domain="163.com"), "scope_digest_mismatch"),
-        (lambda value: value.update(revision="forged"), "performance_revision_mismatch"),
-        (lambda value: value.update(run_id=""), "invalid_performance_run"),
-        (lambda value: value.update(ended_at_utc="not-a-time"), "invalid_performance_time"),
-    ],
-)
-def test_performance_rejects_scope_hardware_revision_and_time_tampering(tmp_path, mutation, code):
-    baseline_payload = _performance_payload(
-        seconds="3262.55", revision="baseline-d46a504", run_id="baseline-run",
-        start="2026-06-24T00:00:00Z", end="2026-06-24T00:54:22.55Z",
+def test_forged_caller_created_candidate_report_cannot_pass(tmp_path):
+    _root, _manifest_path, report_path, result = _candidate_report(
+        tmp_path, seconds="2283.79"
     )
-    candidate_payload = _performance_payload(
-        seconds="2283.79", revision=REVISION, run_id="candidate-run",
-        start="2026-07-12T00:00:00Z", end="2026-07-12T00:38:03.79Z",
-    )
-    mutation(candidate_payload)
+    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    forged = json.loads(report_path.read_text(encoding="utf-8"))
+    forged["validation_digest"] = "f" * 64
+    _write_json(report_path, forged)
 
     with pytest.raises(BatchValidationError) as exc_info:
-        compare_performance(
-            _write_json(tmp_path / "baseline.json", baseline_payload),
-            _write_json(tmp_path / "candidate.json", candidate_payload),
-            revision_resolver=lambda: REVISION,
-        )
+        compare_performance(baseline, report_path, revision_resolver=lambda: REVISION)
 
-    assert exc_info.value.code == code
+    assert exc_info.value.code == "candidate_validation_report_mismatch"
+
+
+def test_independent_candidate_metrics_json_is_rejected(tmp_path):
+    _root, _manifest_path, _report_path, result = _candidate_report(
+        tmp_path / "real", seconds="2283.79"
+    )
+    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    arbitrary = _write_json(tmp_path / "candidate.json", {
+        "run_id": "invented",
+        "elapsed_seconds": "1.00",
+        "revision": REVISION,
+    })
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        compare_performance(baseline, arbitrary, revision_resolver=lambda: REVISION)
+
+    assert exc_info.value.code == "candidate_validation_report_invalid"
+
+
+def test_candidate_timing_tampering_invalidates_revalidation(tmp_path):
+    root, _manifest_path, report_path, result = _candidate_report(
+        tmp_path, seconds="2283.79"
+    )
+    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["elapsed_seconds"] = "1.00"
+    evidence["ended_monotonic_seconds"] = "101.00"
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(BatchValidationError) as exc_info:
+        compare_performance(baseline, report_path, revision_resolver=lambda: REVISION)
+
+    assert exc_info.value.code == "candidate_validation_report_mismatch"
 
 
 @pytest.mark.parametrize("field", ["hardware_fingerprint", "account_domain", "run_mode"])
-def test_performance_rejects_self_consistent_but_different_scope(tmp_path, field):
-    baseline_payload = _performance_payload(
-        seconds="3262.55", revision="baseline-d46a504", run_id="baseline-run",
-        start="2026-06-24T00:00:00Z", end="2026-06-24T00:54:22.55Z",
+def test_baseline_scope_or_hardware_mismatch_is_rejected(tmp_path, field):
+    _root, _manifest_path, report_path, result = _candidate_report(
+        tmp_path, seconds="2283.79"
     )
-    candidate_payload = _performance_payload(
-        seconds="2283.79", revision=REVISION, run_id="candidate-run",
-        start="2026-07-12T00:00:00Z", end="2026-07-12T00:38:03.79Z",
-    )
-    candidate_payload[field] = "different"
-    candidate_payload["scope_digest"] = compute_scope_digest(candidate_payload)
-    candidate_payload["record_digest"] = compute_performance_record_digest(candidate_payload)
+    baseline = _baseline_contract(tmp_path / "baseline.json", result)
+    payload = json.loads(baseline.read_text(encoding="utf-8"))
+    payload["scope"][field] = "different"
+    if field in {"hardware_mode", "hardware_fingerprint"}:
+        payload[field] = "different"
+    payload["scope_digest"] = compute_evidence_scope_digest(payload["scope"])
+    payload["contract_digest"] = compute_performance_record_digest(payload)
+    _write_json(baseline, payload)
 
     with pytest.raises(BatchValidationError) as exc_info:
-        compare_performance(
-            _write_json(tmp_path / "baseline.json", baseline_payload),
-            _write_json(tmp_path / "candidate.json", candidate_payload),
-            revision_resolver=lambda: REVISION,
-        )
+        compare_performance(baseline, report_path, revision_resolver=lambda: REVISION)
 
     assert exc_info.value.code == "performance_contract_mismatch"
 
@@ -431,6 +609,7 @@ def test_cli_remains_path_only_and_credential_free(tmp_path):
     evidence_path = root / "diagnostics" / "run_evidence.json"
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     evidence["candidate_revision"] = current_revision
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
     _write_json(evidence_path, evidence)
     completed = subprocess.run(
         [sys.executable, str(Path(__file__).resolve().parents[1] / "batch_validation.py"),

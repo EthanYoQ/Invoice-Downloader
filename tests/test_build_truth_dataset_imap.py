@@ -167,3 +167,60 @@ def test_truth_output_cannot_mutate_source_tree(tmp_path, placement):
         validate_truth_build_paths(source, output)
 
     assert exc_info.value.code == "output_overlaps_source"
+
+
+def test_offline_manifest_bytes_are_independent_of_output_path_and_wall_clock(tmp_path):
+    source = _offline_source(tmp_path)
+    invoice = source / "invoice.xml"
+    invoice.write_text(
+        "<Invoice><InvoiceNumber>12345678</InvoiceNumber>"
+        "<IssueDate>2026-06-10</IssueDate><SellerName>标准商户</SellerName>"
+        "<BuyerName>目标公司</BuyerName><TotalAmount>100.00</TotalAmount></Invoice>",
+        encoding="utf-8",
+    )
+    (source / "document_index.jsonl").write_text(
+        json.dumps(
+            {
+                "email_id": "100",
+                "mail_date_local": "2026-06-10 10:00:00",
+                "subject": "电子发票",
+                "sender": "merchant@example.com",
+                "source_kind": "attachment",
+                "source_url": "",
+                "file_name": invoice.name,
+                "path": str(invoice),
+                "ext": ".xml",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    entry = Path(__file__).resolve().parents[1] / "build_truth_dataset.py"
+    outputs = [tmp_path / "first-name", tmp_path / "second-name"]
+    for output in outputs:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(entry),
+                "--date-from", "2026-06-01",
+                "--date-to", "2026-06-13",
+                "--before-exclusive", "2026-06-14",
+                "--mailbox", "INBOX",
+                "--source-root", str(source),
+                "--output-root", str(output),
+                "--skip-collect",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    first = (outputs[0] / "truth_manifest.json").read_bytes()
+    second = (outputs[1] / "truth_manifest.json").read_bytes()
+    assert first == second
+    assert hashlib.sha256(first).digest() == hashlib.sha256(second).digest()
+    manifest = json.loads(first)
+    assert manifest["summary"]["included_count"] == 1
+    assert not Path(manifest["included"][0]["raw_path"]).is_absolute()

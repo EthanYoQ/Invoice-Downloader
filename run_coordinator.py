@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import datetime as dt
 import hashlib
 from pathlib import Path
 import threading
@@ -21,6 +22,14 @@ class RunRequest:
     rules_text: str
     account_id: str
     channel_id: str
+    before_exclusive: str = ""
+    account_domain: str = ""
+    mailbox: str = "INBOX"
+    target_identifier: str = ""
+    run_mode: str = "interactive"
+    run_root: str = ""
+    evidence_required: bool = False
+    candidate_version: str = "source"
 
 
 @dataclass(frozen=True)
@@ -201,6 +210,8 @@ class RunCoordinator:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("a run is already active")
         session = None
+        started_monotonic = time.monotonic()
+        started_at_utc = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
         result = RunResult(run_id=request.run_id, state=RunState.CREATED)
         acquired_handle = handle
         try:
@@ -302,6 +313,10 @@ class RunCoordinator:
                 run_id=request.run_id,
                 staging_dir=acquired_handle.staging_dir,
                 output_dir=Path(request.save_path).resolve(),
+                run_root=Path(request.run_root or request.save_path).resolve(),
+                request=request,
+                started_monotonic_seconds=str(started_monotonic),
+                started_at_utc=started_at_utc,
             )
             if session is None:
                 try:

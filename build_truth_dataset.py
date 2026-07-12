@@ -1972,6 +1972,7 @@ def document_role_for(truth_type: str, fields: dict, meta: dict) -> str:
 
 def copy_evidence(paths, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_root = output_dir.parents[1]
     copied = []
     seen = set()
     for src in paths:
@@ -1983,7 +1984,7 @@ def copy_evidence(paths, output_dir: Path):
         shutil.copy2(src, dst)
         copied.append({
             "file_name": dst.name,
-            "path": str(dst),
+            "path": dst.relative_to(manifest_root).as_posix(),
             "sha256": sha256_file(dst),
             "bytes": dst.stat().st_size,
         })
@@ -2099,7 +2100,12 @@ def load_truth_build_identity(
     domain = str(explicit_domain or saved.get("account_domain") or "").strip().lower()
     if not domain:
         raise TruthBuildError("account_domain_required")
-    return {"target_company": target, "account_domain": domain}
+    return {
+        "target_company": target,
+        "account_domain": domain,
+        "dataset": str(saved.get("dataset") or "").strip(),
+        "build_time": str(saved.get("build_time") or "").strip(),
+    }
 
 
 def build_truth(args, source_root: Path, output_root: Path):
@@ -2397,7 +2403,9 @@ def build_truth(args, source_root: Path, output_root: Path):
 
     manifest = {
         "summary": {
-            "dataset": output_root.name,
+            "dataset": str(getattr(args, "dataset", "") or identity["dataset"]) or (
+                f"{identity['account_domain']}_{args.date_from}_{args.date_to}"
+            ),
             "date_from": args.date_from,
             "date_to": args.date_to,
             "before_exclusive": args.before_exclusive,
@@ -2408,7 +2416,10 @@ def build_truth(args, source_root: Path, output_root: Path):
             "excluded_count": len(excluded),
             "pending_review_count": len(pending),
             "finalized": len(pending) == 0,
-            "build_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "build_time": str(
+                getattr(args, "build_time", "") or identity["build_time"]
+            )
+            or f"{args.date_to} 23:59:59",
         },
         "included": included,
         "excluded": excluded,
@@ -2429,6 +2440,8 @@ def main():
     parser.add_argument("--mailbox", default="INBOX")
     parser.add_argument("--target-company", default="")
     parser.add_argument("--account-domain", default="")
+    parser.add_argument("--dataset", default="")
+    parser.add_argument("--build-time", default="")
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--skip-collect", action="store_true")

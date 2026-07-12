@@ -220,7 +220,7 @@ def guarded_dynamic(name, *args, **kwargs):
 builtins.__import__ = guarded
 importlib.import_module = guarded_dynamic
 sys.path.insert(0, sys.argv[1])
-for module in ('truth_contracts', 'strict_truth_audit', 'batch_validation'):
+for module in ('truth_contracts', 'strict_truth_audit', 'run_evidence', 'batch_validation'):
     importlib.import_module(module)
 print('independent-import-ok')
 """
@@ -236,7 +236,12 @@ print('independent-import-ok')
 
 def test_no_hidden_dynamic_runtime_imports_and_offline_builder_has_no_top_level_imap_imports():
     root = Path(__file__).resolve().parents[1]
-    for name in ("truth_contracts.py", "strict_truth_audit.py", "batch_validation.py"):
+    for name in (
+        "truth_contracts.py",
+        "strict_truth_audit.py",
+        "run_evidence.py",
+        "batch_validation.py",
+    ):
         tree = ast.parse((root / name).read_text(encoding="utf-8"), filename=name)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not node.args or not isinstance(node.args[0], ast.Constant):
