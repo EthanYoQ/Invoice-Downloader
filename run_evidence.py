@@ -453,6 +453,8 @@ class RunEvidenceWriter:
             if bool(getattr(archived, "duplicate", False)):
                 continue
             outcome = getattr(archived, "outcome", None)
+            if str(getattr(outcome, "status", "") or "") != "resolved":
+                continue
             candidate = getattr(outcome, "candidate", None)
             identity = getattr(candidate, "identity", None)
             document_id = str(getattr(identity, "document_id", "") or "")

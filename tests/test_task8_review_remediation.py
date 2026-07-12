@@ -319,7 +319,7 @@ def test_supporting_and_registry_exempt_non_invoice_documents_archive(
     assert len(routed) == 1
 
 
-def test_ordinary_non_invoice_is_retained_and_fails_closed(tmp_path: Path):
+def test_ordinary_non_invoice_is_retained_as_terminal_non_business_output(tmp_path: Path):
     source = tmp_path / "ordinary.pdf"
     source.write_bytes(b"ordinary")
     outcome = _resolved_outcome(
@@ -339,7 +339,7 @@ def test_ordinary_non_invoice_is_retained_and_fails_closed(tmp_path: Path):
     ).archive([outcome], tmp_path)
 
     assert report.retained_count == 1
-    assert report.can_complete is False
+    assert report.can_complete is True
     assert routed == []
     assert api.error_invoices[0]["artifact_kind"] == "retention"
 
@@ -693,7 +693,7 @@ def test_prefilter_terminal_outcomes_restore_frontend_error_rows_and_counts(
         finalizer=adapter.finalize,
     ).archive([outcome], tmp_path)
 
-    assert report.can_complete is False
+    assert report.can_complete is True
     assert api.stats == {"invoices": 0, "errors": 1}
     assert len(api.error_invoices) == 1
     error = api.error_invoices[0]
@@ -723,7 +723,7 @@ def test_tier3_manual_review_restores_classified_frontend_state(tmp_path: Path):
     ).archive([outcome], tmp_path)
 
     assert report.manual_count == 1
-    assert report.can_complete is False
+    assert report.can_complete is True
     assert api.discovered_categories == {"餐饮"}
     assert api.stats == {"invoices": 0, "errors": 1}
     assert api.error_invoices[0]["date"] == "20260610"
@@ -764,7 +764,7 @@ def test_router_manual_check_restores_classified_frontend_state(tmp_path: Path):
     ).archive([outcome], tmp_path)
 
     assert report.manual_count == 1
-    assert report.can_complete is False
+    assert report.can_complete is True
     assert api.stats == {"invoices": 0, "errors": 1}
     assert api.error_invoices[0]["path"] == str(manual_path)
     assert api.error_invoices[0]["reason"] == "ROUTE_TO_MANUAL_CHECK"

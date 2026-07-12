@@ -31,7 +31,9 @@ def _complete_summary():
     }
 
 
-def _write_full_evidence(run_root, output_path, *, output_hash=None):
+def _write_full_evidence(
+    run_root, output_path, *, output_hash=None, extra_inventory_paths=()
+):
     digest = output_hash or hashlib.sha256(output_path.read_bytes()).hexdigest()
     size = output_path.stat().st_size
     relative = output_path.relative_to(run_root / "output").as_posix()
@@ -63,6 +65,16 @@ def _write_full_evidence(run_root, output_path, *, output_hash=None):
         }
     ]
     inventory = [{"relative_path": relative, "size": size, "sha256": digest}]
+    for extra_path in extra_inventory_paths:
+        inventory.append(
+            {
+                "relative_path": extra_path.relative_to(
+                    run_root / "output"
+                ).as_posix(),
+                "size": extra_path.stat().st_size,
+                "sha256": hashlib.sha256(extra_path.read_bytes()).hexdigest(),
+            }
+        )
     evidence = {
         "schema_version": 1,
         "run_id": run_id,
@@ -354,6 +366,96 @@ def test_compare_rejects_incomplete_evidence_and_missing_lineage_output(tmp_path
 
     assert missing["audit_authority"]["authoritative"] is False
     assert "lineage_output_mismatch" in missing["audit_authority"]["reasons"]
+
+
+def test_authoritative_audit_ignores_unrelated_inventory_only_terminal_outputs(
+    tmp_path,
+):
+    run_root = tmp_path / "run"
+    output = run_root / "output"
+    business_path = output / "餐饮" / "invoice.pdf"
+    manual_path = output / "待人工复核" / "notice.pdf"
+    retention_path = output / "_audit_retention" / "noise" / "notice.pdf"
+    for path, content in (
+        (business_path, b"%PDF-1.5\nInvoice Number: 26110000000000000001"),
+        (manual_path, b"%PDF-1.5\nunrelated manual"),
+        (retention_path, b"%PDF-1.5\nunrelated retention"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    monitoring = run_root / "monitoring"
+    monitoring.mkdir()
+    (monitoring / "artifact_events.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (
+                {
+                    "kind": "archived",
+                    "document_id": "business",
+                    "path": str(business_path),
+                    "category": "餐饮",
+                },
+                {
+                    "kind": "manual_check",
+                    "document_id": "manual",
+                    "path": str(manual_path),
+                    "category": "待人工复核",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    diagnostics = run_root / "diagnostics"
+    diagnostics.mkdir()
+    (diagnostics / "debug_trace.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (
+                {
+                    "document_id": "business",
+                    "archive_target": str(business_path),
+                    "normalized_fields": {
+                        "InvoiceNumber": "26110000000000000001"
+                    },
+                    "classification_result": {"category": "餐饮"},
+                },
+                {
+                    "document_id": "retention",
+                    "archive_target": str(retention_path),
+                    "classification_result": {"category": "保留记录"},
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_full_evidence(
+        run_root,
+        business_path,
+        extra_inventory_paths=(manual_path, retention_path),
+    )
+    manifest = {
+        "summary": {**_complete_summary(), "included_count": 1},
+        "included": [
+            {
+                "truth_id": "business",
+                "truth_status": "included",
+                "truth_type": "餐饮",
+                "document_role": "invoice",
+                "invoice_number": "26110000000000000001",
+                "expected_category": "餐饮",
+            }
+        ],
+        "excluded": [],
+        "pending_review": [],
+    }
+
+    result = audit.compare(manifest, run_root)
+
+    assert result["audit_authority"] == {"authoritative": True, "reasons": []}
+    assert result["p0_conclusion"]["count"] == 0
+    assert result["manual_check_rows"] == []
 
 
 @pytest.mark.parametrize("field", ["p0", "p1", "p2", "manual"])

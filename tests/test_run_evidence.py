@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from archive_service import ArchiveService
+from archive_service import ArchivedOutcome, ArchiveReport, ArchiveService
 from candidate_pipeline import CandidatePipeline
 from extraction_pipeline import ExtractionOutcome
 from report_service import ReportService, RunFinalizationContext
@@ -291,6 +291,61 @@ def test_evidence_capture_rejects_archived_document_without_source_uid(tmp_path:
         assert str(exc) == "lineage_source_uid_missing"
     else:
         raise AssertionError("archived lineage without source UID must fail")
+
+
+def test_evidence_lineage_excludes_retention_and_manual_review_outputs(tmp_path: Path):
+    output = tmp_path / "output"
+    output.mkdir()
+    source_a = tmp_path / "source-a.pdf"
+    source_b = tmp_path / "source-b.pdf"
+    source_a.write_bytes(b"invoice")
+    source_b.write_bytes(b"non-business")
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": str(source_a), "message_uid": "100"},
+            {"filepath": str(source_b), "message_uid": "101"},
+        ]
+    )
+    archived_path = output / "invoice.pdf"
+    retained_path = output / "_audit_retention" / "notice.pdf"
+    manual_path = output / "待人工复核" / "notice.pdf"
+    archived_path.write_bytes(source_a.read_bytes())
+    retained_path.parent.mkdir()
+    retained_path.write_bytes(source_b.read_bytes())
+    manual_path.parent.mkdir()
+    manual_path.write_bytes(source_b.read_bytes())
+    resolved = ExtractionOutcome.resolved(candidates[0], {"pdf_path": str(source_a)})
+    retained = ExtractionOutcome(
+        candidate=candidates[1],
+        status="retained",
+        reason_code="KNOWN_NON_BUSINESS",
+        message="KNOWN_NON_BUSINESS",
+        artifact_path=str(retained_path),
+    )
+    manual = ExtractionOutcome(
+        candidate=candidates[1],
+        status="manual_review",
+        reason_code="REVIEW",
+        message="REVIEW",
+        artifact_path=str(manual_path),
+    )
+    report = ArchiveReport(
+        outcomes=(
+            ArchivedOutcome(resolved, str(archived_path)),
+            ArchivedOutcome(retained, str(retained_path)),
+            ArchivedOutcome(manual, str(manual_path)),
+        ),
+        archived_count=1,
+        retained_count=1,
+        manual_count=1,
+        unresolved_count=0,
+        duplicate_count=0,
+    )
+
+    rows = RunEvidenceWriter._lineage("run-1", output, report)
+
+    assert len(rows) == 1
+    assert rows[0]["document_id"] == candidates[0].identity.document_id
 
 
 def test_failed_lineage_capture_preserves_staging_instead_of_cleaning(tmp_path: Path):

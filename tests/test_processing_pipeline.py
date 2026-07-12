@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from archive_service import ArchiveService
+from archive_service import ArchiveReport, ArchiveService
 from candidate_pipeline import CandidatePipeline, DocumentCandidate
 from extraction_pipeline import ExtractionOutcome, ExtractionPipeline
 from glm_runtime import GlmRequestError
@@ -564,6 +564,19 @@ def test_archive_report_fails_closed_for_unresolved_and_duplicate_input_identity
     assert report.unresolved_count == 1
     assert report.duplicate_count == 1
     assert report.can_complete is False
+
+
+def test_terminal_retention_and_manual_review_do_not_block_run_completion():
+    report = ArchiveReport(
+        outcomes=(),
+        archived_count=0,
+        retained_count=10,
+        manual_count=1,
+        unresolved_count=0,
+        duplicate_count=0,
+    )
+
+    assert report.can_complete is True
 
 
 def test_archive_event_sink_failure_does_not_hide_report_or_later_outcomes(tmp_path: Path):

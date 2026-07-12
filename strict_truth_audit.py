@@ -302,6 +302,14 @@ def load_artifacts(run_root: Path) -> tuple[list[dict], dict[str, str], dict]:
                 digest = ""
             if lineage_bindings is not None:
                 expected_hash = lineage_bindings.get(resolved)
+                inventory_only_terminal = (
+                    is_retention_artifact(item)
+                    or item.get("kind") in {"manual_check", "manual_review"}
+                    or item.get("used_manual_check")
+                    or path.parent.name in {"待人工复核", "Manual_Check"}
+                )
+                if not expected_hash and inventory_only_terminal:
+                    continue
                 if not expected_hash or digest != expected_hash:
                     if "lineage_output_mismatch" not in authority_reasons:
                         authority_reasons.append("lineage_output_mismatch")

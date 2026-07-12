@@ -40,11 +40,7 @@ class ArchiveReport:
 
     @property
     def can_complete(self) -> bool:
-        return (
-            self.unresolved_count == 0
-            and self.manual_count == 0
-            and self.retained_count == 0
-        )
+        return self.unresolved_count == 0
 
 
 class ArchiveService:
