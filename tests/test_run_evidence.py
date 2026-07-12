@@ -66,7 +66,7 @@ def test_production_facade_records_lineage_before_cleanup_and_finalizes_atomical
 
     archive = ArchiveService(writer=writer).archive([outcome], output)
     evidence_writer = RunEvidenceWriter(
-        revision_resolver=lambda: REVISION,
+        revision_resolver=lambda: "b" * 40,
         version_resolver=lambda: "2026.07.12",
         hardware_resolver=lambda: ("windows-desktop-standard", "fixture-host"),
     )
@@ -93,6 +93,7 @@ def test_production_facade_records_lineage_before_cleanup_and_finalizes_atomical
         run_mode="clean-mailbox",
         run_root=str(root),
         evidence_required=True,
+        trusted_revision=REVISION,
     )
     dependencies = RunDependencies(
         connect=lambda _request: object(),
@@ -214,7 +215,7 @@ def test_failed_lineage_capture_preserves_staging_instead_of_cleaning(tmp_path: 
         "run-1", "2026-06-01", "2026-06-13", str(root / "output"), "", "account", "qq",
         before_exclusive="2026-06-14", account_domain="qq.com", mailbox="INBOX",
         target_identifier="目标公司", run_mode="clean-mailbox", run_root=str(root),
-        evidence_required=True,
+        evidence_required=True, trusted_revision=REVISION,
     )
     dependencies = RunDependencies(
         connect=lambda _request: object(),
@@ -348,7 +349,7 @@ def _zero_lineage_run(tmp_path: Path, *, scan, included_count: int):
         before_exclusive="2026-06-14", account_domain="qq.com", mailbox="INBOX",
         target_identifier="目标公司", run_mode="clean-mailbox", run_root=str(root),
         evidence_required=True, validation_required=True,
-        manifest_included_count=included_count,
+        manifest_included_count=included_count, trusted_revision=REVISION,
     )
     dependencies = RunDependencies(
         connect=lambda _request: object(),
@@ -399,6 +400,7 @@ def _capture_deadline_fixture(
     *,
     evidence_writer: RunEvidenceWriter,
     timeout_seconds: float = 0.02,
+    evidence_capture_launcher=None,
 ):
     root = tmp_path / "run"
     staging = root / "staging" / "run-1"
@@ -426,12 +428,14 @@ def _capture_deadline_fixture(
         ),
         evidence_writer=evidence_writer,
         evidence_capture_timeout_seconds=timeout_seconds,
+        evidence_capture_launcher=evidence_capture_launcher,
     )
     request = RunRequest(
         "run-1", "2026-06-01", "2026-06-13", str(root / "output"), "", "account", "qq",
         before_exclusive="2026-06-14", account_domain="qq.com", mailbox="INBOX",
         target_identifier="目标公司", run_mode="clean-mailbox", run_root=str(root),
         evidence_required=True, validation_required=True, manifest_included_count=1,
+        trusted_revision=REVISION,
     )
     dependencies = RunDependencies(
         connect=lambda _request: object(),
@@ -555,3 +559,45 @@ def test_evidence_worker_start_failure_fails_and_preserves_staging(
     assert staging.exists()
     assert "private" not in result.error
     assert not (root / "diagnostics" / "run_evidence.json").exists()
+
+
+def test_evidence_launch_stall_is_inside_deadline_and_late_work_is_quarantined(
+    tmp_path: Path,
+):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_launcher(target):
+        entered.set()
+        assert release.wait(0.3)
+        target()
+
+    writer = RunEvidenceWriter(revision_resolver=lambda: REVISION)
+    fixture = _capture_deadline_fixture(
+        tmp_path,
+        evidence_writer=writer,
+        timeout_seconds=0.02,
+        evidence_capture_launcher=blocked_launcher,
+    )
+    root, staging, lifecycle, cleaned, state, coordinator, request, handle = fixture
+    started = time.perf_counter()
+    result = coordinator.run(request, handle=handle)
+    elapsed = time.perf_counter() - started
+
+    assert entered.is_set()
+    assert elapsed < 0.15
+    assert result.state is RunState.FAILED
+    assert lifecycle.can_begin is True
+    assert cleaned == []
+    assert staging.exists()
+    state_before = state.snapshot()
+    release.set()
+    quarantine = (
+        root / "diagnostics" / "quarantined" / "run-1" / "evidence_capture_late.json"
+    )
+    deadline = time.time() + 1
+    while time.time() < deadline and not quarantine.exists():
+        time.sleep(0.01)
+    assert quarantine.exists()
+    assert not (root / "diagnostics" / "run_evidence.json").exists()
+    assert state.snapshot() == state_before

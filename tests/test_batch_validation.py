@@ -22,6 +22,7 @@ from run_evidence import (
     compute_inventory_digest as compute_production_inventory_digest,
     compute_lineage_digest,
     compute_scope_digest as compute_evidence_scope_digest,
+    default_hardware,
 )
 
 
@@ -86,7 +87,14 @@ def _write_jsonl(path: Path, rows: list[dict]) -> Path:
     return path
 
 
-def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
+def _run_root(
+    tmp_path: Path,
+    rows=1,
+    *,
+    elapsed="2283.79",
+    hardware_mode="windows-desktop-standard",
+    hardware_fingerprint="host-fixture-v1",
+) -> Path:
     root = tmp_path / "run"
     output = root / "output" / "餐饮"
     output.mkdir(parents=True)
@@ -131,8 +139,8 @@ def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
         "account_channel": "qq",
         "mailbox": "INBOX",
         "run_mode": "clean-mailbox",
-        "hardware_mode": "windows-desktop-standard",
-        "hardware_fingerprint": "host-fixture-v1",
+        "hardware_mode": hardware_mode,
+        "hardware_fingerprint": hardware_fingerprint,
         "active_run_config": {"company": "目标公司"},
         "candidate_revision": REVISION,
         "candidate_version": VERSION,
@@ -148,8 +156,8 @@ def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
         "mailbox": "INBOX",
         "target_identifier": "目标公司",
         "run_mode": "clean-mailbox",
-        "hardware_mode": "windows-desktop-standard",
-        "hardware_fingerprint": "host-fixture-v1",
+        "hardware_mode": hardware_mode,
+        "hardware_fingerprint": hardware_fingerprint,
     }
     inventory = [
         {
@@ -168,8 +176,8 @@ def _run_root(tmp_path: Path, rows=1, *, elapsed="2283.79") -> Path:
         "elapsed_seconds": elapsed,
         "started_at_utc": "2026-07-10T23:00:00Z",
         "ended_at_utc": RUN_END,
-        "hardware_mode": "windows-desktop-standard",
-        "hardware_fingerprint": "host-fixture-v1",
+        "hardware_mode": hardware_mode,
+        "hardware_fingerprint": hardware_fingerprint,
         "candidate_revision": REVISION,
         "candidate_version": VERSION,
         "validation_required": True,
@@ -571,8 +579,8 @@ def test_nominal_run_root_junction_is_rejected(tmp_path):
     assert exc_info.value.code == "reparse_point_rejected"
 
 
-def _candidate_report(tmp_path: Path, *, seconds: str):
-    root = _run_root(tmp_path, elapsed=seconds)
+def _candidate_report(tmp_path: Path, *, seconds: str, **run_options):
+    root = _run_root(tmp_path, elapsed=seconds, **run_options)
     manifest_path = _write_json(tmp_path / "manifest.json", _manifest())
     validator = _validator()
     result = validator.validate(manifest_path, root)
@@ -673,7 +681,9 @@ def test_candidate_timing_tampering_invalidates_revalidation(tmp_path, monkeypat
     assert exc_info.value.code == "candidate_validation_report_mismatch"
 
 
-@pytest.mark.parametrize("field", ["hardware_mode", "account_domain", "run_mode"])
+@pytest.mark.parametrize(
+    "field", ["hardware_mode", "hardware_fingerprint", "account_domain", "run_mode"]
+)
 def test_baseline_scope_or_hardware_mismatch_is_rejected(
     tmp_path, monkeypatch, field
 ):
@@ -724,6 +734,49 @@ def test_caller_cannot_replace_pinned_baseline_with_fake_5000_seconds(
         compare_performance(fake, report_path, revision_resolver=lambda: REVISION)
 
     assert exc_info.value.code == "invalid_baseline_contract"
+
+
+def test_pinned_baseline_contract_uses_current_stable_hardware_fingerprint():
+    import batch_validation as module
+
+    hardware_mode, hardware_fingerprint = default_hardware()
+    contract = module.pinned_baseline_contract()
+
+    assert contract["scope"]["hardware_mode"] == hardware_mode
+    assert contract["hardware_fingerprint"] == hardware_fingerprint
+    assert contract["contract_sha256"] == module.PINNED_BASELINE_CONTRACT_SHA256
+    canonical = {key: value for key, value in contract.items() if key != "contract_sha256"}
+    assert hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest() == contract["contract_sha256"]
+
+
+def test_real_shaped_same_machine_candidate_passes_pinned_hardware_gate(
+    tmp_path, monkeypatch
+):
+    hardware_mode, hardware_fingerprint = default_hardware()
+    _root, _manifest_path, report_path, result = _candidate_report(
+        tmp_path,
+        seconds="2283.79",
+        hardware_mode=hardware_mode,
+        hardware_fingerprint=hardware_fingerprint,
+    )
+    baseline = _baseline_contract(tmp_path / "baseline.json", result, monkeypatch)
+
+    verdict = compare_performance(
+        baseline,
+        report_path,
+        revision_resolver=lambda: REVISION,
+    )
+
+    assert verdict.passed is True
+    assert result.scope["hardware_mode"] == hardware_mode
+    assert result.scope["hardware_fingerprint"] == hardware_fingerprint
 
 
 def test_cli_remains_path_only_and_credential_free(tmp_path):

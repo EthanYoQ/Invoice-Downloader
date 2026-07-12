@@ -19,6 +19,12 @@ class ArtifactVerification:
     reason_code: str = ""
 
 
+@dataclass(frozen=True)
+class _PdfFieldHit:
+    page_index: int
+    bbox: tuple[float, float, float, float]
+
+
 def _text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -51,55 +57,197 @@ def _amount(value: Any) -> Decimal | None:
         return None
 
 
-def _line_value(text: str, labels: tuple[str, ...]) -> str:
-    names = "|".join(re.escape(label) for label in labels)
-    match = re.search(
-        rf"(?im)^\s*(?:{names})\s*[:：]?\s*([^\r\n]+)",
-        text,
+def _sequence(value: Any) -> str:
+    return "".join(character.casefold() for character in _text(value) if character.isalnum())
+
+
+def _spatially_contiguous(words: list[Any]) -> bool:
+    for previous, current in zip(words, words[1:]):
+        previous_height = max(1.0, float(previous[3]) - float(previous[1]))
+        current_height = max(1.0, float(current[3]) - float(current[1]))
+        scale = max(previous_height, current_height)
+        previous_center = (float(previous[1]) + float(previous[3])) / 2
+        current_center = (float(current[1]) + float(current[3])) / 2
+        if abs(current_center - previous_center) <= scale:
+            horizontal_gap = float(current[0]) - float(previous[2])
+            if horizontal_gap < -scale or horizontal_gap > scale * 4:
+                return False
+        elif float(current[1]) - float(previous[3]) > scale * 1.5:
+            return False
+    return True
+
+
+def _word_sequence_hits(page: Any, expected: Any) -> tuple[_PdfFieldHit, ...]:
+    needle = _sequence(expected)
+    if not needle:
+        return ()
+    words = page.get_text("words", sort=True)
+    indexed: list[tuple[int, int, Any]] = []
+    chunks: list[str] = []
+    offset = 0
+    for word in words:
+        normalized = _sequence(word[4])
+        if not normalized:
+            continue
+        chunks.append(normalized)
+        indexed.append((offset, offset + len(normalized), word))
+        offset += len(normalized)
+    joined = "".join(chunks)
+    hits: list[_PdfFieldHit] = []
+    start = joined.find(needle)
+    while start >= 0:
+        end = start + len(needle)
+        if not (
+            (start and joined[start - 1].isdigit() and needle[0].isdigit())
+            or (end < len(joined) and joined[end].isdigit() and needle[-1].isdigit())
+        ):
+            selected = [word for left, right, word in indexed if right > start and left < end]
+            if selected and _spatially_contiguous(selected):
+                import fitz
+
+                bbox = fitz.Rect(selected[0][:4])
+                for word in selected[1:]:
+                    bbox |= fitz.Rect(word[:4])
+                hits.append(
+                    _PdfFieldHit(
+                        page_index=int(page.number),
+                        bbox=(bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+                    )
+                )
+        start = joined.find(needle, start + 1)
+    return tuple(hits)
+
+
+def _find_hits(document: Any, expected: Any) -> tuple[_PdfFieldHit, ...]:
+    hits: list[_PdfFieldHit] = []
+    for page in document:
+        hits.extend(_word_sequence_hits(page, expected))
+    return tuple(hits)
+
+
+def _render_metrics(page: Any, *, bbox: tuple[float, float, float, float] | None = None) -> tuple[int, int, int]:
+    import fitz
+
+    clip = page.rect if bbox is None else fitz.Rect(bbox)
+    if clip.is_empty or clip.is_infinite or not page.rect.contains(clip):
+        return 0, 255, 255
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(2, 2),
+        colorspace=fitz.csGRAY,
+        alpha=False,
+        clip=clip,
     )
-    return match.group(1).strip() if match else ""
+    samples = pixmap.samples
+    if not samples:
+        return 0, 255, 255
+    return sum(value < 245 for value in samples), min(samples), max(samples)
 
 
-def _fields_from_text(text: str) -> dict[str, str]:
-    return {
-        "invoice_number": _line_value(
-            text, ("Invoice Number", "Invoice No", "发票号码", "发票号")
-        ),
-        "invoice_code": _line_value(text, ("Invoice Code", "发票代码")),
-        "invoice_date": _line_value(
-            text, ("Invoice Date", "Issue Date", "开票日期", "日期")
-        ),
-        "amount": _line_value(
-            text, ("Total Amount", "Amount", "价税合计", "合计金额", "金额")
-        ),
-        "seller": _line_value(text, ("Seller", "Seller Name", "销售方", "销方名称")),
-        "document_role": _line_value(
-            text, ("Document Role", "Document Type", "单据类型", "类型")
-        ),
-        "departure": _line_value(text, ("Departure", "From", "出发地")),
-        "destination": _line_value(text, ("Destination", "To", "目的地")),
-    }
+def _document_is_visibly_nonblank(document: Any) -> bool:
+    nonwhite = 0
+    pixels = 0
+    darkest = 255
+    lightest = 0
+    for page in document:
+        page_nonwhite, page_min, page_max = _render_metrics(page)
+        nonwhite += page_nonwhite
+        pixels += int(page.rect.width * 2) * int(page.rect.height * 2)
+        darkest = min(darkest, page_min)
+        lightest = max(lightest, page_max)
+    return (
+        pixels > 0
+        and nonwhite >= max(64, int(pixels * 0.0005))
+        and lightest - darkest >= 16
+    )
 
 
-def _parse_pdf(path: Path) -> tuple[dict[str, str] | None, str]:
+def _hit_is_visible(document: Any, hit: _PdfFieldHit) -> bool:
+    if hit.page_index < 0 or hit.page_index >= document.page_count:
+        return False
+    page = document[hit.page_index]
+    nonwhite, darkest, lightest = _render_metrics(page, bbox=hit.bbox)
+    import fitz
+
+    rect = fitz.Rect(hit.bbox)
+    pixels = max(1, int(rect.width * 2) * int(rect.height * 2))
+    return nonwhite >= max(8, int(pixels * 0.01)) and lightest - darkest >= 16
+
+
+def _visible_hit(document: Any, expected: Any) -> _PdfFieldHit | None:
+    return next(
+        (hit for hit in _find_hits(document, expected) if _hit_is_visible(document, hit)),
+        None,
+    )
+
+
+def _verify_pdf(path: Path, truth: Mapping[str, Any]) -> ArtifactVerification:
     try:
         import fitz
 
         document = fitz.open(path)
-        try:
-            if document.page_count <= 0:
-                return None, "FINAL_FORMAT_INVALID"
-            text = "\n".join(page.get_text("text") for page in document)
-        finally:
-            document.close()
     except Exception:
-        return None, "FINAL_FORMAT_INVALID"
-    if not text.strip():
-        return None, "FINAL_CONTENT_BLANK"
-    fields = _fields_from_text(text)
-    if not any(_text(value) for value in fields.values()):
-        return None, "FINAL_CONTENT_UNPARSEABLE"
-    return fields, ""
+        return _failure("FINAL_FORMAT_INVALID")
+    try:
+        if document.page_count <= 0:
+            return _failure("FINAL_FORMAT_INVALID")
+        if not _document_is_visibly_nonblank(document):
+            return _failure("FINAL_VISUAL_BLANK")
+
+        expected_number = _text(truth.get("invoice_number"))
+        expected_code = _text(truth.get("invoice_code"))
+        matched: list[str] = []
+        if expected_number or expected_code:
+            if expected_number:
+                if _visible_hit(document, expected_number) is None:
+                    return _failure("FINAL_FIELD_NOT_VISIBLE")
+                matched.append("invoice_number")
+            if expected_code:
+                if _visible_hit(document, expected_code) is None:
+                    return _failure("FINAL_FIELD_NOT_VISIBLE")
+                matched.append("invoice_code")
+        else:
+            expected_date = _date(truth.get("invoice_date"))
+            expected_amount = _amount(truth.get("amount"))
+            if not expected_date or _visible_hit(document, expected_date) is None:
+                return _failure("FINAL_QUORUM_MISMATCH")
+            amount_text = format(expected_amount, "f") if expected_amount is not None else ""
+            if not amount_text or _visible_hit(document, amount_text) is None:
+                return _failure("FINAL_QUORUM_MISMATCH")
+            matched.extend(("invoice_date", "amount"))
+
+            supporting = False
+            seller = _text(truth.get("seller"))
+            if seller and _visible_hit(document, seller) is not None:
+                matched.append("seller")
+                supporting = True
+            role = _text(truth.get("document_role"))
+            if role and _visible_hit(document, role) is not None:
+                matched.append("document_role")
+                supporting = True
+            route = truth.get("route") if isinstance(truth.get("route"), Mapping) else {}
+            departure = _text(route.get("departure") or truth.get("departure"))
+            destination = _text(route.get("destination") or truth.get("destination"))
+            if (
+                departure
+                and destination
+                and _visible_hit(document, departure) is not None
+                and _visible_hit(document, destination) is not None
+            ):
+                matched.append("route")
+                supporting = True
+            if not supporting:
+                return _failure("FINAL_QUORUM_MISMATCH")
+
+        return ArtifactVerification(
+            passed=True,
+            manual_required=False,
+            verification_mode="transformed_content_identity",
+            matched_fields=tuple(matched),
+        )
+    except Exception:
+        return _failure("FINAL_CONTENT_UNPARSEABLE")
+    finally:
+        document.close()
 
 
 def _parse_xml(path: Path) -> tuple[dict[str, str] | None, str]:
@@ -164,8 +312,8 @@ def verify_final_artifact(
     path = Path(output_path)
     suffix = path.suffix.casefold()
     if suffix == ".pdf":
-        fields, error = _parse_pdf(path)
-    elif suffix == ".xml":
+        return _verify_pdf(path, truth)
+    if suffix == ".xml":
         fields, error = _parse_xml(path)
     else:
         return _failure("FINAL_FORMAT_UNSUPPORTED")

@@ -60,6 +60,9 @@ PINNED_BASELINE_PAYLOAD: dict[str, Any] = {
         "target_identifier": "辉瑞",
         "run_mode": "clean-mailbox",
         "hardware_mode": "windows-desktop-standard",
+        "hardware_fingerprint": (
+            "9412c455e777cd3d0a8ccf557bc067c5ddfe45ea2c4ae61636cc4cf4cf9e85d1"
+        ),
     },
     "manifest_sha256": (
         "c1ea5ac2e8ccc3cfa2f5f96d217ed8f8459a213f389b0654b116e6d9bc13c8b7"
@@ -71,10 +74,12 @@ PINNED_BASELINE_PAYLOAD: dict[str, Any] = {
         "212ffb87c0d8f29810f035737a4913512303ce917eaeee544ccbf9c029822aea"
     ),
     "source_revision": "unrecorded",
-    "hardware_fingerprint": "unrecorded",
+    "hardware_fingerprint": (
+        "9412c455e777cd3d0a8ccf557bc067c5ddfe45ea2c4ae61636cc4cf4cf9e85d1"
+    ),
 }
 PINNED_BASELINE_CONTRACT_SHA256 = (
-    "7b3d7058437874c1f15deb73dfba765327b7d30b06ad95c5065528f661b99e10"
+    "a10ee5f35418d33eec4e42378b7851ce7eec086f7b74ac480d00a6d33b349883"
 )
 
 

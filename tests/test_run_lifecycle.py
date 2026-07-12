@@ -363,6 +363,24 @@ def _controlled_context(run_root, run_id):
     }
 
 
+def _controlled_request(api):
+    from run_coordinator import RunRequest
+
+    return RunRequest(
+        run_id=api._active_run_handle.run_id,
+        date_from="",
+        date_to="",
+        save_path=api._run_context["output_dir"],
+        rules_text="",
+        account_id="test-account",
+        channel_id="qq",
+        account_domain="qq.com",
+        run_root=api._run_context["run_root"],
+        evidence_required=True,
+        trusted_revision="a" * 40,
+    )
+
+
 def test_truth_audit_timeout_is_bounded_and_late_worker_is_quarantined(tmp_path, monkeypatch):
     import audit_email_truth
 
@@ -594,7 +612,9 @@ def test_controlled_run_config_and_audit_share_confined_canonical_locator(tmp_pa
 
     api._begin_run("running")
     handle = api._active_run_handle
-    api._safe_write_run_config("test@qq.com", auth_code="AUTH", api_key="API")
+    api._safe_write_run_config(
+        "test@qq.com", auth_code="AUTH", api_key="API", request=_controlled_request(api)
+    )
     api._start_truth_audit_async("test@qq.com", "AUTH")
     assert api._truth_audit_job.ready.wait(1)
     api._mark_finalizing()
@@ -642,7 +662,9 @@ def test_timely_valid_truth_audit_keeps_run_completed(tmp_path, monkeypatch):
     )
 
     api._begin_run("running")
-    api._safe_write_run_config("test@qq.com", auth_code="AUTH", api_key="API")
+    api._safe_write_run_config(
+        "test@qq.com", auth_code="AUTH", api_key="API", request=_controlled_request(api)
+    )
     api._start_truth_audit_async("test@qq.com", "AUTH")
     assert api._truth_audit_job.ready.wait(1)
     api._mark_finalizing()
@@ -672,7 +694,9 @@ def test_truth_audit_error_fails_with_truthful_sanitized_reason(tmp_path, monkey
     monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: None)
 
     api._begin_run("running")
-    api._safe_write_run_config("test@qq.com", auth_code="AUTH", api_key="API")
+    api._safe_write_run_config(
+        "test@qq.com", auth_code="AUTH", api_key="API", request=_controlled_request(api)
+    )
     api._start_truth_audit_async("test@qq.com", "AUTH")
     assert api._truth_audit_job.ready.wait(1)
     api._mark_finalizing()

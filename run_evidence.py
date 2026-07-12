@@ -330,7 +330,9 @@ class RunEvidenceWriter:
     ) -> bool:
         request = context.request
         authorized = authorization or (lambda: True)
-        revision = str(self._revision() or "").strip()
+        revision = _full_revision(getattr(request, "trusted_revision", ""))
+        if not revision:
+            raise RevisionUnavailable()
         version = str(self._version() or "").strip()
         hardware_mode, hardware_fingerprint = self._hardware()
         scope = {
@@ -345,7 +347,7 @@ class RunEvidenceWriter:
             "hardware_mode": str(hardware_mode),
             "hardware_fingerprint": str(hardware_fingerprint),
         }
-        if not revision or not version or not all(scope.values()):
+        if not version or not all(scope.values()):
             raise ValueError("incomplete_production_evidence_scope")
         lineage = self._lineage(
             request.run_id,

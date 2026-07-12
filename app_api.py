@@ -434,9 +434,13 @@ class _FallbackDocumentTraceStore:
         return ranks.get(severity, 0)
 
 class InvoiceAppAPI:
-    def __init__(self, truth_audit_timeout_seconds=None):
+    def __init__(self, truth_audit_timeout_seconds=None, revision_resolver=None):
         self._run_context = load_run_context()
-        ensure_run_context_dirs(self._run_context)
+        if revision_resolver is None:
+            from run_evidence import default_revision
+
+            revision_resolver = default_revision
+        self._revision_resolver = revision_resolver
         self._diag_lock = threading.Lock()
         self._packaged_diag_enabled = bool(getattr(sys, "frozen", False))
         self._packaged_diag_poll_count = 0
@@ -1058,7 +1062,7 @@ class InvoiceAppAPI:
             self._active_run_handle.run_id if self._active_run_handle is not None else ""
         )
         paths = self._resolve_truth_audit_paths(self._run_context, lifecycle_run_id)
-        from run_evidence import default_hardware, default_revision
+        from run_evidence import RevisionUnavailable, default_hardware
 
         hardware_mode, hardware_fingerprint = default_hardware()
         before_exclusive = str(getattr(request, "before_exclusive", "") or "")
@@ -1073,6 +1077,11 @@ class InvoiceAppAPI:
         candidate_version = str(
             getattr(request, "candidate_version", "") or "source"
         )
+        candidate_revision = str(
+            getattr(request, "trusted_revision", "") or ""
+        ).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", candidate_revision):
+            raise RevisionUnavailable()
         self._diag_write_json(
             str(paths.run_config_path),
             {
@@ -1097,7 +1106,7 @@ class InvoiceAppAPI:
                 "run_mode": run_mode,
                 "hardware_mode": hardware_mode,
                 "hardware_fingerprint": hardware_fingerprint,
-                "candidate_revision": default_revision(),
+                "candidate_revision": candidate_revision,
                 "candidate_version": candidate_version,
                 "controlled_run": True,
                 "stage_map": {
@@ -3138,7 +3147,9 @@ class InvoiceAppAPI:
         handle.fail(
             exc,
             reason_code=reason_code,
-            user_message="后台任务启动失败，请重试。",
+            user_message=str(
+                getattr(exc, "user_message", "") or "后台任务启动失败，请重试。"
+            ),
         )
         self._run_state_store.update(
             run_state="finalizing",
@@ -3265,6 +3276,43 @@ class InvoiceAppAPI:
                 pass
             raise RuntimeError("run state initialization failed") from None
 
+    @staticmethod
+    def _admission_missing_directories(context, save_path):
+        targets = {
+            str(context.get(key) or "").strip()
+            for key in (
+                "run_root",
+                "output_dir",
+                "staging_dir",
+                "diagnostics_dir",
+                "monitoring_dir",
+                "qc_dir",
+            )
+        }
+        targets.add(str(save_path or "").strip())
+        missing = set()
+        for value in targets:
+            if not value:
+                continue
+            path = Path(value).resolve()
+            while not path.exists() and path != path.parent:
+                missing.add(path)
+                path = path.parent
+        return tuple(sorted(missing, key=lambda item: len(item.parts), reverse=True))
+
+    @staticmethod
+    def _remove_empty_admission_directories(paths):
+        import shutil
+
+        for path in paths:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            except OSError:
+                continue
+
     def _admit_processing_run(
         self,
         *,
@@ -3299,12 +3347,22 @@ class InvoiceAppAPI:
             settings_existed = os.path.exists(self._settings_store.settings_path)
             settings_touched = False
             handle = None
+            admission_missing_dirs = ()
             try:
                 self._run_context = candidate.run_context()
-                ensure_run_context_dirs(self._run_context)
                 self._current_run_id = str(self._run_context.get("run_id", "") or "")
+                admission_missing_dirs = self._admission_missing_directories(
+                    self._run_context,
+                    candidate.effective_save_path,
+                )
                 handle = self._prepare_run_lifecycle()
                 self._reset_run_state_for_admission(handle.run_id)
+                from run_evidence import RevisionUnavailable
+
+                trusted_revision = str(self._revision_resolver() or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{40}", trusted_revision):
+                    raise RevisionUnavailable()
+                ensure_run_context_dirs(self._run_context)
                 previous_settings = self._settings_store.load() or {}
                 self._requested_save_path = candidate.requested_save_path
                 self._effective_save_path = candidate.effective_save_path
@@ -3368,6 +3426,7 @@ class InvoiceAppAPI:
                     candidate_version=str(
                         self._run_context.get("candidate_version") or "source"
                     ),
+                    trusted_revision=trusted_revision,
                     validation_required=bool(
                         self._run_context.get("validation_required", False)
                     ),
@@ -3381,15 +3440,29 @@ class InvoiceAppAPI:
                     auth_code=secrets.auth_code,
                     api_key=secrets.api_key,
                 )
+                self._safe_write_run_config(
+                    secrets.email_address,
+                    auth_code=secrets.auth_code,
+                    api_key=secrets.api_key,
+                    request=request,
+                )
             except Exception as exc:
                 if handle is not None:
-                    self._finalize_admission_failure(handle, exc)
+                    reason_code = str(
+                        getattr(exc, "reason_code", "") or "WORKER_START_FAILED"
+                    )
+                    self._finalize_admission_failure(
+                        handle,
+                        exc,
+                        reason_code=reason_code,
+                    )
                 self._restore_failed_admission(
                     previous,
                     previous_settings,
                     settings_existed,
                     settings_touched,
                 )
+                self._remove_empty_admission_directories(admission_missing_dirs)
                 return {"success": False, "message": "后台任务启动失败"}
 
             self._run_state_store.append_log(
@@ -3436,12 +3509,6 @@ class InvoiceAppAPI:
                         secrets.api_key,
                     ),
                 },
-            )
-            self._safe_write_run_config(
-                secrets.email_address,
-                auth_code=secrets.auth_code,
-                api_key=secrets.api_key,
-                request=request,
             )
             try:
                 self._start_truth_audit_async(secrets.email_address, secrets.auth_code)

@@ -53,6 +53,7 @@ def test_run_request_is_frozen_and_contains_no_secret_fields(tmp_path: Path):
         "run_root",
         "evidence_required",
         "candidate_version",
+        "trusted_revision",
         "validation_required",
         "manifest_included_count",
     }
@@ -61,6 +62,119 @@ def test_run_request_is_frozen_and_contains_no_secret_fields(tmp_path: Path):
     assert "api_key" not in serialized
     with pytest.raises((AttributeError, TypeError)):
         request.run_id = "changed"
+
+
+def test_invalid_packaged_revision_without_git_rolls_back_atomic_admission(
+    tmp_path: Path, monkeypatch
+):
+    import app_api as module
+    from app_api import InvoiceAppAPI
+    from run_evidence import default_revision
+    from run_lifecycle import RunState
+
+    run_root = tmp_path / "controlled-run"
+    context = {
+        "enabled": True,
+        "explicit_run_context": True,
+        "controlled_run": True,
+        "run_id": "revision-admission",
+        "run_root": str(run_root),
+        "output_dir": str(run_root / "output"),
+        "staging_dir": str(run_root / "staging"),
+        "diagnostics_dir": str(run_root / "diagnostics"),
+        "monitoring_dir": str(run_root / "monitoring"),
+        "qc_dir": str(run_root / "monitoring" / "qc"),
+        "locked_date_from": "2026-06-01",
+        "locked_date_to": "2026-06-13",
+        "validation_required": True,
+        "manifest_included_count": 1,
+    }
+    invalid_identity = tmp_path / "invalid-build-identity.json"
+    invalid_identity.write_text('{"source_revision":"short"}', encoding="utf-8")
+    monkeypatch.setenv("PATH", "")
+    api = InvoiceAppAPI(
+        revision_resolver=lambda: default_revision(identity_paths=(invalid_identity,))
+    )
+    monkeypatch.setattr(module, "load_run_context", lambda: dict(context))
+
+    class UntouchedSettings:
+        settings_path = str(tmp_path / "settings.json")
+
+        def load(self):
+            raise AssertionError("revision must resolve before settings access")
+
+        def save(self, _settings):
+            raise AssertionError("settings must remain untouched")
+
+        def clear(self):
+            raise AssertionError("settings must remain untouched")
+
+    api._settings_store = UntouchedSettings()
+    result = api.start_processing(
+        "",
+        str(run_root / "output"),
+        "2026-06-01",
+        "2026-06-13",
+        "fixture@qq.com",
+        "fixture-auth",
+        "fixture-key",
+    )
+
+    assert result == {"success": False, "message": "后台任务启动失败"}
+    assert api._active_run_handle.state is RunState.FAILED
+    assert api._run_lifecycle.can_begin is True
+    assert api._run_lifecycle.owned_staging_count == 0
+    assert api._run_state_store.terminal_reason == "TRUSTED_REVISION_UNAVAILABLE"
+    assert api.run_state == "failed"
+    assert "trusted_revision_unavailable" not in api.last_error
+    assert not run_root.exists()
+
+
+def test_run_config_uses_only_frozen_request_revision(tmp_path: Path):
+    from app_api import InvoiceAppAPI
+    from run_coordinator import RunRequest
+
+    revision = "c" * 40
+    run_root = tmp_path / "run"
+    api = InvoiceAppAPI(
+        revision_resolver=lambda: (_ for _ in ()).throw(
+            AssertionError("config must not resolve revision again")
+        )
+    )
+    api._run_context = {
+        "enabled": True,
+        "run_id": "config-revision",
+        "run_root": str(run_root),
+        "monitoring_dir": str(run_root / "monitoring"),
+    }
+    api._current_run_id = "config-revision"
+    api._requested_save_path = str(run_root / "output")
+    api._effective_save_path = str(run_root / "output")
+    api._effective_date_from = "2026-06-01"
+    api._effective_date_to = "2026-06-13"
+    api._active_run_config = {"company": "目标公司"}
+    captured = []
+    api._diag_write_json = lambda path, payload: captured.append((path, payload))
+    request = RunRequest(
+        "config-revision",
+        "2026-06-01",
+        "2026-06-13",
+        str(run_root / "output"),
+        "",
+        "account",
+        "qq",
+        before_exclusive="2026-06-14",
+        account_domain="qq.com",
+        target_identifier="目标公司",
+        run_root=str(run_root),
+        evidence_required=True,
+        trusted_revision=revision,
+    )
+
+    api._safe_write_run_config("fixture@qq.com", request=request)
+
+    assert len(captured) == 1
+    assert captured[0][1]["candidate_revision"] == revision
 
 
 def test_process_only_dependencies_are_redacted_and_not_dataclasses():

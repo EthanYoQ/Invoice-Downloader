@@ -40,6 +40,23 @@ def _pdf(path: Path, text: str | None) -> Path:
     return path
 
 
+def _styled_pdf(
+    path: Path,
+    spans: list[tuple[tuple[float, float], str, tuple[float, float, float]]],
+    *,
+    tiny_mark: bool = False,
+) -> Path:
+    document = fitz.open()
+    page = document.new_page()
+    for point, text, color in spans:
+        page.insert_text(point, text, color=color)
+    if tiny_mark:
+        page.draw_rect(fitz.Rect(1, 1, 1.1, 1.1), color=(0, 0, 0), fill=(0, 0, 0))
+    document.save(path)
+    document.close()
+    return path
+
+
 def test_transformed_arbitrary_blank_and_corrupt_pdf_fail_closed(tmp_path: Path):
     arbitrary = tmp_path / "arbitrary.pdf"
     arbitrary.write_bytes(b"not a pdf")
@@ -57,10 +74,11 @@ def test_transformed_arbitrary_blank_and_corrupt_pdf_fail_closed(tmp_path: Path)
         assert verdict.passed is False
         assert verdict.manual_required is True
         assert verdict.reason_code in {
-            "FINAL_FORMAT_INVALID",
-            "FINAL_CONTENT_BLANK",
-            "FINAL_CONTENT_UNPARSEABLE",
-        }
+                "FINAL_FORMAT_INVALID",
+                "FINAL_CONTENT_BLANK",
+                "FINAL_CONTENT_UNPARSEABLE",
+                "FINAL_VISUAL_BLANK",
+            }
 
 
 def test_valid_transformed_pdf_with_invoice_identity_passes(tmp_path: Path):
@@ -80,6 +98,93 @@ def test_valid_transformed_pdf_with_invoice_identity_passes(tmp_path: Path):
     assert verdict.passed is True
     assert verdict.verification_mode == "transformed_content_identity"
     assert verdict.matched_fields == ("invoice_number",)
+
+
+def test_white_on_white_and_near_blank_pdf_fail_visual_verification(tmp_path: Path):
+    white = _styled_pdf(
+        tmp_path / "white-text.pdf",
+        [((72, 72), "Invoice Number 12345678", (1, 1, 1))],
+    )
+    near_blank = _styled_pdf(
+        tmp_path / "near-blank.pdf",
+        [((72, 72), "Invoice Number 12345678", (1, 1, 1))],
+        tiny_mark=True,
+    )
+
+    for path in (white, near_blank):
+        verdict = verify_final_artifact(
+            _truth(),
+            path,
+            output_sha256=_sha(path),
+            source_chain_sha256s=[_truth()["sha256"]],
+        )
+        assert verdict.passed is False
+        assert verdict.manual_required is True
+        assert verdict.reason_code in {
+            "FINAL_VISUAL_BLANK",
+            "FINAL_FIELD_NOT_VISIBLE",
+        }
+
+
+def test_off_page_identity_text_cannot_satisfy_visual_verification(tmp_path: Path):
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, page.rect.height + 100), "Invoice Number 12345678")
+    path = tmp_path / "off-page.pdf"
+    document.save(path)
+    document.close()
+
+    verdict = verify_final_artifact(
+        _truth(),
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=[_truth()["sha256"]],
+    )
+
+    assert verdict.passed is False
+    assert verdict.manual_required is True
+
+
+def test_visible_split_sequence_in_independent_blocks_passes(tmp_path: Path):
+    path = _styled_pdf(
+        tmp_path / "visible-split.pdf",
+        [
+            ((72, 72), "Invoice", (0, 0, 0)),
+            ((160, 72), "Number", (0, 0, 0)),
+            ((245, 72), "1234", (0, 0, 0)),
+            ((290, 72), "5678", (0, 0, 0)),
+        ],
+    )
+
+    verdict = verify_final_artifact(
+        _truth(),
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=[_truth()["sha256"]],
+    )
+
+    assert verdict.passed is True
+    assert verdict.matched_fields == ("invoice_number",)
+
+
+def test_distant_words_cannot_be_concatenated_into_strong_identity(tmp_path: Path):
+    document = fitz.open()
+    page = document.new_page()
+    page.draw_rect(page.rect, color=(0.8, 0.8, 0.8), fill=(0.8, 0.8, 0.8))
+    page.insert_text((72, 72), "1234")
+    page.insert_text((72, 700), "5678")
+    path = tmp_path / "distant-sequence.pdf"
+    document.save(path)
+    document.close()
+
+    verdict = verify_final_artifact(
+        _truth(),
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=[_truth()["sha256"]],
+    )
+
+    assert verdict.passed is False
 
 
 def test_valid_transformed_xml_without_number_requires_multifield_quorum(tmp_path: Path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
+import queue
 import threading
 from typing import Any, Callable
 
@@ -43,6 +44,51 @@ class FinalizerCallbackError(RuntimeError):
         super().__init__(f"{self.reason_code}:{type(exc).__name__}:{fingerprint}")
 
 
+class _EvidenceCaptureDispatcher:
+    """Prestarted dispatcher keeps worker launch off the finalizer thread."""
+
+    def __init__(self, launcher: Callable[[Callable[[], None]], Any] | None = None):
+        self._launcher = launcher or self._launch_thread
+        self._jobs: queue.Queue[tuple[Callable[[], None], list[BaseException], threading.Event]] = queue.Queue(maxsize=1)
+        self._startup_error: BaseException | None = None
+        thread = threading.Thread(
+            target=self._serve,
+            name="EvidenceCaptureDispatcher",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except BaseException as exc:
+            self._startup_error = exc
+
+    @staticmethod
+    def _launch_thread(target: Callable[[], None]) -> None:
+        thread = threading.Thread(
+            target=target,
+            name="EvidenceCapture-Worker",
+            daemon=True,
+        )
+        thread.start()
+
+    def _serve(self) -> None:
+        target, failures, done = self._jobs.get()
+        try:
+            self._launcher(target)
+        except BaseException as exc:
+            failures.append(exc)
+            done.set()
+
+    def submit(
+        self,
+        target: Callable[[], None],
+        failures: list[BaseException],
+        done: threading.Event,
+    ) -> None:
+        if self._startup_error is not None:
+            raise self._startup_error
+        self._jobs.put_nowait((target, failures, done))
+
+
 class ReportService:
     """Owns ordered, bounded report/disconnect/cleanup finalization."""
 
@@ -55,6 +101,7 @@ class ReportService:
         evidence_writer: Any = None,
         timeout_seconds: float = 120.0,
         evidence_capture_timeout_seconds: float = 120.0,
+        evidence_capture_launcher: Callable[[Callable[[], None]], Any] | None = None,
     ):
         self._report_callback = report_callback
         self._disconnect_callback = disconnect_callback
@@ -63,6 +110,11 @@ class ReportService:
         self._timeout_seconds = max(0.001, float(timeout_seconds))
         self._evidence_capture_timeout_seconds = max(
             0.001, float(evidence_capture_timeout_seconds)
+        )
+        self._evidence_capture_dispatcher = (
+            _EvidenceCaptureDispatcher(evidence_capture_launcher)
+            if evidence_writer is not None
+            else None
         )
 
     def _bounded(self, name: str, callback: Callable[[], Any]) -> Callable[[], None]:
@@ -128,13 +180,8 @@ class ReportService:
                     finally:
                         done.set()
 
-                thread = threading.Thread(
-                    target=runner,
-                    name=f"EvidenceCapture-{context.run_id}",
-                    daemon=True,
-                )
                 try:
-                    thread.start()
+                    self._evidence_capture_dispatcher.submit(runner, failure, done)
                 except BaseException as exc:
                     abandoned.set()
                     self._evidence_writer.abandon(context)
