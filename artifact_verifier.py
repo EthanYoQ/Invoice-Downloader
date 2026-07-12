@@ -180,6 +180,61 @@ def _visible_hit(document: Any, expected: Any) -> _PdfFieldHit | None:
     )
 
 
+def _date_aliases(value: Any) -> tuple[str, ...]:
+    normalized = _date(value)
+    if not normalized:
+        return ()
+    year, month, day = (int(part) for part in normalized.split("-"))
+    return (
+        normalized,
+        f"{year:04d}{month:02d}{day:02d}",
+        f"{year:04d}年{month:02d}月{day:02d}日",
+        f"{year:04d}年{month}月{day}日",
+    )
+
+
+def _visible_date_hit(document: Any, expected: Any) -> _PdfFieldHit | None:
+    return next(
+        (
+            hit
+            for alias in _date_aliases(expected)
+            if (hit := _visible_hit(document, alias)) is not None
+        ),
+        None,
+    )
+
+
+def _visible_invoice_structure(document: Any) -> bool:
+    marker_groups = (
+        ("电子发票", "invoice"),
+        ("价税合计", "total amount"),
+        ("购买方", "purchaser"),
+        ("销售方", "seller"),
+    )
+    visible = [
+        any(_visible_hit(document, marker) is not None for marker in group)
+        for group in marker_groups
+    ]
+    return visible[0] and visible[1] and (visible[2] or visible[3])
+
+
+def _visible_route(document: Any, truth: Mapping[str, Any]) -> bool:
+    route = truth.get("route") if isinstance(truth.get("route"), Mapping) else {}
+    departure = _text(route.get("departure") or truth.get("departure"))
+    destination = _text(route.get("destination") or truth.get("destination"))
+    return bool(
+        departure
+        and destination
+        and _visible_hit(document, departure) is not None
+        and _visible_hit(document, destination) is not None
+    )
+
+
+def _is_route_role(value: Any) -> bool:
+    role = _name(value)
+    return any(token in role for token in ("trip", "itinerary", "route", "行程", "车票"))
+
+
 def _verify_pdf(path: Path, truth: Mapping[str, Any]) -> ArtifactVerification:
     try:
         import fitz
@@ -205,38 +260,50 @@ def _verify_pdf(path: Path, truth: Mapping[str, Any]) -> ArtifactVerification:
                 if _visible_hit(document, expected_code) is None:
                     return _failure("FINAL_FIELD_NOT_VISIBLE")
                 matched.append("invoice_code")
-        else:
-            expected_date = _date(truth.get("invoice_date"))
+
+            date_hit = _visible_date_hit(document, truth.get("invoice_date"))
             expected_amount = _amount(truth.get("amount"))
-            if not expected_date or _visible_hit(document, expected_date) is None:
+            amount_text = format(expected_amount, "f") if expected_amount is not None else ""
+            amount_hit = _visible_hit(document, amount_text) if amount_text else None
+            if date_hit is None or amount_hit is None:
+                return _failure("FINAL_QUORUM_MISMATCH")
+            matched.extend(("invoice_date", "amount"))
+
+            seller = _text(truth.get("seller"))
+            purchaser = _text(truth.get("purchaser"))
+            seller_visible = bool(seller and _visible_hit(document, seller) is not None)
+            purchaser_visible = bool(
+                purchaser and _visible_hit(document, purchaser) is not None
+            )
+            if seller_visible:
+                matched.append("seller")
+            if purchaser_visible:
+                matched.append("purchaser")
+            if not seller_visible and not purchaser_visible:
+                if not _visible_invoice_structure(document):
+                    return _failure("FINAL_QUORUM_MISMATCH")
+                matched.append("invoice_structure")
+        else:
+            expected_amount = _amount(truth.get("amount"))
+            if _visible_date_hit(document, truth.get("invoice_date")) is None:
                 return _failure("FINAL_QUORUM_MISMATCH")
             amount_text = format(expected_amount, "f") if expected_amount is not None else ""
             if not amount_text or _visible_hit(document, amount_text) is None:
                 return _failure("FINAL_QUORUM_MISMATCH")
             matched.extend(("invoice_date", "amount"))
 
-            supporting = False
             seller = _text(truth.get("seller"))
-            if seller and _visible_hit(document, seller) is not None:
-                matched.append("seller")
-                supporting = True
-            role = _text(truth.get("document_role"))
-            if role and _visible_hit(document, role) is not None:
-                matched.append("document_role")
-                supporting = True
-            route = truth.get("route") if isinstance(truth.get("route"), Mapping) else {}
-            departure = _text(route.get("departure") or truth.get("departure"))
-            destination = _text(route.get("destination") or truth.get("destination"))
-            if (
-                departure
-                and destination
-                and _visible_hit(document, departure) is not None
-                and _visible_hit(document, destination) is not None
-            ):
-                matched.append("route")
-                supporting = True
-            if not supporting:
+            seller_visible = bool(seller and _visible_hit(document, seller) is not None)
+            route_visible = _visible_route(document, truth)
+            route_role = _is_route_role(truth.get("document_role"))
+            if route_role and not route_visible:
                 return _failure("FINAL_QUORUM_MISMATCH")
+            if not route_role and not seller_visible and not route_visible:
+                return _failure("FINAL_QUORUM_MISMATCH")
+            if seller_visible:
+                matched.append("seller")
+            if route_visible:
+                matched.append("route")
 
         return ArtifactVerification(
             passed=True,
@@ -271,6 +338,7 @@ def _parse_xml(path: Path) -> tuple[dict[str, str] | None, str]:
         "invoice_date": first("InvoiceDate", "IssueDate", "Kprq"),
         "amount": first("TotalAmount", "Amount", "Jshj", "TotalTaxIncludedAmount"),
         "seller": first("SellerName", "Seller", "Xfmc"),
+        "purchaser": first("PurchaserName", "Purchaser", "Gfmc"),
         "document_role": first("DocumentRole", "DocumentType", "Type"),
         "departure": first("Departure", "From", "DepartureCity"),
         "destination": first("Destination", "To", "DestinationCity"),
@@ -332,6 +400,30 @@ def verify_final_artifact(
             if _compact(fields.get("invoice_code")) != expected_code:
                 return _failure("FINAL_IDENTITY_MISMATCH")
             matched.append("invoice_code")
+
+        expected_date = _date(truth.get("invoice_date"))
+        expected_amount = _amount(truth.get("amount"))
+        if not expected_date or _date(fields.get("invoice_date")) != expected_date:
+            return _failure("FINAL_QUORUM_MISMATCH")
+        if expected_amount is None or _amount(fields.get("amount")) != expected_amount:
+            return _failure("FINAL_QUORUM_MISMATCH")
+        matched.extend(("invoice_date", "amount"))
+
+        expected_seller = _name(truth.get("seller"))
+        expected_purchaser = _name(truth.get("purchaser"))
+        seller_match = bool(
+            expected_seller and _name(fields.get("seller")) == expected_seller
+        )
+        purchaser_match = bool(
+            expected_purchaser
+            and _name(fields.get("purchaser")) == expected_purchaser
+        )
+        if seller_match:
+            matched.append("seller")
+        if purchaser_match:
+            matched.append("purchaser")
+        if not seller_match and not purchaser_match:
+            return _failure("FINAL_QUORUM_MISMATCH")
     else:
         expected_date = _date(truth.get("invoice_date"))
         expected_amount = _amount(truth.get("amount"))
@@ -340,27 +432,26 @@ def verify_final_artifact(
         if expected_amount is None or _amount(fields.get("amount")) != expected_amount:
             return _failure("FINAL_QUORUM_MISMATCH")
         matched.extend(("invoice_date", "amount"))
-        supporting = False
         expected_seller = _name(truth.get("seller"))
-        if expected_seller and _name(fields.get("seller")) == expected_seller:
+        seller_match = bool(
+            expected_seller and _name(fields.get("seller")) == expected_seller
+        )
+        if seller_match:
             matched.append("seller")
-            supporting = True
-        expected_role = _name(truth.get("document_role"))
-        if expected_role and _name(fields.get("document_role")) == expected_role:
-            matched.append("document_role")
-            supporting = True
         route = truth.get("route") if isinstance(truth.get("route"), Mapping) else {}
         expected_departure = _name(route.get("departure") or truth.get("departure"))
         expected_destination = _name(route.get("destination") or truth.get("destination"))
-        if (
+        route_match = bool(
             expected_departure
             and expected_destination
             and _name(fields.get("departure")) == expected_departure
             and _name(fields.get("destination")) == expected_destination
-        ):
+        )
+        if route_match:
             matched.append("route")
-            supporting = True
-        if not supporting:
+        if _is_route_role(truth.get("document_role")) and not route_match:
+            return _failure("FINAL_QUORUM_MISMATCH")
+        if not _is_route_role(truth.get("document_role")) and not seller_match and not route_match:
             return _failure("FINAL_QUORUM_MISMATCH")
 
     return ArtifactVerification(

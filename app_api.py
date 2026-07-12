@@ -2040,6 +2040,7 @@ class InvoiceAppAPI:
             )
             return coordinator.run(request, handle=run_handle)
         except Exception as exc:
+            self._close_run_dependencies(dependencies)
             self._packaged_diag_write(
                 "coordinator_worker_exception",
                 "_processing_worker",
@@ -2244,6 +2245,7 @@ class InvoiceAppAPI:
                 evidence_writer=RunEvidenceWriter(
                     version_resolver=lambda: request.candidate_version,
                 ),
+                evidence_required=request.evidence_required,
             ),
             cancel_requested=lambda: bool(self._stop_requested),
             secrets={"auth_code": auth_code, "api_key": api_key},
@@ -3313,6 +3315,16 @@ class InvoiceAppAPI:
             except OSError:
                 continue
 
+    @staticmethod
+    def _close_run_dependencies(dependencies):
+        service = getattr(dependencies, "report_service", None)
+        close = getattr(service, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
     def _admit_processing_run(
         self,
         *,
@@ -3347,6 +3359,7 @@ class InvoiceAppAPI:
             settings_existed = os.path.exists(self._settings_store.settings_path)
             settings_touched = False
             handle = None
+            dependencies = None
             admission_missing_dirs = ()
             try:
                 self._run_context = candidate.run_context()
@@ -3447,6 +3460,7 @@ class InvoiceAppAPI:
                     request=request,
                 )
             except Exception as exc:
+                self._close_run_dependencies(dependencies)
                 if handle is not None:
                     reason_code = str(
                         getattr(exc, "reason_code", "") or "WORKER_START_FAILED"
@@ -3513,6 +3527,7 @@ class InvoiceAppAPI:
             try:
                 self._start_truth_audit_async(secrets.email_address, secrets.auth_code)
             except Exception as exc:
+                self._close_run_dependencies(dependencies)
                 self._safe_emit_stage_event(
                     "start_processing",
                     "exit",
@@ -3538,6 +3553,7 @@ class InvoiceAppAPI:
             try:
                 thread.start()
             except Exception as exc:
+                self._close_run_dependencies(dependencies)
                 self._finalize_admission_failure(handle, exc)
                 self._restore_failed_admission(
                     previous,

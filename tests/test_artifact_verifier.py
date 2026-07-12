@@ -97,7 +97,12 @@ def test_valid_transformed_pdf_with_invoice_identity_passes(tmp_path: Path):
 
     assert verdict.passed is True
     assert verdict.verification_mode == "transformed_content_identity"
-    assert verdict.matched_fields == ("invoice_number",)
+    assert set(verdict.matched_fields) == {
+        "invoice_number",
+        "invoice_date",
+        "amount",
+        "seller",
+    }
 
 
 def test_white_on_white_and_near_blank_pdf_fail_visual_verification(tmp_path: Path):
@@ -153,6 +158,9 @@ def test_visible_split_sequence_in_independent_blocks_passes(tmp_path: Path):
             ((160, 72), "Number", (0, 0, 0)),
             ((245, 72), "1234", (0, 0, 0)),
             ((290, 72), "5678", (0, 0, 0)),
+            ((72, 110), "Invoice Date 2026-06-10", (0, 0, 0)),
+            ((72, 140), "Total Amount 100.00", (0, 0, 0)),
+            ((72, 170), "Seller Standard Merchant", (0, 0, 0)),
         ],
     )
 
@@ -164,7 +172,49 @@ def test_visible_split_sequence_in_independent_blocks_passes(tmp_path: Path):
     )
 
     assert verdict.passed is True
-    assert verdict.matched_fields == ("invoice_number",)
+    assert set(verdict.matched_fields) == {
+        "invoice_number",
+        "invoice_date",
+        "amount",
+        "seller",
+    }
+
+
+def test_number_only_and_number_plus_date_fail_completeness_quorum(tmp_path: Path):
+    number_only = _pdf(tmp_path / "number-only.pdf", "Invoice Number: 12345678")
+    number_and_date = _pdf(
+        tmp_path / "number-date-only.pdf",
+        "Invoice Number: 12345678\nInvoice Date: 2026-06-10",
+    )
+
+    for path in (number_only, number_and_date):
+        verdict = verify_final_artifact(
+            _truth(),
+            path,
+            output_sha256=_sha(path),
+            source_chain_sha256s=[_truth()["sha256"]],
+        )
+        assert verdict.passed is False
+        assert verdict.manual_required is True
+        assert verdict.reason_code == "FINAL_QUORUM_MISMATCH"
+
+
+def test_supporting_document_date_only_fails_role_aware_quorum(tmp_path: Path):
+    path = _pdf(
+        tmp_path / "support-date-only.pdf",
+        "Document Role: hotel_folio\nInvoice Date: 2026-06-10",
+    )
+
+    verdict = verify_final_artifact(
+        _truth(invoice_number="", document_role="hotel_folio"),
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=[_truth()["sha256"]],
+    )
+
+    assert verdict.passed is False
+    assert verdict.manual_required is True
+    assert verdict.reason_code == "FINAL_QUORUM_MISMATCH"
 
 
 def test_distant_words_cannot_be_concatenated_into_strong_identity(tmp_path: Path):

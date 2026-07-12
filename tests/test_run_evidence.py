@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import shutil
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from archive_service import ArchiveService
 from candidate_pipeline import CandidatePipeline
 from extraction_pipeline import ExtractionOutcome
-from report_service import ReportService
+from report_service import ReportService, RunFinalizationContext
 from run_coordinator import RunCoordinator, RunDependencies, RunRequest
 from run_evidence import (
     RevisionUnavailable,
@@ -29,7 +33,106 @@ def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _evidence_threads() -> set[int]:
+    return {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.ident is not None and thread.name.startswith("EvidenceCapture")
+    }
+
+
+def _wait_for_evidence_threads(baseline: set[int], timeout: float = 1.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline and _evidence_threads() != baseline:
+        time.sleep(0.01)
+    assert _evidence_threads() == baseline
+
+
+def test_non_validation_services_never_start_evidence_threads():
+    baseline = _evidence_threads()
+    services = [ReportService(evidence_writer=object()) for _ in range(5)]
+    context = RunFinalizationContext(
+        run_id="non-validation",
+        staging_dir=Path("staging"),
+        output_dir=Path("output"),
+        request=SimpleNamespace(evidence_required=False),
+    )
+    for service in services:
+        assert service.callbacks(context, SimpleNamespace(cancelled=False), None) == []
+    del services
+    gc.collect()
+
+    assert _evidence_threads() == baseline
+
+
+def test_unused_required_dispatcher_close_is_idempotent_and_exits():
+    baseline = _evidence_threads()
+    service = ReportService(evidence_writer=object(), evidence_required=True)
+    context = RunFinalizationContext(
+        run_id="unused-required",
+        staging_dir=Path("staging"),
+        output_dir=Path("output"),
+        request=SimpleNamespace(evidence_required=False),
+    )
+
+    assert service.callbacks(context, SimpleNamespace(cancelled=False), None) == []
+    service.close()
+    service.close()
+
+    _wait_for_evidence_threads(baseline)
+
+
+@pytest.mark.parametrize("mode", ["success", "failure", "cancel", "start_failure"])
+def test_required_dispatcher_exits_for_terminal_capture_paths(tmp_path: Path, mode: str):
+    baseline = _evidence_threads()
+
+    class Writer:
+        def capture(self, _context, _result, *, authorization):
+            if mode == "failure":
+                raise RuntimeError("private capture failure")
+            return bool(authorization())
+
+        def abandon(self, _context):
+            return None
+
+    def launcher(target):
+        if mode == "start_failure":
+            raise RuntimeError("private start failure")
+        target()
+
+    service = ReportService(
+        evidence_writer=Writer(),
+        evidence_capture_launcher=launcher,
+        evidence_capture_timeout_seconds=0.1,
+        evidence_required=True,
+    )
+    context = RunFinalizationContext(
+        run_id=f"capture-{mode}",
+        staging_dir=tmp_path / "staging",
+        output_dir=tmp_path / "output",
+        request=SimpleNamespace(evidence_required=True),
+    )
+    callback = dict(
+        service.callbacks(
+            context,
+            SimpleNamespace(cancelled=mode == "cancel"),
+            None,
+        )
+    )["evidence_capture"]
+
+    if mode in {"failure", "start_failure"}:
+        with pytest.raises(Exception):
+            callback()
+    else:
+        callback()
+    service.close()
+    service.close()
+
+    _wait_for_evidence_threads(baseline)
+
+
 def test_production_facade_records_lineage_before_cleanup_and_finalizes_atomically(tmp_path: Path):
+    baseline_threads = _evidence_threads()
     root = tmp_path / "run"
     staging = root / "staging" / "run-1"
     output = root / "output"
@@ -77,6 +180,7 @@ def test_production_facade_records_lineage_before_cleanup_and_finalizes_atomical
             shutil.rmtree(context.staging_dir),
         ),
         evidence_writer=evidence_writer,
+        evidence_required=True,
     )
     request = RunRequest(
         run_id="run-1",
@@ -133,6 +237,7 @@ def test_production_facade_records_lineage_before_cleanup_and_finalizes_atomical
     assert "标准商户" not in rendered
     assert "目标公司" not in rendered
     assert "100.00" not in rendered
+    _wait_for_evidence_threads(baseline_threads)
 
 
 def test_evidence_capture_rejects_archive_without_real_output(tmp_path: Path):
@@ -209,6 +314,7 @@ def test_failed_lineage_capture_preserves_staging_instead_of_cleaning(tmp_path: 
             shutil.rmtree(context.staging_dir),
         ),
         evidence_writer=RunEvidenceWriter(revision_resolver=lambda: REVISION),
+        evidence_required=True,
         timeout_seconds=0.2,
     )
     request = RunRequest(
@@ -292,6 +398,7 @@ def test_missing_revision_fails_run_releases_handle_and_preserves_staging(
             shutil.rmtree(context.staging_dir),
         ),
         evidence_writer=writer,
+        evidence_required=True,
     )
     request = RunRequest(
         "run-1", "2026-06-01", "2026-06-13", str(root / "output"), "", "account", "qq",
@@ -343,6 +450,7 @@ def _zero_lineage_run(tmp_path: Path, *, scan, included_count: int):
             shutil.rmtree(context.staging_dir),
         ),
         evidence_writer=RunEvidenceWriter(revision_resolver=lambda: REVISION),
+        evidence_required=True,
     )
     request = RunRequest(
         "run-1", "2026-06-01", "2026-06-13", str(output), "", "account", "qq",
@@ -429,6 +537,7 @@ def _capture_deadline_fixture(
         evidence_writer=evidence_writer,
         evidence_capture_timeout_seconds=timeout_seconds,
         evidence_capture_launcher=evidence_capture_launcher,
+        evidence_required=True,
     )
     request = RunRequest(
         "run-1", "2026-06-01", "2026-06-13", str(root / "output"), "", "account", "qq",
@@ -456,6 +565,7 @@ def _assert_capture_timeout_is_quarantined(
     *,
     entered: threading.Event,
     release: threading.Event,
+    baseline_threads: set[int],
 ):
     root, staging, lifecycle, cleaned, state, coordinator, request, handle = fixture
     results = []
@@ -492,6 +602,7 @@ def _assert_capture_timeout_is_quarantined(
     assert quarantine.exists()
     assert not (root / "diagnostics" / "run_evidence.json").exists()
     assert state.snapshot() == state_before
+    _wait_for_evidence_threads(baseline_threads)
 
 
 def test_evidence_hash_timeout_is_bounded_and_late_worker_is_quarantined(
@@ -510,10 +621,14 @@ def test_evidence_hash_timeout_is_bounded_and_late_worker_is_quarantined(
         return original(path)
 
     monkeypatch.setattr(module, "_sha256_file", blocked_hash)
+    baseline_threads = _evidence_threads()
     writer = RunEvidenceWriter(revision_resolver=lambda: REVISION)
     fixture = _capture_deadline_fixture(tmp_path, evidence_writer=writer)
     _assert_capture_timeout_is_quarantined(
-        fixture, entered=entered, release=release
+        fixture,
+        entered=entered,
+        release=release,
+        baseline_threads=baseline_threads,
     )
 
 
@@ -525,13 +640,17 @@ def test_evidence_promotion_timeout_cannot_publish_after_deadline(tmp_path: Path
         entered.set()
         assert release.wait(2)
 
+    baseline_threads = _evidence_threads()
     writer = RunEvidenceWriter(
         revision_resolver=lambda: REVISION,
         capture_promoter=blocked_promote,
     )
     fixture = _capture_deadline_fixture(tmp_path, evidence_writer=writer)
     _assert_capture_timeout_is_quarantined(
-        fixture, entered=entered, release=release
+        fixture,
+        entered=entered,
+        release=release,
+        baseline_threads=baseline_threads,
     )
 
 
@@ -540,6 +659,7 @@ def test_evidence_worker_start_failure_fails_and_preserves_staging(
 ):
     import report_service as module
 
+    baseline_threads = _evidence_threads()
     writer = RunEvidenceWriter(revision_resolver=lambda: REVISION)
     fixture = _capture_deadline_fixture(tmp_path, evidence_writer=writer)
     root, staging, lifecycle, cleaned, _state, coordinator, request, handle = fixture
@@ -559,6 +679,7 @@ def test_evidence_worker_start_failure_fails_and_preserves_staging(
     assert staging.exists()
     assert "private" not in result.error
     assert not (root / "diagnostics" / "run_evidence.json").exists()
+    _wait_for_evidence_threads(baseline_threads)
 
 
 def test_evidence_launch_stall_is_inside_deadline_and_late_work_is_quarantined(
@@ -572,6 +693,7 @@ def test_evidence_launch_stall_is_inside_deadline_and_late_work_is_quarantined(
         assert release.wait(0.3)
         target()
 
+    baseline_threads = _evidence_threads()
     writer = RunEvidenceWriter(revision_resolver=lambda: REVISION)
     fixture = _capture_deadline_fixture(
         tmp_path,
@@ -601,3 +723,4 @@ def test_evidence_launch_stall_is_inside_deadline_and_late_work_is_quarantined(
     assert quarantine.exists()
     assert not (root / "diagnostics" / "run_evidence.json").exists()
     assert state.snapshot() == state_before
+    _wait_for_evidence_threads(baseline_threads)

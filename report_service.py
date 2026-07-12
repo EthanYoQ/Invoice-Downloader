@@ -47,19 +47,25 @@ class FinalizerCallbackError(RuntimeError):
 class _EvidenceCaptureDispatcher:
     """Prestarted dispatcher keeps worker launch off the finalizer thread."""
 
+    _SENTINEL = object()
+
     def __init__(self, launcher: Callable[[Callable[[], None]], Any] | None = None):
         self._launcher = launcher or self._launch_thread
-        self._jobs: queue.Queue[tuple[Callable[[], None], list[BaseException], threading.Event]] = queue.Queue(maxsize=1)
+        self._jobs: queue.Queue[Any] = queue.Queue()
         self._startup_error: BaseException | None = None
-        thread = threading.Thread(
+        self._close_lock = threading.Lock()
+        self._close_requested = False
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
             target=self._serve,
             name="EvidenceCaptureDispatcher",
             daemon=True,
         )
         try:
-            thread.start()
+            self._thread.start()
         except BaseException as exc:
             self._startup_error = exc
+            self._closed.set()
 
     @staticmethod
     def _launch_thread(target: Callable[[], None]) -> None:
@@ -71,12 +77,19 @@ class _EvidenceCaptureDispatcher:
         thread.start()
 
     def _serve(self) -> None:
-        target, failures, done = self._jobs.get()
         try:
-            self._launcher(target)
-        except BaseException as exc:
-            failures.append(exc)
-            done.set()
+            while True:
+                item = self._jobs.get()
+                if item is self._SENTINEL:
+                    return
+                target, failures, done = item
+                try:
+                    self._launcher(target)
+                except BaseException as exc:
+                    failures.append(exc)
+                    done.set()
+        finally:
+            self._closed.set()
 
     def submit(
         self,
@@ -86,7 +99,27 @@ class _EvidenceCaptureDispatcher:
     ) -> None:
         if self._startup_error is not None:
             raise self._startup_error
-        self._jobs.put_nowait((target, failures, done))
+        with self._close_lock:
+            if self._close_requested:
+                raise RuntimeError("evidence_capture_dispatcher_closed")
+            self._jobs.put_nowait((target, failures, done))
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._close_requested:
+                return
+            self._close_requested = True
+            if self._startup_error is None:
+                self._jobs.put_nowait(self._SENTINEL)
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        return self._closed.wait(timeout)
+
+    def __enter__(self) -> "_EvidenceCaptureDispatcher":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
 
 
 class ReportService:
@@ -102,6 +135,7 @@ class ReportService:
         timeout_seconds: float = 120.0,
         evidence_capture_timeout_seconds: float = 120.0,
         evidence_capture_launcher: Callable[[Callable[[], None]], Any] | None = None,
+        evidence_required: bool = False,
     ):
         self._report_callback = report_callback
         self._disconnect_callback = disconnect_callback
@@ -113,9 +147,25 @@ class ReportService:
         )
         self._evidence_capture_dispatcher = (
             _EvidenceCaptureDispatcher(evidence_capture_launcher)
-            if evidence_writer is not None
+            if evidence_writer is not None and evidence_required
             else None
         )
+
+    def _capture_dispatcher(self) -> _EvidenceCaptureDispatcher:
+        if self._evidence_capture_dispatcher is None:
+            raise ValueError("production_evidence_dispatcher_required")
+        return self._evidence_capture_dispatcher
+
+    def close(self) -> None:
+        dispatcher = self._evidence_capture_dispatcher
+        if dispatcher is not None:
+            dispatcher.close()
+
+    def __enter__(self) -> "ReportService":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
 
     def _bounded(self, name: str, callback: Callable[[], Any]) -> Callable[[], None]:
         def invoke() -> None:
@@ -154,11 +204,14 @@ class ReportService:
         evidence_required = bool(
             getattr(getattr(context, "request", None), "evidence_required", False)
         )
+        if not evidence_required:
+            self.close()
         if evidence_required:
             if self._evidence_writer is None:
                 raise ValueError("production_evidence_writer_required")
             def capture_evidence() -> None:
                 nonlocal evidence_captured
+                dispatcher = self._capture_dispatcher()
                 done = threading.Event()
                 abandoned = threading.Event()
                 failure: list[BaseException] = []
@@ -181,22 +234,25 @@ class ReportService:
                         done.set()
 
                 try:
-                    self._evidence_capture_dispatcher.submit(runner, failure, done)
-                except BaseException as exc:
-                    abandoned.set()
-                    self._evidence_writer.abandon(context)
-                    raise FinalizerCallbackError("evidence_capture", exc) from None
-                if not done.wait(self._evidence_capture_timeout_seconds):
-                    abandoned.set()
-                    self._evidence_writer.abandon(context)
-                    raise FinalizerTimeoutError("evidence_capture")
-                if failure:
-                    self._evidence_writer.abandon(context)
-                    raise failure[0]
-                if promoted != [True]:
-                    self._evidence_writer.abandon(context)
-                    raise ValueError("evidence_capture_not_promoted")
-                evidence_captured = True
+                    try:
+                        dispatcher.submit(runner, failure, done)
+                    except BaseException as exc:
+                        abandoned.set()
+                        self._evidence_writer.abandon(context)
+                        raise FinalizerCallbackError("evidence_capture", exc) from None
+                    if not done.wait(self._evidence_capture_timeout_seconds):
+                        abandoned.set()
+                        self._evidence_writer.abandon(context)
+                        raise FinalizerTimeoutError("evidence_capture")
+                    if failure:
+                        self._evidence_writer.abandon(context)
+                        raise failure[0]
+                    if promoted != [True]:
+                        self._evidence_writer.abandon(context)
+                        raise ValueError("evidence_capture_not_promoted")
+                    evidence_captured = True
+                finally:
+                    dispatcher.close()
 
             callbacks.append(("evidence_capture", capture_evidence))
         if self._report_callback is not None:

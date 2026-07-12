@@ -628,6 +628,41 @@ def test_app_api_coordinator_setup_failure_releases_run_without_secret(tmp_path:
     assert "SETUP-SECRET" not in api.last_error
 
 
+def test_worker_start_failure_closes_unused_required_report_service(
+    tmp_path: Path, monkeypatch
+):
+    from app_api import InvoiceAppAPI
+
+    api = InvoiceAppAPI()
+    closed = []
+    service = SimpleNamespace(close=lambda: closed.append("closed"))
+    dependencies = SimpleNamespace(report_service=service)
+    monkeypatch.setattr(api, "_build_run_dependencies", lambda *_args, **_kwargs: dependencies)
+    monkeypatch.setattr(api, "_start_truth_audit_async", lambda *_args: None)
+    monkeypatch.setattr(api, "_safe_write_run_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(api, "save_user_settings", lambda *_args: {"success": True})
+    original_start = threading.Thread.start
+
+    def fail_worker_start(thread):
+        if thread.name == "InvoiceFlowWorker":
+            raise RuntimeError("private worker start failure")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_worker_start)
+    result = api.start_processing(
+        "",
+        str(tmp_path / "output"),
+        "2026-06-01",
+        "2026-06-13",
+        "fixture@qq.com",
+        "fixture-auth",
+        "fixture-key",
+    )
+
+    assert result == {"success": False, "message": "后台任务启动失败"}
+    assert closed == ["closed"]
+
+
 def test_settings_load_failure_releases_reserved_handle_and_restores_config(tmp_path: Path, monkeypatch):
     from app_api import InvoiceAppAPI
     from run_lifecycle import RunState
