@@ -779,6 +779,74 @@ def test_archived_itinerary_quoting_invoice_number_never_suppresses_provider_url
     assert pending == [candidates[1]]
 
 
+def test_archived_full_invoice_number_suppresses_cross_email_provider_duplicate(
+    tmp_path,
+):
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": "C:/staging/invoice.pdf", "email_id": "mail-a"},
+            {
+                "filepath": "https://provider.example/duplicate",
+                "email_id": "mail-b",
+                "provider_family": "chinatax_direct_invoice",
+                "provider_expected_fields": {
+                    "invoice_number": "26112000001703755951"
+                },
+            },
+        ]
+    )
+    attachment = ExtractionOutcome.resolved(candidates[0], {})
+    archive_path = tmp_path / "invoice.pdf"
+    archive_path.write_bytes(b"%PDF-1.4\n")
+
+    skipped, pending = partition_redundant_provider_candidates(
+        [candidates[1]],
+        [ArchivedOutcome(outcome=attachment, archive_path=str(archive_path))],
+        canonical_info_by_document_id={
+            candidates[0].identity.document_id: {
+                "InvoiceNumber": "26112000001703755951",
+                "is_invoice": True,
+                "Type": "餐饮",
+            }
+        },
+    )
+
+    assert pending == []
+    assert skipped[0].reason_code == "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_INVOICE"
+
+
+def test_short_invoice_number_never_suppresses_cross_email_provider_url(tmp_path):
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": "C:/staging/invoice.pdf", "email_id": "mail-a"},
+            {
+                "filepath": "https://provider.example/not-proven",
+                "email_id": "mail-b",
+                "provider_family": "baiwang",
+                "provider_expected_fields": {"invoice_number": "12345678"},
+            },
+        ]
+    )
+    attachment = ExtractionOutcome.resolved(candidates[0], {})
+    archive_path = tmp_path / "invoice.pdf"
+    archive_path.write_bytes(b"%PDF-1.4\n")
+
+    skipped, pending = partition_redundant_provider_candidates(
+        [candidates[1]],
+        [ArchivedOutcome(outcome=attachment, archive_path=str(archive_path))],
+        canonical_info_by_document_id={
+            candidates[0].identity.document_id: {
+                "InvoiceNumber": "12345678",
+                "is_invoice": True,
+                "Type": "餐饮",
+            }
+        },
+    )
+
+    assert skipped == []
+    assert pending == [candidates[1]]
+
+
 def test_extraction_progress_supports_monotonic_multi_phase_offsets():
     progress = []
     candidates = [_candidate(0), _candidate(1)]

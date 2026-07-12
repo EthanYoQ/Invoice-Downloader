@@ -523,6 +523,11 @@ def partition_redundant_provider_candidates(
         primary_outcomes,
         canonical_info_by_document_id,
     )
+    recovered_full_invoice_numbers = {
+        invoice_number
+        for _source_uid, invoice_number in recovered_identities
+        if len(invoice_number) == 20
+    }
     skipped = []
     pending = []
     for candidate in candidates:
@@ -533,12 +538,18 @@ def partition_redundant_provider_candidates(
             or expected_fields.get("InvoiceNumber")
         )
         source_uid = str(candidate.identity.source_message_uid or "").strip()
+        identity_recovered = bool(
+            (source_uid and (source_uid, expected_number) in recovered_identities)
+            or (
+                len(expected_number) == 20
+                and expected_number in recovered_full_invoice_numbers
+            )
+        )
         redundant = bool(
             candidate.identity.source_kind == "url"
             and legacy.get("provider_family")
-            and source_uid
             and expected_number
-            and (source_uid, expected_number) in recovered_identities
+            and identity_recovered
         )
         if not redundant:
             pending.append(candidate)
