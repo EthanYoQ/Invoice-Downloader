@@ -181,8 +181,65 @@ def _visible_hit(document: Any, expected: Any) -> _PdfFieldHit | None:
 
 
 def _visible_labeled_value(
-    document: Any, expected: Any, labels: tuple[str, ...]
+    document: Any,
+    expected: Any,
+    labels: tuple[str, ...],
+    *,
+    allow_unqualified_prefix: bool = False,
 ) -> bool:
+    label_sequences = tuple(_sequence(label) for label in labels)
+    disallowed_qualifiers = (
+        "original",
+        "related",
+        "previous",
+        "referenced",
+        "reversed",
+        "blue",
+        "red",
+        "原",
+        "原始",
+        "关联",
+        "相关",
+        "对应",
+        "蓝字",
+        "红字",
+        "冲销",
+    )
+    valid_label_lines: dict[int, list[tuple[float, float, float, float]]] = {}
+    for page in document:
+        lines: dict[tuple[int, int], list[Any]] = {}
+        for word in page.get_text("words", sort=True):
+            lines.setdefault((int(word[5]), int(word[6])), []).append(word)
+        for words in lines.values():
+            line_sequence = "".join(_sequence(word[4]) for word in words)
+            valid = False
+            for label_sequence in label_sequences:
+                start = line_sequence.find(label_sequence)
+                while label_sequence and start >= 0:
+                    prefix = line_sequence[:start]
+                    if start == 0 or (
+                        allow_unqualified_prefix
+                        and not any(
+                            prefix.endswith(token) for token in disallowed_qualifiers
+                        )
+                    ):
+                        valid = True
+                        break
+                    start = line_sequence.find(label_sequence, start + 1)
+                if valid:
+                    break
+            if valid:
+                valid_label_lines.setdefault(int(page.number), []).append(
+                    (
+                        min(float(word[0]) for word in words),
+                        min(float(word[1]) for word in words),
+                        max(float(word[2]) for word in words),
+                        max(float(word[3]) for word in words),
+                    )
+                )
+
+    if not valid_label_lines:
+        return False
     value_hits = [hit for hit in _find_hits(document, expected) if _hit_is_visible(document, hit)]
     label_hits = [
         hit
@@ -191,6 +248,15 @@ def _visible_labeled_value(
         if _hit_is_visible(document, hit)
     ]
     for label_hit in label_hits:
+        label_center_x = (label_hit.bbox[0] + label_hit.bbox[2]) / 2
+        label_center_y = (label_hit.bbox[1] + label_hit.bbox[3]) / 2
+        if not any(
+            left <= label_center_x <= right and top <= label_center_y <= bottom
+            for left, top, right, bottom in valid_label_lines.get(
+                label_hit.page_index, ()
+            )
+        ):
+            continue
         label_x0, label_y0, label_x1, label_y1 = label_hit.bbox
         label_height = max(1.0, label_y1 - label_y0)
         label_center = (label_y0 + label_y1) / 2
@@ -305,6 +371,10 @@ def _verify_pdf(
                     return _failure("FINAL_FIELD_NOT_LABELED")
                 matched.append("invoice_number")
             if expected_code:
+                if require_labeled_identity and _visible_hit(
+                    document, "EMAIL_BODY_RECEIPT_CANONICAL"
+                ) is None:
+                    return _failure("FINAL_SEMANTIC_PROFILE_MISMATCH")
                 if _visible_hit(document, expected_code) is None:
                     return _failure("FINAL_FIELD_NOT_VISIBLE")
                 if require_labeled_identity and not _visible_labeled_value(
@@ -317,6 +387,7 @@ def _verify_pdf(
                         "order number",
                         "order no",
                     ),
+                    allow_unqualified_prefix=True,
                 ):
                     return _failure("FINAL_FIELD_NOT_LABELED")
                 matched.append("invoice_code")

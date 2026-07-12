@@ -163,6 +163,30 @@ def test_semantic_identity_rejects_invoice_number_only_referenced_in_remarks(
     assert verdict.reason_code == "FINAL_FIELD_NOT_LABELED"
 
 
+def test_semantic_identity_rejects_original_invoice_number_label_in_remarks(
+    tmp_path: Path,
+):
+    truth = _truth(invoice_number="26110000000000000001")
+    path = _pdf(
+        tmp_path / "credit-note.pdf",
+        "Invoice Number: 99999999999999999999\n"
+        "Remark - Original Invoice Number: 26110000000000000001\n"
+        "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
+        "Seller: Standard Merchant",
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_NOT_LABELED"
+
+
 def test_semantic_receipt_accepts_labeled_order_and_document_numbers(tmp_path: Path):
     truth = _truth(
         invoice_number="778080227734",
@@ -171,6 +195,7 @@ def test_semantic_receipt_accepts_labeled_order_and_document_numbers(tmp_path: P
     )
     path = _pdf(
         tmp_path / "receipt.pdf",
+        "EMAIL_BODY_RECEIPT_CANONICAL\n"
         "Document No: 778080227734\nOrder Number: MTFKT9WLF9\n"
         "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
         "Seller: Cloud Merchant",
