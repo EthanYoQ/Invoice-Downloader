@@ -180,7 +180,6 @@ def _hit_overlaps_embedded_image(document: Any, hit: _PdfFieldHit) -> bool:
 
     page = document[hit.page_index]
     hit_rect = fitz.Rect(hit.bbox)
-    hit_area = max(1.0, float(hit_rect.width * hit_rect.height))
     for image in page.get_images(full=True):
         try:
             rectangles = page.get_image_rects(int(image[0]))
@@ -188,7 +187,7 @@ def _hit_overlaps_embedded_image(document: Any, hit: _PdfFieldHit) -> bool:
             return True
         for rectangle in rectangles:
             overlap = hit_rect & rectangle
-            if not overlap.is_empty and float(overlap.width * overlap.height) >= hit_area * 0.1:
+            if not overlap.is_empty:
                 return True
     return False
 
@@ -288,6 +287,7 @@ def _first_visible_labeled_value(
                 for label in labels
                 for hit in _word_sequence_hits(page, label)
                 if _hit_is_visible(document, hit)
+                and not _hit_overlaps_embedded_image(document, hit)
                 and line_bbox[0] <= (hit.bbox[0] + hit.bbox[2]) / 2 <= line_bbox[2]
                 and line_bbox[1] <= (hit.bbox[1] + hit.bbox[3]) / 2 <= line_bbox[3]
             ]
