@@ -1361,11 +1361,16 @@ class InvoiceExtractor:
                     
             # 强化兜底：不再直接因为缺少 Date/Seller/Amount 就报错抛弃，而是填入未知并放行。
             # 分类白名单拦截网或者 Manual_Check 机制会自然处理这些"半残"发票。
-            if "Date" not in result: result["Date"] = "未知日期"
-            if "Seller" not in result: result["Seller"] = "未知开票方"
-            if "Amount" not in result: result["Amount"] = "0.00"
-            if "Type" not in result: result["Type"] = "未知分类"
-            if "Purchaser" not in result: result["Purchaser"] = "暂无抬头"
+            if "Date" not in result:
+                result["Date"] = "未知日期"
+            if "Seller" not in result:
+                result["Seller"] = "未知开票方"
+            if "Amount" not in result:
+                result["Amount"] = "0.00"
+            if "Type" not in result:
+                result["Type"] = "未知分类"
+            if "Purchaser" not in result:
+                result["Purchaser"] = "暂无抬头"
             
             return result
 
