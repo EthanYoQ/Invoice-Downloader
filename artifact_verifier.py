@@ -180,13 +180,14 @@ def _visible_hit(document: Any, expected: Any) -> _PdfFieldHit | None:
     )
 
 
-def _visible_labeled_value(
+def _first_visible_labeled_value(
     document: Any,
     expected: Any,
     labels: tuple[str, ...],
     *,
     allow_unqualified_prefix: bool = False,
-) -> bool:
+) -> str | None:
+    expected_sequence = _sequence(expected)
     label_sequences = tuple(_sequence(label) for label in labels)
     disallowed_qualifiers = (
         "original",
@@ -205,14 +206,21 @@ def _visible_labeled_value(
         "红字",
         "冲销",
     )
-    valid_label_lines: dict[int, list[tuple[float, float, float, float]]] = {}
+    def candidate_from(sequence: str) -> str:
+        if expected_sequence.isdigit():
+            match = re.search(r"\d{8,20}", sequence)
+        else:
+            match = re.search(r"[0-9a-z]{6,30}", sequence)
+        return match.group(0) if match else ""
+
     for page in document:
+        page_words = page.get_text("words", sort=True)
         lines: dict[tuple[int, int], list[Any]] = {}
-        for word in page.get_text("words", sort=True):
+        for word in page_words:
             lines.setdefault((int(word[5]), int(word[6])), []).append(word)
         for words in lines.values():
             line_sequence = "".join(_sequence(word[4]) for word in words)
-            valid = False
+            valid_labels: list[tuple[int, str]] = []
             for label_sequence in label_sequences:
                 start = line_sequence.find(label_sequence)
                 while label_sequence and start >= 0:
@@ -220,60 +228,52 @@ def _visible_labeled_value(
                     if start == 0 or (
                         allow_unqualified_prefix
                         and not any(
-                            prefix.endswith(token) for token in disallowed_qualifiers
+                            token in prefix for token in disallowed_qualifiers
                         )
                     ):
-                        valid = True
-                        break
+                        valid_labels.append((start, label_sequence))
                     start = line_sequence.find(label_sequence, start + 1)
-                if valid:
-                    break
-            if valid:
-                valid_label_lines.setdefault(int(page.number), []).append(
-                    (
-                        min(float(word[0]) for word in words),
-                        min(float(word[1]) for word in words),
-                        max(float(word[2]) for word in words),
-                        max(float(word[3]) for word in words),
-                    )
-                )
-
-    if not valid_label_lines:
-        return False
-    value_hits = [hit for hit in _find_hits(document, expected) if _hit_is_visible(document, hit)]
-    label_hits = [
-        hit
-        for label in labels
-        for hit in _find_hits(document, label)
-        if _hit_is_visible(document, hit)
-    ]
-    for label_hit in label_hits:
-        label_center_x = (label_hit.bbox[0] + label_hit.bbox[2]) / 2
-        label_center_y = (label_hit.bbox[1] + label_hit.bbox[3]) / 2
-        if not any(
-            left <= label_center_x <= right and top <= label_center_y <= bottom
-            for left, top, right, bottom in valid_label_lines.get(
-                label_hit.page_index, ()
-            )
-        ):
-            continue
-        label_x0, label_y0, label_x1, label_y1 = label_hit.bbox
-        label_height = max(1.0, label_y1 - label_y0)
-        label_center = (label_y0 + label_y1) / 2
-        page_width = float(document[label_hit.page_index].rect.width)
-        for value_hit in value_hits:
-            if value_hit.page_index != label_hit.page_index:
+            if not valid_labels:
                 continue
-            value_x0, value_y0, _value_x1, value_y1 = value_hit.bbox
-            value_height = max(1.0, value_y1 - value_y0)
-            value_center = (value_y0 + value_y1) / 2
-            if (
-                abs(value_center - label_center) <= max(label_height, value_height)
-                and value_x0 >= label_x0
-                and value_x0 - label_x1 <= page_width * 0.5
-            ):
-                return True
-    return False
+            start, label_sequence = min(valid_labels, key=lambda item: item[0])
+            inline_value = candidate_from(
+                line_sequence[start + len(label_sequence):]
+            )
+            if inline_value:
+                return inline_value
+
+            line_bbox = (
+                min(float(word[0]) for word in words),
+                min(float(word[1]) for word in words),
+                max(float(word[2]) for word in words),
+                max(float(word[3]) for word in words),
+            )
+            label_hits = [
+                hit
+                for label in labels
+                for hit in _word_sequence_hits(page, label)
+                if _hit_is_visible(document, hit)
+                and line_bbox[0] <= (hit.bbox[0] + hit.bbox[2]) / 2 <= line_bbox[2]
+                and line_bbox[1] <= (hit.bbox[1] + hit.bbox[3]) / 2 <= line_bbox[3]
+            ]
+            for label_hit in sorted(label_hits, key=lambda hit: hit.bbox[0]):
+                label_height = max(1.0, label_hit.bbox[3] - label_hit.bbox[1])
+                label_center = (label_hit.bbox[1] + label_hit.bbox[3]) / 2
+                candidates = []
+                for word in page_words:
+                    word_height = max(1.0, float(word[3]) - float(word[1]))
+                    word_center = (float(word[1]) + float(word[3])) / 2
+                    if (
+                        float(word[0]) >= label_hit.bbox[2] - label_height
+                        and abs(word_center - label_center)
+                        <= max(label_height, word_height) * 0.35
+                    ):
+                        value = candidate_from(_sequence(word[4]))
+                        if value:
+                            candidates.append((float(word[0]), value))
+                if candidates:
+                    return min(candidates, key=lambda item: item[0])[1]
+    return None
 
 
 def _date_aliases(value: Any) -> tuple[str, ...]:
@@ -356,19 +356,23 @@ def _verify_pdf(
             if expected_number:
                 if _visible_hit(document, expected_number) is None:
                     return _failure("FINAL_FIELD_NOT_VISIBLE")
-                if require_labeled_identity and not _visible_labeled_value(
-                    document,
-                    expected_number,
-                    (
-                        "发票号码",
-                        "invoice number",
-                        "invoice no",
-                        "文稿编号",
-                        "document number",
-                        "document no",
-                    ),
-                ):
-                    return _failure("FINAL_FIELD_NOT_LABELED")
+                if require_labeled_identity:
+                    actual_number = _first_visible_labeled_value(
+                        document,
+                        expected_number,
+                        (
+                            "发票号码",
+                            "invoice number",
+                            "invoice no",
+                            "文稿编号",
+                            "document number",
+                            "document no",
+                        ),
+                    )
+                    if actual_number is None:
+                        return _failure("FINAL_FIELD_NOT_LABELED")
+                    if actual_number != _sequence(expected_number):
+                        return _failure("FINAL_FIELD_VALUE_MISMATCH")
                 matched.append("invoice_number")
             if expected_code:
                 if require_labeled_identity and _visible_hit(
@@ -377,19 +381,17 @@ def _verify_pdf(
                     return _failure("FINAL_SEMANTIC_PROFILE_MISMATCH")
                 if _visible_hit(document, expected_code) is None:
                     return _failure("FINAL_FIELD_NOT_VISIBLE")
-                if require_labeled_identity and not _visible_labeled_value(
-                    document,
-                    expected_code,
-                    (
-                        "发票代码",
-                        "invoice code",
-                        "订单号",
-                        "order number",
-                        "order no",
-                    ),
-                    allow_unqualified_prefix=True,
-                ):
-                    return _failure("FINAL_FIELD_NOT_LABELED")
+                if require_labeled_identity:
+                    actual_code = _first_visible_labeled_value(
+                        document,
+                        expected_code,
+                        ("订单号", "order number", "order no"),
+                        allow_unqualified_prefix=True,
+                    )
+                    if actual_code is None:
+                        return _failure("FINAL_FIELD_NOT_LABELED")
+                    if actual_code != _sequence(expected_code):
+                        return _failure("FINAL_FIELD_VALUE_MISMATCH")
                 matched.append("invoice_code")
 
             date_hit = _visible_date_hit(document, truth.get("invoice_date"))

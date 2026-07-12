@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 
 import fitz
+import pytest
 
 from artifact_verifier import verify_final_artifact
 
@@ -160,7 +161,7 @@ def test_semantic_identity_rejects_invoice_number_only_referenced_in_remarks(
     )
 
     assert verdict.passed is False
-    assert verdict.reason_code == "FINAL_FIELD_NOT_LABELED"
+    assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
 
 
 def test_semantic_identity_rejects_original_invoice_number_label_in_remarks(
@@ -184,7 +185,117 @@ def test_semantic_identity_rejects_original_invoice_number_label_in_remarks(
     )
 
     assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
+
+
+def test_semantic_identity_uses_first_field_value_not_later_same_row_reference(
+    tmp_path: Path,
+):
+    truth = _truth(invoice_number="26110000000000000001")
+    path = _styled_pdf(
+        tmp_path / "same-row-reference.pdf",
+        [
+            ((72, 72), "Invoice Number:", (0, 0, 0)),
+            ((180, 72), "99999999999999999999", (0, 0, 0)),
+            ((330, 72), "Red", (0, 0, 0)),
+            ((370, 72), "26110000000000000001", (0, 0, 0)),
+            ((72, 110), "Invoice Date: 2026-06-10", (0, 0, 0)),
+            ((72, 140), "Total Amount: 100.00", (0, 0, 0)),
+            ((72, 170), "Seller: Standard Merchant", (0, 0, 0)),
+        ],
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
+
+
+def test_semantic_receipt_uses_current_order_not_referenced_order(tmp_path: Path):
+    truth = _truth(
+        invoice_number="778080227734",
+        invoice_code="MTFKT9WLF9",
+        seller="Cloud Merchant",
+    )
+    path = _pdf(
+        tmp_path / "wrong-receipt.pdf",
+        "EMAIL_BODY_RECEIPT_CANONICAL\n"
+        "Document No: 778080227734\nOrder Number: WRONGCODE0\n"
+        "Original Receipt Order Number: MTFKT9WLF9\n"
+        "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
+        "Seller: Cloud Merchant",
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
+
+
+def test_semantic_receipt_rejects_only_qualified_order_reference(tmp_path: Path):
+    truth = _truth(
+        invoice_number="778080227734",
+        invoice_code="MTFKT9WLF9",
+        seller="Cloud Merchant",
+    )
+    path = _pdf(
+        tmp_path / "referenced-order-only.pdf",
+        "EMAIL_BODY_RECEIPT_CANONICAL\n"
+        "Document No: 778080227734\n"
+        "Original Receipt Order Number: MTFKT9WLF9\n"
+        "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
+        "Seller: Cloud Merchant",
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
     assert verdict.reason_code == "FINAL_FIELD_NOT_LABELED"
+
+
+@pytest.mark.parametrize("value_y, expected_pass", [(72, True), (84, False)])
+def test_semantic_field_binding_requires_same_visual_baseline(
+    tmp_path: Path, value_y: int, expected_pass: bool
+):
+    truth = _truth(invoice_number="26110000000000000001")
+    path = _styled_pdf(
+        tmp_path / f"baseline-{value_y}.pdf",
+        [
+            ((72, 72), "Invoice Number:", (0, 0, 0)),
+            ((180, value_y), "26110000000000000001", (0, 0, 0)),
+            ((72, 110), "Invoice Date: 2026-06-10", (0, 0, 0)),
+            ((72, 140), "Total Amount: 100.00", (0, 0, 0)),
+            ((72, 170), "Seller: Standard Merchant", (0, 0, 0)),
+        ],
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is expected_pass
 
 
 def test_semantic_receipt_accepts_labeled_order_and_document_numbers(tmp_path: Path):
