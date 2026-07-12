@@ -310,6 +310,45 @@ def test_semantic_identity_ignores_hidden_target_field_before_visible_current(
     assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
 
 
+def test_semantic_identity_rejects_ocr_text_over_scanned_wrong_field(tmp_path: Path):
+    source = fitz.open()
+    source_page = source.new_page()
+    source_page.insert_text(
+        (72, 72), "Invoice Number: 99999999999999999999", color=(0, 0, 0)
+    )
+    scan = source_page.get_pixmap(alpha=False)
+    source.close()
+
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_image(page.rect, pixmap=scan)
+    page.insert_text(
+        (72, 72), "Invoice Number: 26110000000000000001", color=(1, 1, 1)
+    )
+    page.insert_text(
+        (72, 120),
+        "Original Invoice Number: 26110000000000000001",
+        color=(0, 0, 0),
+    )
+    page.insert_text((72, 150), "Invoice Date: 2026-06-10", color=(0, 0, 0))
+    page.insert_text((72, 180), "Total Amount: 100.00", color=(0, 0, 0))
+    page.insert_text((72, 210), "Seller: Standard Merchant", color=(0, 0, 0))
+    path = tmp_path / "ocr-scan.pdf"
+    document.save(path)
+    document.close()
+
+    verdict = verify_final_artifact(
+        _truth(invoice_number="26110000000000000001"),
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_NOT_LABELED"
+
+
 def test_semantic_receipt_uses_current_order_not_referenced_order(tmp_path: Path):
     truth = _truth(
         invoice_number="778080227734",

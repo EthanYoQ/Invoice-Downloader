@@ -173,6 +173,26 @@ def _hit_is_visible(document: Any, hit: _PdfFieldHit) -> bool:
     return nonwhite >= max(8, int(pixels * 0.01)) and lightest - darkest >= 16
 
 
+def _hit_overlaps_embedded_image(document: Any, hit: _PdfFieldHit) -> bool:
+    if hit.page_index < 0 or hit.page_index >= document.page_count:
+        return True
+    import fitz
+
+    page = document[hit.page_index]
+    hit_rect = fitz.Rect(hit.bbox)
+    hit_area = max(1.0, float(hit_rect.width * hit_rect.height))
+    for image in page.get_images(full=True):
+        try:
+            rectangles = page.get_image_rects(int(image[0]))
+        except Exception:
+            return True
+        for rectangle in rectangles:
+            overlap = hit_rect & rectangle
+            if not overlap.is_empty and float(overlap.width * overlap.height) >= hit_area * 0.1:
+                return True
+    return False
+
+
 def _visible_hit(document: Any, expected: Any) -> _PdfFieldHit | None:
     return next(
         (hit for hit in _find_hits(document, expected) if _hit_is_visible(document, hit)),
@@ -250,6 +270,7 @@ def _first_visible_labeled_value(
                     <= (hit.bbox[1] + hit.bbox[3]) / 2
                     <= line_bbox[3]
                     and _hit_is_visible(document, hit)
+                    and not _hit_overlaps_embedded_image(document, hit)
                     for hit in _word_sequence_hits(page, value)
                 )
 
@@ -282,6 +303,13 @@ def _first_visible_labeled_value(
                         and abs(word_center - label_center)
                         <= max(label_height, word_height) * 0.35
                         and _hit_is_visible(
+                            document,
+                            _PdfFieldHit(
+                                page_index=int(page.number),
+                                bbox=tuple(float(value) for value in word[:4]),
+                            ),
+                        )
+                        and not _hit_overlaps_embedded_image(
                             document,
                             _PdfFieldHit(
                                 page_index=int(page.number),
