@@ -105,6 +105,40 @@ def test_valid_transformed_pdf_with_invoice_identity_passes(tmp_path: Path):
     }
 
 
+def test_regenerated_pdf_requires_explicit_semantic_source_identity(tmp_path: Path):
+    truth = _truth(invoice_number="26110000000000000001")
+    path = _pdf(
+        tmp_path / "regenerated.pdf",
+        "Invoice Number: 26110000000000000001\nInvoice Date: 2026-06-10\n"
+        "Total Amount: 100.00\nSeller: Standard Merchant",
+    )
+    strict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+    )
+
+    semantic = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert strict.passed is False
+    assert strict.reason_code == "SOURCE_LINEAGE_MISSING"
+    assert semantic.passed is True
+    assert semantic.verification_mode == "semantic_source_identity"
+    assert set(semantic.matched_fields) >= {
+        "invoice_number",
+        "invoice_date",
+        "amount",
+        "seller",
+    }
+
+
 def test_white_on_white_and_near_blank_pdf_fail_visual_verification(tmp_path: Path):
     white = _styled_pdf(
         tmp_path / "white-text.pdf",

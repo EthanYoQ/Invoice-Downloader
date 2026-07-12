@@ -772,15 +772,21 @@ class BatchValidator:
                 for value in lineage_row["source_chain_sha256s"]
             }
             strong_hashes.add(str(lineage_row["output_sha256"]).lower())
-            if truth_row.artifact_sha256.lower() not in strong_hashes:
-                raise BatchValidationError("truth_lineage_mismatch", truth_row.truth_id)
+            source_lineage_matches = (
+                truth_row.artifact_sha256.lower() in strong_hashes
+            )
             verification = verify_final_artifact(
                 truth_row.to_mapping(),
                 assignment["matched_path"],
                 output_sha256=str(lineage_row["output_sha256"]),
                 source_chain_sha256s=list(lineage_row["source_chain_sha256s"]),
+                allow_semantic_source_identity=not source_lineage_matches,
             )
             if not verification.passed:
+                if not source_lineage_matches:
+                    raise BatchValidationError(
+                        "truth_lineage_mismatch", truth_row.truth_id
+                    )
                 raise BatchValidationError(
                     "artifact_content_verification_failed",
                     f"{truth_row.truth_id}:{verification.reason_code}",

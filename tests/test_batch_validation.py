@@ -360,6 +360,38 @@ def test_weak_business_match_cannot_satisfy_truth_without_content_lineage(tmp_pa
     assert exc_info.value.code == "truth_lineage_mismatch"
 
 
+def test_batch_validator_accepts_strong_semantic_identity_for_regenerated_pdf(tmp_path):
+    root = _run_root(tmp_path)
+    manifest = _manifest()
+    manifest["included"][0]["invoice_number"] = "26110000000000000001"
+    artifact = root / "output" / "餐饮" / "invoice-1.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "Invoice Number: 26110000000000000001\n"
+        "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
+        "Seller: Standard Merchant 1",
+    )
+    document.save(artifact)
+    document.close()
+    manifest["included"][0]["seller"] = "Standard Merchant 1"
+    _rebind_output_evidence(root)
+    evidence_path = root / "diagnostics" / "run_evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["lineage"][0]["source_chain_sha256s"] = ["f" * 64]
+    evidence["lineage_digest"] = compute_lineage_digest(evidence["lineage"])
+    evidence["evidence_digest"] = compute_evidence_digest(evidence)
+    _write_json(evidence_path, evidence)
+
+    result = _validator().validate(manifest, root)
+
+    assert result.passed is True
+    assert result.assignments[0]["artifact_verification_mode"] == (
+        "semantic_source_identity"
+    )
+
+
 def test_lineage_run_id_is_bound_to_top_level_evidence(tmp_path):
     root = _run_root(tmp_path)
     evidence_path = root / "diagnostics" / "run_evidence.json"

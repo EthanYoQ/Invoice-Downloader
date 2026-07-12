@@ -363,6 +363,7 @@ def verify_final_artifact(
     *,
     output_sha256: str,
     source_chain_sha256s: list[str] | tuple[str, ...],
+    allow_semantic_source_identity: bool = False,
 ) -> ArtifactVerification:
     truth_hash = _text(truth.get("sha256")).lower()
     output_hash = _text(output_sha256).lower()
@@ -374,13 +375,36 @@ def verify_final_artifact(
             verification_mode="unchanged_sha256",
             matched_fields=("sha256",),
         )
-    if not truth_hash or truth_hash not in source_hashes:
+    source_lineage_matches = bool(truth_hash and truth_hash in source_hashes)
+    semantic_invoice_number = _compact(truth.get("invoice_number"))
+    semantic_invoice_code = _compact(truth.get("invoice_code"))
+    semantic_source_identity = bool(
+        allow_semantic_source_identity
+        and (
+            len(semantic_invoice_number) == 20
+            or (
+                len(semantic_invoice_number) >= 8
+                and len(semantic_invoice_code) >= 6
+            )
+        )
+    )
+    if not source_lineage_matches and not semantic_source_identity:
         return _failure("SOURCE_LINEAGE_MISSING")
 
     path = Path(output_path)
     suffix = path.suffix.casefold()
     if suffix == ".pdf":
-        return _verify_pdf(path, truth)
+        verification = _verify_pdf(path, truth)
+        if semantic_source_identity and verification.passed:
+            return ArtifactVerification(
+                passed=True,
+                manual_required=False,
+                verification_mode="semantic_source_identity",
+                matched_fields=verification.matched_fields,
+            )
+        return verification
+    if semantic_source_identity:
+        return _failure("SOURCE_LINEAGE_MISSING")
     if suffix == ".xml":
         fields, error = _parse_xml(path)
     else:
