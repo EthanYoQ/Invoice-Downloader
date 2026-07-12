@@ -208,10 +208,10 @@ def _first_visible_labeled_value(
     )
     def candidate_from(sequence: str) -> str:
         if expected_sequence.isdigit():
-            match = re.match(r"\d+", sequence)
+            return sequence if sequence[:1].isdigit() else ""
         else:
             match = re.match(r"[0-9a-z]+", sequence)
-        return match.group(0) if match else ""
+            return match.group(0) if match else ""
 
     for page in document:
         page_words = page.get_text("words", sort=True)
@@ -285,6 +285,7 @@ def _first_visible_labeled_value(
                             chunks.append(sequence)
                             continue
                         if chunks:
+                            chunks.append(sequence)
                             break
                         return sequence
                     if chunks:

@@ -256,6 +256,28 @@ def test_semantic_identity_does_not_skip_split_or_overlong_current_number(
         assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
 
 
+def test_semantic_identity_rejects_qualifier_after_target_number(tmp_path: Path):
+    truth = _truth(invoice_number="26110000000000000001")
+    path = _pdf(
+        tmp_path / "qualified-target.pdf",
+        "Invoice Number: 26110000000000000001 Original\n"
+        "Invoice Number: 99999999999999999999\n"
+        "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
+        "Seller: Standard Merchant",
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
+
+
 def test_semantic_receipt_uses_current_order_not_referenced_order(tmp_path: Path):
     truth = _truth(
         invoice_number="778080227734",
