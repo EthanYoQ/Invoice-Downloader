@@ -236,18 +236,32 @@ def _first_visible_labeled_value(
             if not valid_labels:
                 continue
             start, label_sequence = min(valid_labels, key=lambda item: item[0])
-            inline_value = candidate_from(
-                line_sequence[start + len(label_sequence):]
-            )
-            if inline_value:
-                return inline_value
-
             line_bbox = (
                 min(float(word[0]) for word in words),
                 min(float(word[1]) for word in words),
                 max(float(word[2]) for word in words),
                 max(float(word[3]) for word in words),
             )
+
+            def visible_in_line(value: str) -> bool:
+                return any(
+                    line_bbox[0] <= (hit.bbox[0] + hit.bbox[2]) / 2 <= line_bbox[2]
+                    and line_bbox[1]
+                    <= (hit.bbox[1] + hit.bbox[3]) / 2
+                    <= line_bbox[3]
+                    and _hit_is_visible(document, hit)
+                    for hit in _word_sequence_hits(page, value)
+                )
+
+            inline_value = candidate_from(
+                line_sequence[start + len(label_sequence):]
+            )
+            if (
+                inline_value
+                and visible_in_line(label_sequence)
+                and visible_in_line(inline_value)
+            ):
+                return inline_value
             label_hits = [
                 hit
                 for label in labels
@@ -267,6 +281,13 @@ def _first_visible_labeled_value(
                         float(word[0]) >= label_hit.bbox[2] - label_height
                         and abs(word_center - label_center)
                         <= max(label_height, word_height) * 0.35
+                        and _hit_is_visible(
+                            document,
+                            _PdfFieldHit(
+                                page_index=int(page.number),
+                                bbox=tuple(float(value) for value in word[:4]),
+                            ),
+                        )
                     ):
                         eligible_words.append(word)
                 eligible_words.sort(key=lambda word: float(word[0]))

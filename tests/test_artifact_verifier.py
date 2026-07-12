@@ -278,6 +278,38 @@ def test_semantic_identity_rejects_qualifier_after_target_number(tmp_path: Path)
     assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
 
 
+def test_semantic_identity_ignores_hidden_target_field_before_visible_current(
+    tmp_path: Path,
+):
+    truth = _truth(invoice_number="26110000000000000001")
+    path = _styled_pdf(
+        tmp_path / "hidden-target-field.pdf",
+        [
+            ((72, 72), "Invoice Number: 26110000000000000001", (1, 1, 1)),
+            ((72, 100), "Invoice Number: 99999999999999999999", (0, 0, 0)),
+            (
+                (72, 130),
+                "Original Invoice Number: 26110000000000000001",
+                (0, 0, 0),
+            ),
+            ((72, 160), "Invoice Date: 2026-06-10", (0, 0, 0)),
+            ((72, 190), "Total Amount: 100.00", (0, 0, 0)),
+            ((72, 220), "Seller: Standard Merchant", (0, 0, 0)),
+        ],
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
+
+
 def test_semantic_receipt_uses_current_order_not_referenced_order(tmp_path: Path):
     truth = _truth(
         invoice_number="778080227734",
