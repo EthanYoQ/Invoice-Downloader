@@ -1219,20 +1219,34 @@ class PDFConverter:
             response.close()
 
     def _probe_direct_invoice_artifact_with_retry(
-        self, session, url, artifact_prefix, max_attempts=3
+        self,
+        session,
+        url,
+        artifact_prefix,
+        max_attempts=3,
+        retry_delays=(2.0, 8.0),
     ):
         logs = []
-        for _attempt in range(max(1, int(max_attempts))):
+        attempt_count = max(1, int(max_attempts))
+        for attempt in range(attempt_count):
             artifacts, attempt_logs = self._probe_direct_invoice_artifact(
                 session, url, artifact_prefix
             )
             logs.extend(attempt_logs)
             if artifacts:
                 return artifacts, logs
-            if not attempt_logs or any(
-                item.get("kind") != "direct_probe_error" for item in attempt_logs
-            ):
+            if any(item.get("kind") == "URL_POLICY_REJECTED" for item in attempt_logs):
                 break
+            if attempt + 1 >= attempt_count:
+                continue
+            transport_only = bool(attempt_logs) and all(
+                item.get("kind") == "direct_probe_error" for item in attempt_logs
+            )
+            if not transport_only:
+                delay_index = min(attempt, len(retry_delays) - 1)
+                delay = float(retry_delays[delay_index]) if retry_delays else 0.0
+                if delay > 0:
+                    __import__("time").sleep(delay)
         return [], logs
 
     def _probe_nuonuo_scan_invoice_artifacts(self, session, url, artifact_prefix):

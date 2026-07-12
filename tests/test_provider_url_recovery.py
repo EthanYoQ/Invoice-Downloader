@@ -1672,6 +1672,54 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "downloaded")
         self.assertEqual(len(attempts), 3)
 
+    def test_direct_invoice_recovery_retries_empty_provider_response(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+        )
+        calls = []
+
+        def probe(_session, _url, _artifact_prefix):
+            calls.append(len(calls) + 1)
+            if len(calls) < 3:
+                return [], [{"kind": "direct_probe_empty_response"}]
+            return [{"kind": "pdf", "path": "recovered.pdf"}], []
+
+        converter._probe_direct_invoice_artifact = probe
+
+        artifacts, _logs = converter._probe_direct_invoice_artifact_with_retry(
+            object(),
+            "https://provider.example/invoice",
+            "artifact",
+            retry_delays=(0, 0),
+        )
+
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual(artifacts[0]["path"], "recovered.pdf")
+
+    def test_direct_invoice_recovery_does_not_retry_policy_rejection(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+        )
+        calls = []
+
+        def probe(_session, _url, _artifact_prefix):
+            calls.append(len(calls) + 1)
+            return [], [{"kind": "URL_POLICY_REJECTED"}]
+
+        converter._probe_direct_invoice_artifact = probe
+
+        artifacts, _logs = converter._probe_direct_invoice_artifact_with_retry(
+            object(),
+            "https://provider.example/invoice",
+            "artifact",
+            retry_delays=(0, 0),
+        )
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(artifacts, [])
+
     def test_baiwang_preview_invoice_downloads_pdf_without_chromium(self):
         original_requests = pdf_converter.requests
         pdf_converter.requests = FakeRequests
