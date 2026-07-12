@@ -217,6 +217,45 @@ def test_semantic_identity_uses_first_field_value_not_later_same_row_reference(
     assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
 
 
+def test_semantic_identity_does_not_skip_split_or_overlong_current_number(
+    tmp_path: Path,
+):
+    truth = _truth(invoice_number="26110000000000000001")
+    split = _styled_pdf(
+        tmp_path / "split-current.pdf",
+        [
+            ((72, 72), "Invoice Number:", (0, 0, 0)),
+            ((180, 72), "9999", (0, 0, 0)),
+            ((215, 72), "9999", (0, 0, 0)),
+            ((250, 72), "9999", (0, 0, 0)),
+            ((285, 72), "9999", (0, 0, 0)),
+            ((320, 72), "9999", (0, 0, 0)),
+            ((360, 72), "Red", (0, 0, 0)),
+            ((400, 72), "26110000000000000001", (0, 0, 0)),
+            ((72, 110), "Invoice Date: 2026-06-10", (0, 0, 0)),
+            ((72, 140), "Total Amount: 100.00", (0, 0, 0)),
+            ((72, 170), "Seller: Standard Merchant", (0, 0, 0)),
+        ],
+    )
+    overlong = _pdf(
+        tmp_path / "overlong-current.pdf",
+        "Invoice Number: 261100000000000000019\n"
+        "Related: 26110000000000000001\nInvoice Date: 2026-06-10\n"
+        "Total Amount: 100.00\nSeller: Standard Merchant",
+    )
+
+    for path in (split, overlong):
+        verdict = verify_final_artifact(
+            truth,
+            path,
+            output_sha256=_sha(path),
+            source_chain_sha256s=["f" * 64],
+            allow_semantic_source_identity=True,
+        )
+        assert verdict.passed is False
+        assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
+
+
 def test_semantic_receipt_uses_current_order_not_referenced_order(tmp_path: Path):
     truth = _truth(
         invoice_number="778080227734",
@@ -230,6 +269,31 @@ def test_semantic_receipt_uses_current_order_not_referenced_order(tmp_path: Path
         "Original Receipt Order Number: MTFKT9WLF9\n"
         "Invoice Date: 2026-06-10\nTotal Amount: 100.00\n"
         "Seller: Cloud Merchant",
+    )
+
+    verdict = verify_final_artifact(
+        truth,
+        path,
+        output_sha256=_sha(path),
+        source_chain_sha256s=["f" * 64],
+        allow_semantic_source_identity=True,
+    )
+
+    assert verdict.passed is False
+    assert verdict.reason_code == "FINAL_FIELD_VALUE_MISMATCH"
+
+
+def test_semantic_receipt_does_not_skip_short_current_order(tmp_path: Path):
+    truth = _truth(
+        invoice_number="778080227734",
+        invoice_code="MTFKT9WLF9",
+        seller="Cloud Merchant",
+    )
+    path = _pdf(
+        tmp_path / "short-current-order.pdf",
+        "EMAIL_BODY_RECEIPT_CANONICAL\nDocument No: 778080227734\n"
+        "Order Number: WRONG MTFKT9WLF9\nInvoice Date: 2026-06-10\n"
+        "Total Amount: 100.00\nSeller: Cloud Merchant",
     )
 
     verdict = verify_final_artifact(

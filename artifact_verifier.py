@@ -208,9 +208,9 @@ def _first_visible_labeled_value(
     )
     def candidate_from(sequence: str) -> str:
         if expected_sequence.isdigit():
-            match = re.search(r"\d{8,20}", sequence)
+            match = re.match(r"\d+", sequence)
         else:
-            match = re.search(r"[0-9a-z]{6,30}", sequence)
+            match = re.match(r"[0-9a-z]+", sequence)
         return match.group(0) if match else ""
 
     for page in document:
@@ -259,7 +259,7 @@ def _first_visible_labeled_value(
             for label_hit in sorted(label_hits, key=lambda hit: hit.bbox[0]):
                 label_height = max(1.0, label_hit.bbox[3] - label_hit.bbox[1])
                 label_center = (label_hit.bbox[1] + label_hit.bbox[3]) / 2
-                candidates = []
+                eligible_words = []
                 for word in page_words:
                     word_height = max(1.0, float(word[3]) - float(word[1]))
                     word_center = (float(word[1]) + float(word[3])) / 2
@@ -268,11 +268,32 @@ def _first_visible_labeled_value(
                         and abs(word_center - label_center)
                         <= max(label_height, word_height) * 0.35
                     ):
-                        value = candidate_from(_sequence(word[4]))
-                        if value:
-                            candidates.append((float(word[0]), value))
-                if candidates:
-                    return min(candidates, key=lambda item: item[0])[1]
+                        eligible_words.append(word)
+                eligible_words.sort(key=lambda word: float(word[0]))
+                if not eligible_words:
+                    continue
+                first_gap = float(eligible_words[0][0]) - label_hit.bbox[2]
+                if first_gap > float(page.rect.width) * 0.25:
+                    continue
+                if expected_sequence.isdigit():
+                    chunks: list[str] = []
+                    for word in eligible_words:
+                        sequence = _sequence(word[4])
+                        if not sequence:
+                            continue
+                        if sequence.isdigit():
+                            chunks.append(sequence)
+                            continue
+                        if chunks:
+                            break
+                        return sequence
+                    if chunks:
+                        return "".join(chunks)
+                else:
+                    for word in eligible_words:
+                        sequence = _sequence(word[4])
+                        if sequence:
+                            return sequence
     return None
 
 
