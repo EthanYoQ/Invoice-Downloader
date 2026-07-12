@@ -1317,6 +1317,34 @@ class PDFConverter:
             logs.extend(direct_logs)
         return artifacts, logs
 
+    def _probe_nuonuo_scan_invoice_artifacts_with_retry(
+        self,
+        session,
+        url,
+        artifact_prefix,
+        max_attempts=3,
+        retry_delays=(2.0, 8.0),
+    ):
+        logs = []
+        attempt_count = max(1, int(max_attempts))
+        for attempt in range(attempt_count):
+            artifacts, attempt_logs = self._probe_nuonuo_scan_invoice_artifacts(
+                session, url, artifact_prefix
+            )
+            logs.extend(attempt_logs)
+            if artifacts:
+                return artifacts, logs
+            kinds = {str(item.get("kind") or "") for item in attempt_logs}
+            if "URL_POLICY_REJECTED" in kinds or "nuonuo_missing_param_list" in kinds:
+                break
+            if attempt + 1 >= attempt_count:
+                continue
+            delay_index = min(attempt, len(retry_delays) - 1)
+            delay = float(retry_delays[delay_index]) if retry_delays else 0.0
+            if delay > 0:
+                __import__("time").sleep(delay)
+        return [], logs
+
     def _capture_direct_invoice_response_artifact(self, response, artifact_prefix, artifact_index, source_url):
         self._validate_browser_response(response)
         headers = self._response_headers(response)
@@ -1797,10 +1825,12 @@ class PDFConverter:
                 seen_urls.add(url)
                 artifact_prefix = os.path.join(email_staging_path, f"direct_invoice_{index}")
                 if provider_family == "nuonuo_scan_invoice":
-                    nuonuo_artifacts, nuonuo_logs = self._probe_nuonuo_scan_invoice_artifacts(
-                        session,
-                        url,
-                        artifact_prefix,
+                    nuonuo_artifacts, nuonuo_logs = (
+                        self._probe_nuonuo_scan_invoice_artifacts_with_retry(
+                            session,
+                            url,
+                            artifact_prefix,
+                        )
                     )
                     artifacts.extend(nuonuo_artifacts)
                     network_logs.extend(nuonuo_logs)

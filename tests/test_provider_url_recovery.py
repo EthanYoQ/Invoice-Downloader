@@ -1720,6 +1720,31 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
         self.assertEqual(calls, [1])
         self.assertEqual(artifacts, [])
 
+    def test_nuonuo_recovery_retries_empty_provider_response(self):
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(),
+            url_policy=public_test_policy(),
+        )
+        calls = []
+
+        def probe(_session, _url, _artifact_prefix):
+            calls.append(len(calls) + 1)
+            if len(calls) < 3:
+                return [], [{"kind": "nuonuo_detail_api_unsuccessful"}]
+            return [{"kind": "pdf", "path": "nuonuo.pdf"}], []
+
+        converter._probe_nuonuo_scan_invoice_artifacts = probe
+
+        artifacts, _logs = converter._probe_nuonuo_scan_invoice_artifacts_with_retry(
+            object(),
+            "https://nnfp.jss.com.cn/short-link",
+            "artifact",
+            retry_delays=(0, 0),
+        )
+
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertEqual(artifacts[0]["path"], "nuonuo.pdf")
+
     def test_baiwang_preview_invoice_downloads_pdf_without_chromium(self):
         original_requests = pdf_converter.requests
         pdf_converter.requests = FakeRequests
