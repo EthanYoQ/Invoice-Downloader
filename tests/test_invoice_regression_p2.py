@@ -54,6 +54,43 @@ class InvoiceP2RegressionTests(unittest.TestCase):
         app_api.record_business_success(records, code, number, fields, file_name)
         return True
 
+    def test_train_ticket_embedded_departure_date_overrides_model_drift(self):
+        pdf = self.root / "train-ticket.pdf"
+        write_text_pdf(
+            pdf,
+            "\n".join(
+                [
+                    "发票号码:26119110010001302959",
+                    "2026年01月23日",
+                    "电子发票（铁路电子客票）",
+                    "14:42开",
+                    "票价:￥202.00",
+                    "北京南站",
+                    "济南西站",
+                    "开票日期:2026年02月10日",
+                ]
+            ),
+        )
+        model_result = {
+            "is_invoice": True,
+            "Date": "20260210",
+            "Departure_Date": "20260223",
+            "Departure_City": "北京南站",
+            "Destination_City": "济南西站",
+            "Purchaser": "辉瑞投资有限公司",
+            "Seller": "中国铁路",
+            "Amount": "202.00",
+            "InvoiceCode": "",
+            "InvoiceNumber": "26119110010001302959",
+            "Type": "火车票",
+            "category": "火车票",
+        }
+
+        result = self.extractor._reconcile_train_ticket_embedded_fields(model_result, str(pdf))
+
+        self.assertEqual(result["Departure_Date"], "20260123")
+        self.assertEqual(result["Date"], "20260123")
+
     def test_business_dedup_keeps_ride_invoice_and_itinerary_for_pairing(self):
         from archive_pairing import match_ride_pairs
 

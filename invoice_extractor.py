@@ -160,6 +160,43 @@ class InvoiceExtractor:
             logging.warning(f"Failed to read embedded PDF text for fast path: {exc}")
             return ""
 
+    def _reconcile_train_ticket_embedded_fields(self, payload, pdf_path):
+        """Prefer deterministic ticket fields over nondeterministic model dates."""
+        if not isinstance(payload, dict):
+            return payload
+        text = self._extract_embedded_pdf_text(pdf_path)
+        if "铁路电子客票" not in text or "发票号码" not in text:
+            return payload
+
+        date_matches = list(re.finditer(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", text))
+        travel_date_match = next(
+            (
+                match
+                for match in date_matches
+                if "开票日期" not in text[max(0, match.start() - 12):match.start()]
+            ),
+            None,
+        )
+        if travel_date_match is None:
+            return payload
+
+        result = copy.deepcopy(payload)
+        travel_date = (
+            f"{travel_date_match.group(1)}"
+            f"{int(travel_date_match.group(2)):02d}"
+            f"{int(travel_date_match.group(3)):02d}"
+        )
+        result.update(
+            {
+                "Date": travel_date,
+                "Departure_Date": travel_date,
+                "Seller": "中国铁路",
+                "Type": "火车票",
+                "category": "火车票",
+            }
+        )
+        return result
+
     @staticmethod
     def _parse_english_ordinal_date_to_yyyymmdd(value):
         text = re.sub(r"\b(\d{1,2})(st|nd|rd|th)\b", r"\1", str(value or ""), flags=re.IGNORECASE).strip()
@@ -1298,6 +1335,7 @@ class InvoiceExtractor:
             self.last_timing_trace = copy.deepcopy(timing_trace)
 
         def _adapt_result(result):
+            result = self._reconcile_train_ticket_embedded_fields(result, pdf_path)
             return self._adapt_extraction_result(result, pdf_path=pdf_path, document_context=document_context)
 
         # 兼容单张图片的传入情况
