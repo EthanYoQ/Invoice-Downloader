@@ -3,17 +3,28 @@ import re
 import json
 import base64
 import copy
+import hashlib
 import logging
 import shutil
+import threading
 import datetime as dt
 import unicodedata
+from dataclasses import dataclass
 import fitz  # PyMuPDF
-import requests
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 from document_types import MANUAL_REVIEW_FOLDER, get_document_type_names, normalize_document_type
 from email_body_receipts import CANONICAL_MARKER
+from glm_runtime import GlmRuntime
+from invoice_domain import DocumentIdentity, InvoiceRecord
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+@dataclass(frozen=True)
+class LocalExtractionProbe:
+    status: str
+    result: dict | None = None
+    reason_code: str = ""
+    engine: str = ""
 
 OCR_COMPAT_TRANSLATION = str.maketrans({
     "⻔": "门",
@@ -27,18 +38,48 @@ def normalize_ocr_compat_text(value):
     return unicodedata.normalize("NFKC", str(value or "")).translate(OCR_COMPAT_TRANSLATION)
 
 class InvoiceExtractor:
-    def __init__(self, api_key=None, output_dir="extracted_invoices"):
+    def __init__(
+        self,
+        api_key=None,
+        output_dir="extracted_invoices",
+        *,
+        glm_runtime=None,
+        glm_settings=None,
+        close_glm_runtime=True,
+    ):
         """
         初始化大模型提取器, 使用 GLM-4.5V 解决图文识别发票信息并结构化
         """
         self.api_key = api_key or ""
         self.model = "glm-4.5v"
+        self.glm_runtime = glm_runtime or GlmRuntime(self.api_key, settings=glm_settings)
+        self._close_glm_runtime = bool(close_glm_runtime)
+        self._close_lock = threading.Lock()
+        self._closed = False
         self.output_dir = os.path.abspath(output_dir)
         self.processed_records_file = os.path.join(self.output_dir, "processed_records.json")
         self.last_extraction_trace = {}
         self.last_route_trace = {}
         self.last_timing_trace = {}
         os.makedirs(self.output_dir, exist_ok=True)
+
+    def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        if self._close_glm_runtime:
+            close_runtime = getattr(self.glm_runtime, "close", None)
+            if callable(close_runtime):
+                close_runtime()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
 
     @staticmethod
     def _valid_types():
@@ -47,6 +88,24 @@ class InvoiceExtractor:
     @staticmethod
     def _normalize_type_from_text(value):
         return normalize_document_type(value)
+
+    @staticmethod
+    def _adapt_extraction_result(payload, pdf_path=None, document_context=None):
+        """Validate an extractor result through the typed boundary without changing its legacy shape."""
+        if payload is None:
+            return None
+        context = document_context or {}
+        source_locator = os.path.abspath(pdf_path) if pdf_path else ""
+        source_filename = str(context.get("original_filename") or (os.path.basename(pdf_path) if pdf_path else ""))
+        identity = DocumentIdentity(
+            document_id=str(context.get("document_id") or source_locator or source_filename or "extraction-result"),
+            source_message_uid=str(context.get("email_id") or context.get("source_email_id") or ""),
+            source_filename=source_filename,
+            source_locator=source_locator,
+            source_kind=str(context.get("source_kind") or "extraction"),
+            provider_group_key=str(context.get("provider_group_key") or ""),
+        )
+        return InvoiceRecord.from_legacy(payload, identity).to_legacy()
 
 
     def pdf_to_base64_image(self, pdf_path):
@@ -100,6 +159,43 @@ class InvoiceExtractor:
         except Exception as exc:
             logging.warning(f"Failed to read embedded PDF text for fast path: {exc}")
             return ""
+
+    def _reconcile_train_ticket_embedded_fields(self, payload, pdf_path):
+        """Prefer deterministic ticket fields over nondeterministic model dates."""
+        if not isinstance(payload, dict):
+            return payload
+        text = self._extract_embedded_pdf_text(pdf_path)
+        if "铁路电子客票" not in text or "发票号码" not in text:
+            return payload
+
+        date_matches = list(re.finditer(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", text))
+        travel_date_match = next(
+            (
+                match
+                for match in date_matches
+                if "开票日期" not in text[max(0, match.start() - 12):match.start()]
+            ),
+            None,
+        )
+        if travel_date_match is None:
+            return payload
+
+        result = copy.deepcopy(payload)
+        travel_date = (
+            f"{travel_date_match.group(1)}"
+            f"{int(travel_date_match.group(2)):02d}"
+            f"{int(travel_date_match.group(3)):02d}"
+        )
+        result.update(
+            {
+                "Date": travel_date,
+                "Departure_Date": travel_date,
+                "Seller": "中国铁路",
+                "Type": "火车票",
+                "category": "火车票",
+            }
+        )
+        return result
 
     @staticmethod
     def _parse_english_ordinal_date_to_yyyymmdd(value):
@@ -1131,11 +1227,92 @@ class InvoiceExtractor:
             return None
         return result
 
-    def extract_info_via_llm(self, base64_images, custom_rules="", pdf_path=None, document_context=None):
+    def probe_local_only(self, pdf_path, document_context=None):
+        """Run deterministic extraction paths without touching the GLM runtime."""
+        if not pdf_path or not os.path.exists(pdf_path):
+            return LocalExtractionProbe("invalid", reason_code="LOCAL_SOURCE_MISSING")
+        abs_pdf_path = os.path.abspath(pdf_path)
+        probes = (
+            (
+                "local_email_body_receipt_pdf",
+                "LOCAL_EMAIL_BODY_RECEIPT_PDF_FAST_PATH",
+                lambda: self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_foreign_invoice_pdf",
+                "LOCAL_FOREIGN_INVOICE_PDF_FAST_PATH",
+                lambda: self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_cits_gbt_pdf",
+                "LOCAL_CITS_GBT_PDF_FAST_PATH",
+                lambda: self._try_extract_cits_gbt_from_pdf_text(
+                    abs_pdf_path, document_context=document_context
+                ),
+            ),
+            (
+                "local_ride_itinerary_pdf",
+                "LOCAL_RIDE_ITINERARY_PDF_FAST_PATH",
+                lambda: self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_ihg_folio_pdf",
+                "LOCAL_IHG_FOLIO_PDF_FAST_PATH",
+                lambda: self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_standard_einvoice_pdf",
+                "LOCAL_STANDARD_EINVOICE_PDF_FAST_PATH",
+                lambda: self._try_extract_standard_china_einvoice_from_pdf_text_v2(
+                    abs_pdf_path
+                )
+                or self._try_extract_standard_china_einvoice_from_pdf_text(abs_pdf_path),
+            ),
+            (
+                "local_didi_pdf",
+                "LOCAL_DIDI_PDF_FAST_PATH",
+                lambda: self._try_extract_didi_invoice_from_pdf_text(abs_pdf_path),
+            ),
+        )
+        for engine, reason_code, probe in probes:
+            result = probe()
+            if result:
+                return LocalExtractionProbe(
+                    "resolved",
+                    result=self._adapt_extraction_result(
+                        result,
+                        pdf_path=abs_pdf_path,
+                        document_context=document_context,
+                    ),
+                    reason_code=reason_code,
+                    engine=engine,
+                )
+        if os.path.getsize(abs_pdf_path) < 1000:
+            return LocalExtractionProbe("invalid", reason_code="LOCAL_SOURCE_TOO_SMALL")
+        return LocalExtractionProbe("needs_remote", reason_code="LOCAL_PROBE_UNRESOLVED")
+
+    def extract_remote_only(
+        self, base64_images, custom_rules="", pdf_path=None, document_context=None
+    ):
+        return self.extract_info_via_llm(
+            base64_images,
+            custom_rules=custom_rules,
+            pdf_path=pdf_path,
+            document_context=document_context,
+            _allow_local_probe=False,
+        )
+
+    def extract_info_via_llm(
+        self,
+        base64_images,
+        custom_rules="",
+        pdf_path=None,
+        document_context=None,
+        *,
+        _allow_local_probe=True,
+    ):
         """3.2 Construct the Vision/OCR API payload and extract structured JSON using dual engines"""
         import time
-
-        class LayoutParsingError(Exception): pass
 
         extraction_trace = {
             "engine": None,
@@ -1156,6 +1333,10 @@ class InvoiceExtractor:
             timing_trace["total_ms"] = _elapsed_ms(run_started_at)
             extraction_trace["timing_ms"] = copy.deepcopy(timing_trace)
             self.last_timing_trace = copy.deepcopy(timing_trace)
+
+        def _adapt_result(result):
+            result = self._reconcile_train_ticket_embedded_fields(result, pdf_path)
+            return self._adapt_extraction_result(result, pdf_path=pdf_path, document_context=document_context)
 
         # 兼容单张图片的传入情况
         if isinstance(base64_images, str):
@@ -1205,7 +1386,12 @@ class InvoiceExtractor:
                 result = json.loads(content)
             except json.JSONDecodeError as e:
                 # 极端情况下若JSON严重破损，不直接崩溃，返回一个兜底包让 Manual_Check 接手
-                logging.warning(f"Failed to decode LLM JSON: {e}. Raw content: {content}")
+                response_fingerprint = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+                logging.warning(
+                    "Failed to decode LLM JSON: %s; response_fingerprint=%s",
+                    type(e).__name__,
+                    response_fingerprint,
+                )
                 return {"Type": "解析失败", "Date": "未知", "Seller": "无法读取商户", "Amount": "0.00"}
             
             # Type constraint validation heuristic fallback
@@ -1213,15 +1399,19 @@ class InvoiceExtractor:
                     
             # 强化兜底：不再直接因为缺少 Date/Seller/Amount 就报错抛弃，而是填入未知并放行。
             # 分类白名单拦截网或者 Manual_Check 机制会自然处理这些"半残"发票。
-            if "Date" not in result: result["Date"] = "未知日期"
-            if "Seller" not in result: result["Seller"] = "未知开票方"
-            if "Amount" not in result: result["Amount"] = "0.00"
-            if "Type" not in result: result["Type"] = "未知分类"
-            if "Purchaser" not in result: result["Purchaser"] = "暂无抬头"
+            if "Date" not in result:
+                result["Date"] = "未知日期"
+            if "Seller" not in result:
+                result["Seller"] = "未知开票方"
+            if "Amount" not in result:
+                result["Amount"] = "0.00"
+            if "Type" not in result:
+                result["Type"] = "未知分类"
+            if "Purchaser" not in result:
+                result["Purchaser"] = "暂无抬头"
             
             return result
 
-        @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(2), reraise=True, retry=retry_if_not_exception_type(LayoutParsingError))
         def _call_track_a_ocr(file_path):
             logging.info("Track A - Calling OCR (glm-ocr layout_parsing)...")
             print(">>> [进度] 开始 OCR 提取...")
@@ -1257,40 +1447,31 @@ class InvoiceExtractor:
                     mime_type = mime_map.get(ext, 'image/png')
                     file_data_uri = f"data:{mime_type};base64,{img_b64}"
                 
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-                
                 payload = {
-                    "model": "glm-ocr",
                     "file": file_data_uri
                 }
-                
-                res = requests.post("https://open.bigmodel.cn/api/paas/v4/layout_parsing", headers=headers, json=payload, timeout=90)
-                
-                if res.status_code in [400, 404]:
-                    print(f">>> [错误] layout_parsing 接口返回 {res.status_code}，详情: {res.text}。准备自动切换至 Track B (glm-4.5v)。")
-                    raise LayoutParsingError(f"HTTP {res.status_code}")
-                res.raise_for_status()
-            except LayoutParsingError:
-                raise
+
+                def _parse_ocr_response(body):
+                    text = body.get("md_results", "") if isinstance(body, dict) else ""
+                    if not text or len(text.strip()) < 5:
+                        raise ValueError("OCR text missing or too short")
+                    return text
+
+                text = self.glm_runtime.request(
+                    "ocr",
+                    payload,
+                    _parse_ocr_response,
+                    attempts=2,
+                    timeout_seconds=90,
+                )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
                 raise
-            
-            text = res.json().get('md_results', '')
-            if not text or len(text.strip()) < 5:
-                print(">>> [错误] 模型调用失败，原因: OCR 文本过空")
-                raise ValueError("OCR text missing or too short.")
             print(">>> [进度] OCR 提取完成")
             return text
 
-        @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3), reraise=True)
         def _call_track_a_llm(ocr_text):
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             payload = {
-                "model": "glm-4-flash",
                 "messages": [
                     {"role": "system", "content": prompt_text},
                     {"role": "user", "content": f"以下是提取出的票据文本，请提取信息并输出严格 JSON:\n\n{ocr_text}"}
@@ -1300,24 +1481,25 @@ class InvoiceExtractor:
             logging.info("Track A - Calling Text LLM (glm-4-flash)...")
             print(">>> [进度] 开始 LLM 分类及字段提取...")
             try:
-                res = requests.post("https://open.bigmodel.cn/api/paas/v4/chat/completions", headers=headers, json=payload, timeout=45)
-                res.raise_for_status()
+                result = self.glm_runtime.request(
+                    "text",
+                    payload,
+                    lambda body: _parse_json_result(body["choices"][0]["message"]["content"]),
+                    attempts=3,
+                    timeout_seconds=45,
+                )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
                 raise
-            content = res.json()["choices"][0]["message"]["content"]
             print(">>> [进度] LLM 分类完成")
-            return _parse_json_result(content)
+            return result
 
-        @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3), reraise=True)
         def _call_track_b_vision(b64_list):
             import threading
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             messages_content = [{"type": "text", "text": prompt_text}]
             for b64 in b64_list:
                 messages_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
             payload = {
-                "model": "glm-4.5v",
                 "messages": [{"role": "user", "content": messages_content}],
                 "temperature": 0.1
             }
@@ -1334,8 +1516,13 @@ class InvoiceExtractor:
             t.start()
             
             try:
-                res = requests.post("https://open.bigmodel.cn/api/paas/v4/chat/completions", headers=headers, json=payload, timeout=60)
-                res.raise_for_status()
+                result = self.glm_runtime.request(
+                    "vision_quality",
+                    payload,
+                    lambda body: _parse_json_result(body["choices"][0]["message"]["content"]),
+                    attempts=3,
+                    timeout_seconds=60,
+                )
             except Exception as e:
                 print(f">>> [错误] 模型调用失败，原因: {e}")
                 raise
@@ -1343,9 +1530,8 @@ class InvoiceExtractor:
                 stop_event.set()
                 t.join(timeout=1.0)
                 
-            content = res.json()["choices"][0]["message"]["content"]
             print(">>> [进度] 视觉提取完成")
-            return _parse_json_result(content)
+            return result
 
         def _print_success_summary(res_dict):
             if res_dict:
@@ -1368,8 +1554,13 @@ class InvoiceExtractor:
             # 强制日志输出物理校验信息
             print(f">>> [物理校验] 绝对路径: {abs_pdf_path} | 真实字节: {actual_size}")
 
-            email_body_receipt_result = self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path)
+            email_body_receipt_result = (
+                self._try_extract_email_body_receipt_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if email_body_receipt_result:
+                email_body_receipt_result = _adapt_result(email_body_receipt_result)
                 extraction_trace["engine"] = "local_email_body_receipt_pdf"
                 extraction_trace["reason_code"] = "LOCAL_EMAIL_BODY_RECEIPT_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(email_body_receipt_result)
@@ -1382,8 +1573,13 @@ class InvoiceExtractor:
             if actual_size < 1000:
                 raise ValueError(f"文件大小异常: 仅 {actual_size} bytes，拒绝处理。")
 
-            foreign_invoice_result = self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path)
+            foreign_invoice_result = (
+                self._try_extract_foreign_invoice_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if foreign_invoice_result:
+                foreign_invoice_result = _adapt_result(foreign_invoice_result)
                 extraction_trace["engine"] = "local_foreign_invoice_pdf"
                 extraction_trace["reason_code"] = "LOCAL_FOREIGN_INVOICE_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(foreign_invoice_result)
@@ -1393,8 +1589,15 @@ class InvoiceExtractor:
                 _print_success_summary(foreign_invoice_result)
                 return foreign_invoice_result
 
-            cits_gbt_result = self._try_extract_cits_gbt_from_pdf_text(abs_pdf_path, document_context=document_context)
+            cits_gbt_result = (
+                self._try_extract_cits_gbt_from_pdf_text(
+                    abs_pdf_path, document_context=document_context
+                )
+                if _allow_local_probe
+                else None
+            )
             if cits_gbt_result:
+                cits_gbt_result = _adapt_result(cits_gbt_result)
                 extraction_trace["engine"] = "local_cits_gbt_pdf"
                 extraction_trace["reason_code"] = "LOCAL_CITS_GBT_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(cits_gbt_result)
@@ -1404,8 +1607,13 @@ class InvoiceExtractor:
                 _print_success_summary(cits_gbt_result)
                 return cits_gbt_result
 
-            ride_itinerary_result = self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path)
+            ride_itinerary_result = (
+                self._try_extract_ride_itinerary_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if ride_itinerary_result:
+                ride_itinerary_result = _adapt_result(ride_itinerary_result)
                 extraction_trace["engine"] = "local_ride_itinerary_pdf"
                 extraction_trace["reason_code"] = "LOCAL_RIDE_ITINERARY_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(ride_itinerary_result)
@@ -1415,8 +1623,13 @@ class InvoiceExtractor:
                 _print_success_summary(ride_itinerary_result)
                 return ride_itinerary_result
 
-            ihg_folio_result = self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path)
+            ihg_folio_result = (
+                self._try_extract_ihg_folio_from_pdf_text(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if ihg_folio_result:
+                ihg_folio_result = _adapt_result(ihg_folio_result)
                 extraction_trace["engine"] = "local_ihg_folio_pdf"
                 extraction_trace["reason_code"] = "LOCAL_IHG_FOLIO_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(ihg_folio_result)
@@ -1426,10 +1639,15 @@ class InvoiceExtractor:
                 _print_success_summary(ihg_folio_result)
                 return ihg_folio_result
 
-            local_standard_result = self._try_extract_standard_china_einvoice_from_pdf_text_v2(abs_pdf_path)
-            if not local_standard_result:
+            local_standard_result = (
+                self._try_extract_standard_china_einvoice_from_pdf_text_v2(abs_pdf_path)
+                if _allow_local_probe
+                else None
+            )
+            if not local_standard_result and _allow_local_probe:
                 local_standard_result = self._try_extract_standard_china_einvoice_from_pdf_text(abs_pdf_path)
             if local_standard_result:
+                local_standard_result = _adapt_result(local_standard_result)
                 extraction_trace["engine"] = "local_standard_einvoice_pdf"
                 extraction_trace["reason_code"] = "LOCAL_STANDARD_EINVOICE_PDF_FAST_PATH"
                 extraction_trace["result"] = copy.deepcopy(local_standard_result)
@@ -1450,6 +1668,7 @@ class InvoiceExtractor:
                 track_a_result = _call_track_a_llm(full_ocr_text)
             finally:
                 timing_trace["track_a_llm_ms"] = _elapsed_ms(track_a_llm_started_at)
+            track_a_result = _adapt_result(track_a_result)
             track_a_success = True
             extraction_trace["track_a"] = {"status": "success", "reason_code": None, "message": None}
         except Exception as e:
@@ -1476,6 +1695,7 @@ class InvoiceExtractor:
                 track_b_result = _call_track_b_vision(base64_images)
             finally:
                 timing_trace["track_b_vision_ms"] = _elapsed_ms(track_b_started_at)
+            track_b_result = _adapt_result(track_b_result)
             extraction_trace["track_b"] = {"status": "success", "reason_code": None, "message": None}
             extraction_trace["engine"] = "track_b"
             extraction_trace["reason_code"] = "TRACK_A_FAILED_TRACK_B_FALLBACK"
@@ -1492,8 +1712,13 @@ class InvoiceExtractor:
                 "reason_code": "TRACK_B_FAILED",
                 "message": str(e),
             }
-            local_fallback_result = self._try_extract_didi_invoice_from_pdf_text(pdf_path)
+            local_fallback_result = (
+                self._try_extract_didi_invoice_from_pdf_text(pdf_path)
+                if _allow_local_probe
+                else None
+            )
             if local_fallback_result:
+                local_fallback_result = _adapt_result(local_fallback_result)
                 extraction_trace["engine"] = "local_didi_pdf_fallback"
                 extraction_trace["reason_code"] = "TRACK_A_TRACK_B_FAILED_LOCAL_DIDI_PDF_FALLBACK"
                 extraction_trace["result"] = copy.deepcopy(local_fallback_result)

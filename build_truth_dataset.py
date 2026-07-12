@@ -2,10 +2,11 @@ import argparse
 import csv
 import datetime as dt
 import email
+import email.header
 import email.utils
 import hashlib
+import html
 import json
-import os
 import re
 import shutil
 import sys
@@ -14,6 +15,9 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+import requests
+from bs4 import BeautifulSoup
 
 
 DOC_EXTS = {".pdf", ".xml", ".ofd", ".jpg", ".jpeg", ".png"}
@@ -64,30 +68,99 @@ ROOT = repo_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bs4 import BeautifulSoup
-import requests
-from email_fetcher import (  # noqa: E402
-    EmailFetcher,
-    KEYWORDS_BODY,
-    KEYWORDS_SUBJECT,
-    TIER1_DOMAINS,
-    _build_link_candidate_decision,
-    _build_provider_group_key,
-    _collect_provider_group_urls,
-    _merge_provider_expected_fields,
-    _should_drop_baiwang_wrapper_url,
-    decode_str,
-    normalize_invoice_link_candidate,
-    prioritize_invoice_links,
+
+TIER1_DOMAINS = (
+    "@12306.cn", "@rails.com.cn", "@didichuxing.com", "@gaode.com", "@marriott.com",
+    "@hworld.com", "@cits.com", "@meituan.com", "@carlsonwagonlit.com", "@mycwt.com", "@citsgbt.com",
 )
-from invoice_extractor import InvoiceExtractor, normalize_ocr_compat_text  # noqa: E402
-from pdf_converter import PDFConverter  # noqa: E402
-from provider_baiwang import parse_baiwang_xml_fields  # noqa: E402
-from provider_direct_invoice import (  # noqa: E402
-    DIRECT_INVOICE_FAMILIES,
-    parse_direct_invoice_xml_fields,
+KEYWORDS_SUBJECT = ("发票", "行程单", "账单", "receipt", "invoice")
+KEYWORDS_BODY = ("发票", "报销", "行程", "差旅")
+DIRECT_INVOICE_FAMILIES = (
+    "chinatax_direct_invoice", "bwjf_signed_invoice", "fpyun_direct_invoice",
+    "nuonuo_scan_invoice", "pdd_direct_invoice", "jdcloud_direct_invoice", "kpbyd_direct_invoice",
 )
-from user_settings import UserSettingsStore  # noqa: E402
+OCR_COMPAT_TRANSLATION = str.maketrans({"⻔": "门", "⻝": "食", "⻨": "麦", "⻆": "角"})
+
+
+class TruthBuildError(ValueError):
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def decode_str(value) -> str:
+    try:
+        return str(email.header.make_header(email.header.decode_header(str(value or ""))))
+    except (LookupError, UnicodeError):
+        return str(value or "")
+
+
+def normalize_ocr_compat_text(value) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).translate(OCR_COMPAT_TRANSLATION)
+
+
+def normalize_invoice_link_candidate(value: str) -> str:
+    candidate = html.unescape(str(value or "")).strip().strip("<>\"'")
+    if not candidate.lower().startswith(("http://", "https://")):
+        return ""
+    return candidate
+
+
+def prioritize_invoice_links(links):
+    hints = ("发票", "下载", "pdf", "ofd", "xml", "invoice", "fapiao", "baiwang", "nuonuo", "chinatax")
+    return sorted(links, key=lambda item: (not any(token in f"{item[0]} {item[1]}".lower() for token in hints), item[0]))
+
+
+def _provider_family(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    full = url.lower()
+    for token, family in (
+        ("baiwang", "baiwang"), ("bwfp", "baiwang"), ("chinatax", "chinatax_direct_invoice"),
+        ("bwjf", "bwjf_signed_invoice"), ("fpyun", "fpyun_direct_invoice"),
+        ("nuonuo", "nuonuo_scan_invoice"), ("pdd-fapiao", "pdd_direct_invoice"),
+        ("jdcloud", "jdcloud_direct_invoice"), ("kpbyd", "kpbyd_direct_invoice"),
+    ):
+        if token in host or token in full:
+            return family
+    return ""
+
+
+def _build_link_candidate_decision(url, anchor_text, *, tier, sender_addr, subject, body_text):
+    normalized = normalize_invoice_link_candidate(url)
+    if not normalized:
+        return {"candidate_action": "drop", "reason_code": "TRUTH_INVALID_URL"}
+    provider = _provider_family(normalized)
+    combined = f"{normalized} {anchor_text} {subject} {body_text}".lower()
+    hinted = any(token in combined for token in ("发票", "账单", "行程", "invoice", "receipt", "pdf", "ofd", "xml"))
+    return {
+        "candidate_action": "main_chain" if provider or hinted or tier <= 3 else "audit_only",
+        "reason_code": "TRUTH_OWNED_LINK_EVIDENCE",
+        "source_url": normalized,
+        "provider_family": provider,
+        "provider_expected_fields": {},
+        "link_group_key": normalized,
+    }
+
+
+def _should_drop_baiwang_wrapper_url(*_args, **_kwargs):
+    return False
+
+
+def _build_provider_group_key(provider_family, *, email_id, candidate_urls, expected_fields):
+    return f"{provider_family}:{email_id}"
+
+
+def _collect_provider_group_urls(_provider_family, urls):
+    return list(dict.fromkeys(url for url in urls if url))
+
+
+def _merge_provider_expected_fields(left, right):
+    merged = dict(left or {})
+    for key, value in (right or {}).items():
+        if value not in (None, ""):
+            merged[key] = value
+    return merged
 
 
 try:
@@ -179,17 +252,41 @@ def parse_mail_date(message) -> str:
         return ""
 
 
-def fetch_internaldate_local(fetcher: EmailFetcher, email_id) -> str:
+def _truth_uid(value) -> bytes | None:
+    raw = value.decode("ascii", errors="ignore") if isinstance(value, bytes) else str(value or "")
+    raw = raw.strip()
+    return raw.encode("ascii") if raw.isdigit() else None
+
+
+def fetch_internaldate_local(fetcher, email_id) -> str:
+    requested_uid = _truth_uid(email_id)
+    if requested_uid is None:
+        return ""
     try:
-        status, data = fetcher.mail.fetch(email_id, "(INTERNALDATE)")
+        status, data = fetcher.mail.uid(
+            "FETCH", requested_uid, "(UID INTERNALDATE)"
+        )
     except Exception:
         return ""
-    if status != "OK" or not data:
+    status_text = status.decode("ascii", errors="ignore") if isinstance(status, bytes) else str(status or "")
+    if status_text.upper() != "OK" or not data:
         return ""
     for part in data:
-        parsed = EmailFetcher._extract_fetch_internaldate(part)
-        if parsed:
-            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        metadata = part[0] if isinstance(part, tuple) and part else part
+        if not isinstance(metadata, (bytes, bytearray)):
+            continue
+        metadata = bytes(metadata)
+        uid_match = re.search(rb"\bUID\s+(\d+)\b", metadata, flags=re.IGNORECASE)
+        if not uid_match or uid_match.group(1) != requested_uid:
+            continue
+        date_match = re.search(rb'INTERNALDATE\s+"([^"]+)"', metadata, flags=re.IGNORECASE)
+        if not date_match:
+            continue
+        try:
+            parsed = email.utils.parsedate_to_datetime(date_match.group(1).decode("ascii"))
+            return parsed.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            continue
     return ""
 
 
@@ -348,7 +445,16 @@ def compute_tier(sender: str, subject: str, body_text: str) -> int:
 
 
 def collect_raw_evidence(args, source_root: Path):
+    from email_fetcher import EmailFetcher
+    from pdf_converter import PDFConverter
+    from user_settings import UserSettingsStore
+
     settings = UserSettingsStore().load()
+    args.target_company = str(getattr(args, "target_company", "") or settings.get("company") or "").strip()
+    settings_email = str(settings.get("email") or "").strip()
+    args.account_domain = str(getattr(args, "account_domain", "") or (
+        settings_email.rsplit("@", 1)[1] if "@" in settings_email else ""
+    )).lower()
     email_address = settings["email"]
     auth_code = settings["auth_code"]
     fetcher = EmailFetcher(
@@ -567,7 +673,6 @@ def collect_raw_evidence(args, source_root: Path):
                         "subject": subject,
                         "sender": sender,
                         "source_url": candidate_info["source_url"],
-                        "source_url": candidate_info["source_url"],
                         "status": "failed",
                         "reason_code": "TRUTH_DIRECT_DOWNLOAD_EXCEPTION",
                         "message": str(exc),
@@ -750,28 +855,29 @@ def parse_generic_xml(path: Path) -> dict:
         for el in root.iter():
             tag = el.tag.split("}", 1)[-1]
             text = (el.text or "").strip()
-            if text and tag not in values:
-                values[tag] = text
+            if text and tag.lower() not in values:
+                values[tag.lower()] = text
     except Exception:
         values = {}
-    fields = parse_direct_invoice_xml_fields(payload) or parse_baiwang_xml_fields(payload) or {}
-    if fields:
-        if values.get("ItemName") and not fields.get("item_name"):
-            fields["item_name"] = values.get("ItemName", "")
-        return fields
+
+    def first(*names):
+        accepted = {name.lower() for name in names}
+        return next((value for name, value in values.items() if name in accepted and value), "")
+
+    invoice_number = first("fphm", "invoice_no", "invoiceno", "invoice_number", "invoicenumber", "eiid")
+    if not invoice_number:
+        number_match = re.search(rb"(?<!\d)(\d{20})(?!\d)", payload)
+        invoice_number = number_match.group(1).decode("ascii") if number_match else ""
     return {
-        "invoice_number": values.get("InvoiceNumber") or values.get("EIid") or "",
-        "invoice_code": values.get("InvoiceCode") or "",
-        "invoice_date": norm_date(values.get("IssueTime") or values.get("RequestTime") or ""),
-        "seller": values.get("SellerName", ""),
-        "purchaser": values.get("BuyerName", ""),
+        "invoice_number": invoice_number,
+        "invoice_code": first("fpdm", "invoice_code", "invoicecode"),
+        "invoice_date": norm_date(first("kprq", "invoice_date", "issuedate", "issue_date", "issuetime", "requesttime")),
+        "seller": first("xfmc", "sellername", "seller_name", "seller"),
+        "purchaser": first("gmfmc", "buyername", "buyer_name", "purchaser"),
         "amount": norm_amount(
-            values.get("TotalTax-includedAmount")
-            or values.get("TotaltaxIncludedAmount")
-            or values.get("TotalAmount")
-            or ""
+            first("jshj", "amount", "total_amount", "totaltax-includedamount", "totaltaxincludedamount", "totalamount", "价税合计")
         ),
-        "item_name": values.get("ItemName", ""),
+        "item_name": first("itemname"),
     }
 
 
@@ -1108,6 +1214,49 @@ def parse_foreign_invoice_pdf(path: Path) -> dict:
     return {}
 
 
+def extract_cits_total_amount(text: str) -> str:
+    amount_token = r"([0-9]{1,3}(?:,[0-9]{3})*\.\d{2}|[0-9]+\.\d{2})"
+    patterns = (
+        rf"Total:\s*CNY\s*{amount_token}",
+        rf"Amount Received:\s*CNY\s*{amount_token}",
+        rf"Grand Total:\s*(?:.|\n){{0,120}}?{amount_token}",
+        rf"{amount_token}\s*CNY\s*(?:[^\n\r]{{0,100}})?\s*\n\s*总价[:：]?",
+        rf"总价[:：]?\s*\n?{amount_token}\s*CNY",
+        rf"总价[:：]?\s*CNY\s*{amount_token}",
+        rf"机票总价[:：]?\s*CNY\s*{amount_token}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return norm_amount(match.group(1).replace(",", ""))
+    fallback = re.sub(r"Tax Detail:[^\n\r]+", "", text, flags=re.IGNORECASE)
+    match = re.search(rf"CNY\s*{amount_token}", fallback, flags=re.IGNORECASE)
+    return norm_amount(match.group(1).replace(",", "")) if match else ""
+
+
+def looks_like_cits_hotel_itinerary(text: str, context_text: str = "") -> bool:
+    combined = f"{text}\n{context_text}"
+    return (
+        "酒店" in combined
+        and ("行程单" in combined or "国内行程" in text)
+        and any(marker in text for marker in ("入住日期", "离店日期", "预订详情", "价格及付款信息", "支付方式"))
+    )
+
+
+def extract_cits_hotel_name(text: str) -> str:
+    match = re.search(r"([^\n\r]{2,80}?酒店(?:（[^）]+）)?)\s*\n\s*电话[:：]", text)
+    if match:
+        value = match.group(1)
+    else:
+        value = next((
+            line.strip() for line in text.splitlines()
+            if "酒店" in line and not any(token in line for token in ("如酒店", "酒店将", "下榻", "酒店是", "酒店前台"))
+        ), "")
+    value = re.sub(r"（[^）]*协议[^）]*）", "", value)
+    value = re.sub(r"\([^)]*协议[^)]*\)", "", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip(" ：:")
+
+
 def parse_cits_pdf(path: Path) -> dict:
     text = read_pdf_text(path)
     subjectish = f"{path.name}\n{path.parent.name}"
@@ -1123,11 +1272,11 @@ def parse_cits_pdf(path: Path) -> dict:
     if date_match:
         dd, mm, yy = date_match.group(1).split("/")
         invoice_date = f"20{yy}-{mm}-{dd}"
-    amount_value = InvoiceExtractor._extract_cits_total_amount(text)
+    amount_value = extract_cits_total_amount(text)
     purchaser = "辉瑞投资有限公司" if "辉瑞投资有限公司" in text or "PFIZER" in text.upper() else "个人"
     hotel_itinerary = (
         not invoice_number
-        and InvoiceExtractor._looks_like_cits_hotel_itinerary(text, subjectish)
+        and looks_like_cits_hotel_itinerary(text, subjectish)
     )
     is_air_invoice = any(token in text for token in ["机场", "首段行程", "Flight", "APT", "航班号", "航空公司"])
     is_travel_service_fee = (
@@ -1141,7 +1290,7 @@ def parse_cits_pdf(path: Path) -> dict:
     if not invoice_date:
         invoice_date_match = re.search(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text)
         invoice_date = norm_date(invoice_date_match.group(0) if invoice_date_match else invoice_date)
-    seller = InvoiceExtractor._extract_cits_hotel_name(text) if hotel_itinerary else "CITS GBT"
+    seller = extract_cits_hotel_name(text) if hotel_itinerary else "CITS GBT"
     return {
         "invoice_number": invoice_number,
         "invoice_code": "",
@@ -1383,6 +1532,9 @@ def fetch_email_text_evidence(email_ids, source_root: Path, mailbox: str) -> dic
     email_ids = sorted({str(item) for item in email_ids if str(item)})
     if not email_ids:
         return {}
+    from email_fetcher import EmailFetcher
+    from user_settings import UserSettingsStore
+
     settings = UserSettingsStore().load()
     fetcher = EmailFetcher(
         settings["email"],
@@ -1394,7 +1546,7 @@ def fetch_email_text_evidence(email_ids, source_root: Path, mailbox: str) -> dic
     if not fetcher.connect():
         return evidence
     try:
-        fetcher.mail.select(mailbox)
+        fetcher._mailbox_scanner().select_mailbox(mailbox)
         for email_id in email_ids:
             raw_bytes = b""
             for mode_label, fetch_command in (("RFC822", "(RFC822)"), ("BODY.PEEK[]", "(BODY.PEEK[])")):
@@ -1444,7 +1596,284 @@ def fetch_email_text_evidence(email_ids, source_root: Path, mailbox: str) -> dic
     return evidence
 
 
-def parse_pdf_local(extractor: InvoiceExtractor, path: Path, target_company: str) -> tuple[dict, str]:
+def load_saved_email_text_evidence(email_ids, source_root: Path) -> dict:
+    evidence_root = source_root / "email_evidence"
+    result = {}
+    for email_id in sorted({str(item) for item in email_ids if str(item)}):
+        candidates = list(evidence_root.glob(f"{email_id}_*")) if evidence_root.exists() else []
+        files = []
+        for candidate in candidates:
+            files.extend(candidate.rglob("*") if candidate.is_dir() else [candidate])
+        files = [path for path in files if path.is_file()]
+        body_path = next((path for path in files if path.name == f"{email_id}_body.txt"), None)
+        links_path = next((path for path in files if path.name == f"{email_id}_links.json"), None)
+        raw_path = next((path for path in files if path.name == f"{email_id}.eml"), None)
+        body_text = body_path.read_text(encoding="utf-8", errors="replace") if body_path else ""
+        links = []
+        if links_path:
+            try:
+                loaded_links = json.loads(links_path.read_text(encoding="utf-8"))
+                links = loaded_links if isinstance(loaded_links, list) else []
+            except (OSError, json.JSONDecodeError):
+                links = []
+        subject = ""
+        if raw_path:
+            try:
+                message = email.message_from_bytes(raw_path.read_bytes())
+                subject = decode_str(message.get("Subject", ""))
+                if not body_text:
+                    body_text, discovered_links = extract_email_body_and_links(message)
+                    if not links:
+                        links = [{"url": url, "text": text} for url, text in discovered_links]
+            except OSError:
+                pass
+        extra_files = [path for path in files if path not in {body_path, links_path, raw_path}]
+        extra_chunks = []
+        for path in extra_files:
+            try:
+                extra_chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+        if body_text or links or raw_path or extra_chunks:
+            result[email_id] = {
+                "raw_path": str(raw_path or ""),
+                "text_path": str(body_path or ""),
+                "links_path": str(links_path or ""),
+                "extra_paths": [str(path) for path in extra_files],
+                "extra_text": "\n".join(extra_chunks),
+                "body_text": body_text,
+                "links": links,
+                "subject": subject,
+            }
+    return result
+
+
+def resolve_email_text_evidence(email_ids, source_root: Path, mailbox: str, *, allow_network: bool) -> dict:
+    saved = load_saved_email_text_evidence(email_ids, source_root)
+    if not allow_network:
+        return saved
+    missing_ids = [str(item) for item in email_ids if str(item) not in saved]
+    fetched = fetch_email_text_evidence(missing_ids, source_root, mailbox)
+    return {**saved, **fetched}
+
+
+def _clean_party_line(line: str) -> str:
+    value = re.sub(r"\s+", "", normalize_ocr_compat_text(line)).strip()
+    return re.sub(r"^(名称|名\s*称)[:：]?", "", value).strip()
+
+
+def _tax_id(line: str) -> str:
+    match = re.search(r"([0-9A-Z]{15,24})$", re.sub(r"\s+", "", str(line or "")))
+    return match.group(1) if match else ""
+
+
+def _company_line(line: str) -> bool:
+    value = _clean_party_line(line)
+    if not value or re.fullmatch(r"[0-9A-Z]{10,24}", value):
+        return False
+    if re.search(r"\d{4}年\d{1,2}月\d{1,2}日|\d+\.\d{2}|¥|￥", value):
+        return False
+    if any(token in value for token in ("名称", "发票", "开票", "购买方", "销售方", "合计", "价税", "规格型号", "项目名称", "税率", "税额", "备注")):
+        return False
+    company_tokens = (
+        "公司", "有限公司", "酒店", "分公司", "辉瑞", "银行", "集团", "中心", "商行", "个体工商户",
+        "火锅店", "饭店", "餐厅", "饮品", "烧烤", "串串", "食府", "涮肉", "小吃", "面馆", "餐馆",
+        "咖啡", "海鲜", "肯德基", "麦当劳", "金拱", "盒马",
+    )
+    return bool(re.search(r"[\u4e00-\u9fff]", value)) and any(token in value for token in company_tokens)
+
+
+def _standard_invoice_amount(text: str, compact_lines: list[str]) -> str:
+    marker_index = text.find("（小写）")
+    if marker_index >= 0:
+        window = text[marker_index + 4:marker_index + 164]
+        values = re.findall(r"[¥￥]?\s*([0-9]+\.\d{2})\s*[¥￥]?", window)
+        if values:
+            return _first_money(values)
+    values = re.findall(r"[¥￥]\s*([0-9]+\.\d{2})", text)
+    for index, line in enumerate(compact_lines):
+        if line in {"¥", "￥"} and index and re.fullmatch(r"[0-9]+\.\d{2}", compact_lines[index - 1]):
+            values.append(compact_lines[index - 1])
+    return _first_money(values or re.findall(r"\b([0-9]+\.\d{2})\b", text))
+
+
+def _wrapped_standard_invoice_parties(compact_lines: list[str], date_index: int):
+    if date_index < 0:
+        return None
+    names = []
+    for line in compact_lines[date_index + 1:date_index + 24]:
+        if _tax_id(line):
+            continue
+        cleaned = _clean_party_line(line)
+        if _company_line(cleaned):
+            names.append(cleaned)
+    return (names[0], names[1]) if len(names) >= 2 else None
+
+
+def _parallel_standard_invoice_parties(compact_lines: list[str]):
+    tax_indexes = [index for index, line in enumerate(compact_lines) if _tax_id(line)]
+    for first_tax, second_tax in zip(tax_indexes, tax_indexes[1:]):
+        if second_tax - first_tax > 3:
+            continue
+        candidates = [
+            (index, _clean_party_line(compact_lines[index]))
+            for index in range(max(0, first_tax - 12), first_tax)
+            if _company_line(_clean_party_line(compact_lines[index]))
+        ]
+        if len(candidates) < 2:
+            continue
+        first_company, second_company = candidates[-2], candidates[-1]
+        label_text = "".join(compact_lines[max(0, first_company[0] - 32):first_company[0]])
+        seller_pos = label_text.find("销售方信息")
+        buyer_pos = label_text.find("购买方信息")
+        if seller_pos >= 0 and buyer_pos >= 0:
+            return (
+                (second_company[1], first_company[1])
+                if seller_pos < buyer_pos
+                else (first_company[1], second_company[1])
+            )
+    return None
+
+
+def parse_standard_einvoice_pdf(path: Path) -> dict:
+    text = read_pdf_text(path).replace("\xa0", " ")
+    if not all(marker in text for marker in ("电子发票", "发票号码", "开票日期")):
+        return {}
+    compact_lines = [re.sub(r"\s+", "", line or "") for line in text.splitlines()]
+    compact_lines = [line for line in compact_lines if line]
+    number_match = re.search(r"发票号码[:：]?\s*([0-9]{8,})", text)
+    number_candidates = [line for line in compact_lines if re.fullmatch(r"[0-9]{8,}", line)]
+    invoice_number = number_match.group(1) if number_match else next((line for line in number_candidates if len(line) >= 20), "")
+    if not invoice_number and number_candidates:
+        invoice_number = number_candidates[0]
+    date_match = None
+    date_index = -1
+    for index, line in enumerate(compact_lines):
+        match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", line)
+        if match:
+            date_match, date_index = match, index
+            break
+    amount = _standard_invoice_amount(text, compact_lines)
+    if not invoice_number or not date_match or not amount:
+        return {}
+
+    parties = _wrapped_standard_invoice_parties(compact_lines, date_index) or _parallel_standard_invoice_parties(compact_lines)
+    if not parties:
+        pairs = []
+        seen = set()
+        pattern = re.compile(r"([A-Za-z0-9\u4e00-\u9fff（）()·\-]{2,})\s*\n\s*([0-9A-Z]{10,24})")
+        for match in pattern.finditer("\n".join(compact_lines[date_index + 1:])):
+            name = _clean_party_line(match.group(1))
+            if not name or name in seen or not _company_line(name):
+                continue
+            seen.add(name)
+            pairs.append(name)
+            if len(pairs) == 2:
+                break
+        parties = tuple(pairs) if len(pairs) == 2 else None
+    if not parties or parties[0] == parties[1]:
+        return {}
+
+    compact = re.sub(r"\s+", "", text)
+    invoice_type = "其他"
+    for candidate, markers in (
+        ("餐饮", ("*餐饮服务*", "餐费", "餐饮服务")),
+        ("住宿发票", ("*住宿服务*", "住宿服务", "房费", "住宿费")),
+        ("打车", ("*运输服务*", "客运服务费", "旅客运输服务", "滴滴")),
+        ("过路费", ("通行费", "过路费")),
+    ):
+        if any(marker in compact for marker in markers):
+            invoice_type = candidate
+            break
+    code_match = re.search(r"发票代码[:：]?\s*([0-9]{8,})", text)
+    return {
+        "invoice_number": invoice_number,
+        "invoice_code": code_match.group(1) if code_match else "",
+        "invoice_date": f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}",
+        "seller": parties[1],
+        "purchaser": parties[0],
+        "amount": amount,
+        "truth_type": invoice_type,
+        "category": invoice_type,
+    }
+
+
+def parse_didi_invoice_pdf(path: Path) -> dict:
+    text = read_pdf_text(path).replace("\xa0", " ")
+    markers = ("电子发票（普通发票）", "旅客运输服务", "发票号码", "开票日期", "价税合计", "滴滴")
+    if any(marker not in text for marker in markers):
+        return {}
+    number = re.search(r"发票号码[:：]\s*([0-9]{8,})", text)
+    date_match = re.search(r"开票日期[:：]\s*(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+    amount = re.search(r"（小写）\s*¥?\s*([0-9]+\.\d{2})", text)
+    names = re.findall(r"名称[:：]\s*([^\n]+)", text)
+    if not number or not date_match or not amount or len(names) < 2 or "滴滴" not in names[1]:
+        return {}
+    return {
+        "invoice_number": number.group(1),
+        "invoice_code": "",
+        "invoice_date": f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}",
+        "seller": names[1].strip(),
+        "purchaser": names[0].strip(),
+        "amount": norm_amount(amount.group(1)),
+        "truth_type": "打车",
+        "category": "打车",
+    }
+
+
+def truth_hotel_folio_date(text: str) -> str:
+    date_match = None
+    for label in ("打印日期", "离店日期"):
+        date_match = re.search(rf"{label}\s*[:：]?\s*(20\d{{2}})[-/.](\d{{1,2}})[-/.](\d{{1,2}})", text)
+        if date_match:
+            break
+    date_match = date_match or re.search(r"GD:(20\d{2})-(\d{1,2})-(\d{1,2})", text, re.IGNORECASE)
+    if date_match:
+        return f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
+    short = re.search(r"\b(\d{2})/(\d{2})/(\d{2})\b", text)
+    return f"20{short.group(3)}-{int(short.group(1)):02d}-{int(short.group(2)):02d}" if short else ""
+
+
+def parse_generic_hotel_folio_pdf(path: Path) -> dict:
+    text = read_pdf_text(path).replace("\xa0", " ")
+    compact = re.sub(r"\s+", "", text).lower()
+    if not text or "电子发票" in compact or "发票号码" in compact:
+        return {}
+    if not any(marker in compact for marker in ("结账单", "住宿明细", "宾客账单", "guestfolio", "folio", "balance")):
+        return {}
+    if not any(marker in compact for marker in ("酒店", "hotel", "入住日期", "arrival", "departure")):
+        return {}
+    lines = [re.sub(r"\s+", " ", line).strip(" :：") for line in text.splitlines() if line.strip()]
+    seller = lines[0] if lines else ""
+    purchaser_match = re.search(r"客人姓名\s*[:：]?\s*([\u4e00-\u9fffA-Za-z, ]{1,40})", text)
+    purchaser = purchaser_match.group(1).strip(" :：") if purchaser_match else ""
+    values = []
+    for pattern in (
+        r"Total\s*\n\s*([0-9]{1,3}(?:,[0-9]{3})*\.\d{2}|[0-9]+\.\d{2})",
+        r"付款合计\s*([0-9]+(?:\.\d{2})?)", r"消费合计\s*([0-9]+(?:\.\d{2})?)",
+        r"Balance\s+(?:CNY\s*)?([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            values.append(match.group(1))
+    amount = _first_money(values)
+    invoice_date = truth_hotel_folio_date(text)
+    if not seller or not amount or not invoice_date:
+        return {}
+    return {
+        "invoice_number": "", "invoice_code": "", "invoice_date": invoice_date,
+        "seller": seller, "purchaser": purchaser or "个人", "amount": amount,
+        "truth_type": "住宿水单", "category": "住宿水单",
+    }
+
+
+def parse_pdf_local(path_or_legacy_owner, company_or_path, legacy_company=None) -> tuple[dict, str]:
+    if legacy_company is None:
+        path = Path(path_or_legacy_owner)
+        target_company = str(company_or_path)
+    else:
+        path = Path(company_or_path)
+        target_company = str(legacy_company)
     train_result = parse_train_ticket_pdf(path)
     if train_result:
         return train_result, "local_train_ticket_pdf"
@@ -1453,6 +1882,7 @@ def parse_pdf_local(extractor: InvoiceExtractor, path: Path, target_company: str
         ("local_marriott_folio_pdf", parse_marriott_folio_pdf),
         ("local_foreign_invoice_pdf", parse_foreign_invoice_pdf),
         ("local_cits_pdf", parse_cits_pdf),
+        ("truth_generic_hotel_folio_pdf", parse_generic_hotel_folio_pdf),
     ):
         parsed = parser(path)
         if parsed and (parsed.get("amount") or parsed.get("invoice_number")):
@@ -1460,19 +1890,13 @@ def parse_pdf_local(extractor: InvoiceExtractor, path: Path, target_company: str
     companion_xml = parse_companion_xml_for_pdf(path)
     if companion_xml:
         return companion_xml, "companion_xml_for_pdf"
-    for name in (
-        "_try_extract_ihg_folio_from_pdf_text",
-        "_try_extract_generic_hotel_folio_from_pdf_text",
-        "_try_extract_standard_china_einvoice_from_pdf_text_v2",
-        "_try_extract_standard_china_einvoice_from_pdf_text",
-        "_try_extract_didi_invoice_from_pdf_text",
+    for parser_name, parser in (
+        ("truth_standard_china_einvoice_pdf", parse_standard_einvoice_pdf),
+        ("truth_didi_invoice_pdf", parse_didi_invoice_pdf),
     ):
-        try:
-            result = getattr(extractor, name)(str(path))
-        except Exception:
-            result = None
+        result = parser(path)
         if result:
-            return normalize_extractor_result(result), name
+            return result, parser_name
     loose_result = parse_loose_standard_einvoice_pdf(path, target_company)
     if loose_result:
         return loose_result, "local_loose_standard_einvoice_pdf"
@@ -1548,6 +1972,7 @@ def document_role_for(truth_type: str, fields: dict, meta: dict) -> str:
 
 def copy_evidence(paths, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_root = output_dir.parents[1]
     copied = []
     seen = set()
     for src in paths:
@@ -1559,7 +1984,7 @@ def copy_evidence(paths, output_dir: Path):
         shutil.copy2(src, dst)
         copied.append({
             "file_name": dst.name,
-            "path": str(dst),
+            "path": dst.relative_to(manifest_root).as_posix(),
             "sha256": sha256_file(dst),
             "bytes": dst.stat().st_size,
         })
@@ -1644,9 +2069,52 @@ def row_in_truth_window(row: dict, date_from: str, before_exclusive: str) -> boo
     return True
 
 
+def validate_truth_build_paths(source_root: Path, output_root: Path) -> None:
+    source = source_root.resolve()
+    output = output_root.resolve()
+    try:
+        output.relative_to(source)
+    except ValueError:
+        pass
+    else:
+        raise TruthBuildError("output_overlaps_source")
+
+
+def load_truth_build_identity(
+    source_root: Path,
+    *,
+    explicit_target: str,
+    explicit_domain: str,
+) -> dict[str, str]:
+    config_path = source_root / "truth_collection_config.json"
+    saved = {}
+    if config_path.is_file():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            saved = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TruthBuildError("invalid_collection_config") from exc
+    target = str(explicit_target or saved.get("target_company") or saved.get("target_identifier") or "").strip()
+    if not target:
+        raise TruthBuildError("target_company_required")
+    domain = str(explicit_domain or saved.get("account_domain") or "").strip().lower()
+    if not domain:
+        raise TruthBuildError("account_domain_required")
+    return {
+        "target_company": target,
+        "account_domain": domain,
+        "dataset": str(saved.get("dataset") or "").strip(),
+        "build_time": str(saved.get("build_time") or "").strip(),
+    }
+
+
 def build_truth(args, source_root: Path, output_root: Path):
-    settings = UserSettingsStore().load()
-    target_company = str(settings.get("company") or "").strip()
+    identity = load_truth_build_identity(
+        source_root,
+        explicit_target=str(getattr(args, "target_company", "") or ""),
+        explicit_domain=str(getattr(args, "account_domain", "") or ""),
+    )
+    target_company = identity["target_company"]
     doc_rows = read_jsonl(source_root / "document_index.jsonl")
     link_rows = read_jsonl(source_root / "link_downloads.jsonl")
     url_rows = read_jsonl(source_root / "url_candidates.jsonl")
@@ -1658,7 +2126,6 @@ def build_truth(args, source_root: Path, output_root: Path):
     doc_rows = enrich_doc_rows_from_link_downloads(doc_rows, link_rows)
     url_expected_by_email = build_url_expected_by_email(url_rows)
     output_raw = output_root / "raw_documents"
-    extractor = InvoiceExtractor(api_key="", output_dir=str(output_root / "_extractor_tmp"))
     parsed = []
     pending = []
     excluded = []
@@ -1709,7 +2176,7 @@ def build_truth(args, source_root: Path, output_root: Path):
                 pending.append({**doc, "reason": "xml_parse_failed", "error": str(exc)})
                 continue
         elif ext == ".pdf":
-            fields, engine = parse_pdf_local(extractor, path, target_company)
+            fields, engine = parse_pdf_local(path, target_company)
             if not fields:
                 if has_invoice_hint(path.name, doc.get("subject"), doc.get("sender")):
                     pending.append({**doc, "reason": "pdf_parse_pending_review"})
@@ -1765,7 +2232,12 @@ def build_truth(args, source_root: Path, output_root: Path):
         and str(row.get("email_id") or "") not in parsed_email_ids
         and has_invoice_hint(row.get("subject"), row.get("sender"))
     ]
-    email_evidence = fetch_email_text_evidence([row.get("email_id") for row in email_candidates], source_root, args.mailbox)
+    email_evidence = resolve_email_text_evidence(
+        [row.get("email_id") for row in email_candidates],
+        source_root,
+        args.mailbox,
+        allow_network=not bool(getattr(args, "skip_collect", False)),
+    )
     for email_row in email_candidates:
         email_id = str(email_row.get("email_id") or "")
         evidence = email_evidence.get(email_id, {})
@@ -1819,7 +2291,6 @@ def build_truth(args, source_root: Path, output_root: Path):
 
     parsed_email_ids = {str(row.get("email_id") or row.get("source_email_id") or "") for row in parsed}
     parsed_subjects = {str(row.get("subject") or "").strip() for row in parsed if row.get("subject")}
-    evidence_email_ids = {str(row.get("email_id") or row.get("source_email_id") or "") for row in doc_rows}
     for email_row in mailbox_rows:
         email_id = str(email_row.get("email_id") or "")
         if not email_id or email_id in parsed_email_ids:
@@ -1932,18 +2403,23 @@ def build_truth(args, source_root: Path, output_root: Path):
 
     manifest = {
         "summary": {
-            "dataset": output_root.name,
+            "dataset": str(getattr(args, "dataset", "") or identity["dataset"]) or (
+                f"{identity['account_domain']}_{args.date_from}_{args.date_to}"
+            ),
             "date_from": args.date_from,
             "date_to": args.date_to,
             "before_exclusive": args.before_exclusive,
             "mailbox": args.mailbox,
-            "account_domain": settings.get("email", "").split("@")[-1] if "@" in settings.get("email", "") else "",
+            "account_domain": identity["account_domain"],
             "target_company": target_company,
             "included_count": len(included),
             "excluded_count": len(excluded),
             "pending_review_count": len(pending),
             "finalized": len(pending) == 0,
-            "build_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "build_time": str(
+                getattr(args, "build_time", "") or identity["build_time"]
+            )
+            or f"{args.date_to} 23:59:59",
         },
         "included": included,
         "excluded": excluded,
@@ -1962,6 +2438,10 @@ def main():
     parser.add_argument("--date-to", required=True)
     parser.add_argument("--before-exclusive", default="")
     parser.add_argument("--mailbox", default="INBOX")
+    parser.add_argument("--target-company", default="")
+    parser.add_argument("--account-domain", default="")
+    parser.add_argument("--dataset", default="")
+    parser.add_argument("--build-time", default="")
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--skip-collect", action="store_true")
@@ -1972,12 +2452,24 @@ def main():
 
     source_root = Path(args.source_root).resolve()
     output_root = Path(args.output_root).resolve()
-    source_root.mkdir(parents=True, exist_ok=True)
+    validate_truth_build_paths(source_root, output_root)
+    if args.skip_collect:
+        if not source_root.is_dir():
+            raise TruthBuildError("missing_source_root")
+        identity = load_truth_build_identity(
+            source_root,
+            explicit_target=args.target_company,
+            explicit_domain=args.account_domain,
+        )
+        args.target_company = identity["target_company"]
+        args.account_domain = identity["account_domain"]
+    else:
+        source_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
-    write_json(source_root / "truth_collection_config.json", vars(args))
     if not args.skip_collect:
         inventory = collect_raw_evidence(args, source_root)
         print(json.dumps({"event": "collected", **{k: inventory[k] for k in ["email_count", "document_count", "url_candidate_count", "link_download_count"]}}, ensure_ascii=False), flush=True)
+    write_json(output_root / "truth_build_config.json", vars(args))
     manifest = build_truth(args, source_root, output_root)
     print(json.dumps({"event": "truth_built", **manifest["summary"]}, ensure_ascii=False, indent=2), flush=True)
     return 0 if manifest["summary"]["finalized"] else 2

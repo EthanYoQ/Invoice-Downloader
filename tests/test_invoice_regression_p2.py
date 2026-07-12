@@ -46,6 +46,116 @@ class InvoiceP2RegressionTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def _admit_business_artifact(self, records, fields, file_name):
+        code = fields.get("InvoiceCode", "")
+        number = fields.get("InvoiceNumber", "")
+        if app_api.is_business_duplicate(code, number, records, fields, file_name):
+            return False
+        app_api.record_business_success(records, code, number, fields, file_name)
+        return True
+
+    def test_train_ticket_embedded_departure_date_overrides_model_drift(self):
+        pdf = self.root / "train-ticket.pdf"
+        write_text_pdf(
+            pdf,
+            "\n".join(
+                [
+                    "发票号码:26119110010001302959",
+                    "2026年01月23日",
+                    "电子发票（铁路电子客票）",
+                    "14:42开",
+                    "票价:￥202.00",
+                    "北京南站",
+                    "济南西站",
+                    "开票日期:2026年02月10日",
+                ]
+            ),
+        )
+        model_result = {
+            "is_invoice": True,
+            "Date": "20260210",
+            "Departure_Date": "20260223",
+            "Departure_City": "北京南站",
+            "Destination_City": "济南西站",
+            "Purchaser": "辉瑞投资有限公司",
+            "Seller": "中国铁路",
+            "Amount": "202.00",
+            "InvoiceCode": "",
+            "InvoiceNumber": "26119110010001302959",
+            "Type": "火车票",
+            "category": "火车票",
+        }
+
+        result = self.extractor._reconcile_train_ticket_embedded_fields(model_result, str(pdf))
+
+        self.assertEqual(result["Departure_Date"], "20260123")
+        self.assertEqual(result["Date"], "20260123")
+
+    def test_business_dedup_keeps_ride_invoice_and_itinerary_for_pairing(self):
+        from archive_pairing import match_ride_pairs
+
+        records = {}
+        invoice_fields = {
+            "Type": "打车",
+            "InvoiceCode": "RIDE",
+            "InvoiceNumber": "1001",
+        }
+        itinerary_fields = {
+            "Type": "打车",
+            "InvoiceCode": "RIDE",
+            "InvoiceNumber": "1001",
+            "_is_itinerary": True,
+        }
+
+        self.assertTrue(self._admit_business_artifact(records, invoice_fields, "ride_invoice.pdf"))
+        self.assertTrue(self._admit_business_artifact(records, itinerary_fields, "ride_itinerary.pdf"))
+        pairs = match_ride_pairs(
+            [{"amount": "100.00", "date": "20260605", "document_id": "ride-invoice"}],
+            [{"amount": "100.00", "date": "20260605", "document_id": "ride-itinerary"}],
+        )
+        self.assertEqual(len(pairs), 1)
+
+    def test_business_dedup_keeps_hotel_invoice_and_folio_for_pairing(self):
+        from archive_pairing import match_hotel_pairs
+
+        records = {}
+        invoice_fields = {
+            "Type": "住宿发票",
+            "InvoiceCode": "HOTEL",
+            "InvoiceNumber": "2001",
+        }
+        folio_fields = {
+            "Type": "住宿水单",
+            "InvoiceCode": "HOTEL",
+            "InvoiceNumber": "2001",
+        }
+
+        self.assertTrue(self._admit_business_artifact(records, invoice_fields, "hotel_invoice.pdf"))
+        self.assertTrue(self._admit_business_artifact(records, folio_fields, "hotel_folio.pdf"))
+        pairs = match_hotel_pairs(
+            [{"amount": "500.00", "date": "20260601", "document_id": "hotel-invoice"}],
+            [{"amount": "500.00", "date": "20260601", "document_id": "hotel-folio"}],
+        )
+        self.assertEqual(len(pairs), 1)
+
+    def test_business_dedup_still_rejects_same_role_representations(self):
+        cases = [
+            ({"Type": "打车"}, "ride_invoice.pdf"),
+            ({"Type": "打车", "_is_itinerary": True}, "ride_itinerary.pdf"),
+            ({"Type": "住宿发票"}, "hotel_invoice.pdf"),
+            ({"Type": "住宿水单"}, "hotel_folio.pdf"),
+        ]
+        for role_fields, file_name in cases:
+            with self.subTest(file_name=file_name):
+                fields = {
+                    **role_fields,
+                    "InvoiceCode": "SAME",
+                    "InvoiceNumber": "3001",
+                }
+                records = {}
+                self.assertTrue(self._admit_business_artifact(records, fields, file_name))
+                self.assertFalse(self._admit_business_artifact(records, fields, f"copy-{file_name}"))
+
     def test_non_target_company_invoice_with_unknown_seller_stays_out_of_manual_check(self):
         pdf = self.root / "Invoice-23265242.pdf"
         pdf.write_bytes(b"%PDF-1.4\n% placeholder\n")

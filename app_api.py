@@ -7,25 +7,34 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from archive_pairing import (
-    build_hotel_pair_renames,
-    build_ride_pair_renames,
-    is_hotel_folio_filename,
-    is_hotel_order_filename,
-    is_ride_itinerary_filename,
-    match_hotel_pairs,
-    match_ride_pairs,
-    parse_archived_filename,
-)
 from build_identity import load_build_identity
-from company_rules import DEFAULT_COMPANY, classify_purchaser_relation
-from document_types import MANUAL_REVIEW_FOLDER, get_archive_folder, is_exempt_type
+from company_rules import DEFAULT_COMPANY
+from document_types import (
+    MANUAL_REVIEW_FOLDER,
+    classify_cwt_document_type as _classify_cwt_document_type,
+    normalize_document_type_for_archive as _normalize_document_type_for_archive,
+)
 from email_channel import resolve_channel
-from frontend_run_context import ensure_run_context_dirs, load_run_context, serialize_run_context
+from frontend_run_context import ensure_run_context_dirs, load_run_context, make_run_staging_dir, serialize_run_context
+from glm_runtime import GlmRequestError, GlmRuntime
+from report_service import ReportService
+from run_coordinator import RunCoordinator, RunDependencies, RunRequest
+from run_lifecycle import RunLifecycle, RunState
+from run_state_store import RunStateStore
 from provider_direct_invoice import DIRECT_INVOICE_FAMILIES
+from url_trace_sanitizer import (
+    build_url_evidence,
+    sanitize_persistence_payload,
+    sanitize_url_trace_record,
+    stable_hash,
+)
 from user_settings import (
+    DEFAULT_GLM_MODEL_CANDIDATES,
+    DEFAULT_GLM_PROFILE_LIMITS,
     UserSettingsStore,
     ensure_directory,
     get_default_save_path as resolve_default_save_path,
@@ -35,36 +44,491 @@ from user_settings import (
 )
 
 
+DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS = 120.0
+
+
+class TruthAuditTimeout(RuntimeError):
+    reason_code = "TRUTH_AUDIT_TIMEOUT"
+    user_message = "真值审计收尾超时，请查看诊断报告后重试。"
+
+
+class ProcessingLoopFailure(RuntimeError):
+    reason_code = "PROCESSING_FAILED"
+    user_message = "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
+
+
+class ImapLoginError(RuntimeError):
+    reason_code = "IMAP_LOGIN_FAILED"
+    user_message = "邮箱登录失败，请检查授权码和 IMAP 设置。"
+
+
+class RemoteAuthError(RuntimeError):
+    reason_code = "REMOTE_AUTH_FAILED"
+    user_message = "GLM API 身份验证失败，请检查 API Key。"
+
+
+class QuotaExhaustedError(RuntimeError):
+    reason_code = "QUOTA_EXHAUSTED"
+    user_message = "GLM API 额度已耗尽，请充值或更换可用的 API Key。"
+
+
+class TruthAuditEvidenceError(RuntimeError):
+    def __init__(self, reason_code, user_message):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.user_message = user_message
+
+
+@dataclass(frozen=True)
+class TruthAuditPaths:
+    run_root: Path
+    monitoring_dir: Path
+    artifact_dir: Path
+    report_path: Path
+    error_path: Path
+    index_path: Path
+    run_config_path: Path
+
+
+@dataclass(frozen=True)
+class TruthAuditJob:
+    run_id: str
+    paths: TruthAuditPaths
+    thread: threading.Thread
+    ready: threading.Event
+    abandoned: threading.Event
+    result: dict
+
+
+@dataclass(frozen=True)
+class _RunAdmissionCandidate:
+    rules_text: str
+    requested_save_path: str
+    effective_save_path: str
+    date_from: str
+    date_to: str
+    account_id: str
+    channel_id: str
+    email_domain: str
+    run_context_json: str
+    started_at: str
+
+    def run_context(self):
+        return json.loads(self.run_context_json)
+
+
+class _RunAdmissionSecrets:
+    __slots__ = ("email_address", "auth_code", "api_key")
+
+    def __init__(self, email_address, auth_code, api_key):
+        self.email_address = str(email_address or "")
+        self.auth_code = str(auth_code or "")
+        self.api_key = str(api_key or "")
+
+    def __repr__(self):
+        return "_RunAdmissionSecrets(<process-only redacted>)"
+
+
+class _ProcessingPipelineSession:
+    def __init__(
+        self,
+        *,
+        api,
+        candidates,
+        pipeline,
+        archive_service,
+        save_path,
+        output_state_dir,
+        working_history,
+        business_records,
+        sidecar,
+        trace_store,
+        owned_extractor=None,
+        provider_retry_delay_seconds=0.0,
+    ):
+        self._api = api
+        self.candidates = candidates
+        self._pipeline = pipeline
+        self._archive_service = archive_service
+        self._save_path = save_path
+        self._output_state_dir = output_state_dir
+        self._working_history = working_history
+        self._business_records = business_records
+        self._sidecar = sidecar
+        self._trace_store = trace_store
+        self._owned_extractor = owned_extractor
+        self._provider_retry_delay_seconds = max(
+            0.0, float(provider_retry_delay_seconds)
+        )
+        self._provider_url_candidates = []
+        self._candidate_total = len(candidates)
+        self._closed = False
+
+    def extract(self):
+        candidates = list(self.candidates)
+        primary = [
+            candidate
+            for candidate in candidates
+            if candidate.identity.source_kind != "url"
+        ]
+        self._provider_url_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.identity.source_kind == "url"
+        ]
+        return self._pipeline.extract(primary, progress_total=self._candidate_total)
+
+    def _record_deferred_outcomes(self, outcomes):
+        for outcome in outcomes:
+            event = {
+                "document_id": outcome.candidate.identity.document_id,
+                "sequence": outcome.candidate.sequence,
+                "status": outcome.status,
+                "reason_code": outcome.reason_code,
+            }
+            self._trace_store.set_fields(
+                event["document_id"], extraction_result=dict(event)
+            )
+            self._api._safe_emit_stage_event(
+                "extraction_pipeline", "trace", dict(event)
+            )
+
+    def _canonical_info_by_document_id(self, archived_outcomes):
+        document_ids = {
+            archived.outcome.candidate.identity.document_id
+            for archived in archived_outcomes
+        }
+        records = {}
+        getter = getattr(self._trace_store, "get_record", None)
+        if callable(getter):
+            records = {
+                document_id: getter(document_id) or {}
+                for document_id in document_ids
+            }
+        else:
+            iterator = getattr(self._trace_store, "iter_records", None)
+            if callable(iterator):
+                records = {
+                    str(record.get("document_id") or ""): record
+                    for record in iterator()
+                    if isinstance(record, dict)
+                }
+        return {
+            document_id: dict(record.get("normalized_fields") or {})
+            for document_id, record in records.items()
+            if isinstance(record, dict)
+        }
+
+    @staticmethod
+    def _is_strong_provider_retry_candidate(candidate):
+        legacy = candidate.to_legacy()
+        expected = legacy.get("provider_expected_fields") or {}
+        invoice_number = "".join(
+            character
+            for character in str(
+                expected.get("invoice_number") or expected.get("InvoiceNumber") or ""
+            )
+            if character.isdigit()
+        )
+        return bool(
+            candidate.identity.source_kind == "url"
+            and legacy.get("provider_family")
+            and len(invoice_number) == 20
+        )
+
+    def _wait_for_provider_retry(self) -> bool:
+        remaining = self._provider_retry_delay_seconds
+        while remaining > 0:
+            if bool(getattr(self._api, "_stop_requested", False)):
+                return False
+            interval = min(0.25, remaining)
+            time.sleep(interval)
+            remaining -= interval
+        return not bool(getattr(self._api, "_stop_requested", False))
+
+    def archive(self, outcomes):
+        from archive_service import ArchiveReport
+        from candidate_pipeline import partition_redundant_provider_candidates
+
+        def merge_reports(reports):
+            return ArchiveReport(
+                outcomes=tuple(
+                    sorted(
+                        (
+                            archived
+                            for source_report in reports
+                            for archived in source_report.outcomes
+                        ),
+                        key=lambda archived: archived.outcome.candidate.sequence,
+                    )
+                ),
+                archived_count=sum(item.archived_count for item in reports),
+                retained_count=sum(item.retained_count for item in reports),
+                manual_count=sum(item.manual_count for item in reports),
+                unresolved_count=sum(item.unresolved_count for item in reports),
+                duplicate_count=sum(item.duplicate_count for item in reports),
+            )
+
+        primary_outcomes = list(outcomes)
+        primary_report = self._archive_service.archive(
+            primary_outcomes, self._save_path, finalize=False
+        )
+        skipped, pending = partition_redundant_provider_candidates(
+            self._provider_url_candidates,
+            primary_report.outcomes,
+            canonical_info_by_document_id=self._canonical_info_by_document_id(
+                primary_report.outcomes
+            ),
+        )
+        self._record_deferred_outcomes(skipped)
+        offset = len(primary_outcomes) + len(skipped)
+        provider_outcomes = self._pipeline.extract(
+            pending,
+            progress_offset=offset,
+            progress_total=self._candidate_total,
+        )
+        failed_provider_outcomes = [
+            outcome
+            for outcome in provider_outcomes
+            if outcome.status == "unresolved"
+            and outcome.reason_code == "URL_DOWNLOAD_FAILED"
+        ]
+        failed_document_ids = {
+            outcome.candidate.identity.document_id
+            for outcome in failed_provider_outcomes
+        }
+        archiveable_outcomes = sorted(
+            [
+                *skipped,
+                *(
+                    outcome
+                    for outcome in provider_outcomes
+                    if outcome.candidate.identity.document_id
+                    not in failed_document_ids
+                ),
+            ],
+            key=lambda outcome: outcome.candidate.sequence,
+        )
+        reports = [primary_report]
+        if archiveable_outcomes:
+            reports.append(
+                self._archive_service.archive(
+                    archiveable_outcomes, self._save_path, finalize=False
+                )
+            )
+
+        archived_evidence = tuple(
+            archived
+            for source_report in reports
+            for archived in source_report.outcomes
+        )
+        recovered_failures, still_pending = partition_redundant_provider_candidates(
+            [outcome.candidate for outcome in failed_provider_outcomes],
+            archived_evidence,
+            canonical_info_by_document_id=self._canonical_info_by_document_id(
+                archived_evidence
+            )
+        )
+        self._record_deferred_outcomes(recovered_failures)
+        still_pending_ids = {
+            candidate.identity.document_id for candidate in still_pending
+        }
+        remaining_failures = [
+            outcome
+            for outcome in failed_provider_outcomes
+            if outcome.candidate.identity.document_id in still_pending_ids
+        ]
+        retryable_failures = [
+            outcome
+            for outcome in remaining_failures
+            if self._is_strong_provider_retry_candidate(outcome.candidate)
+        ]
+        retryable_ids = {
+            outcome.candidate.identity.document_id for outcome in retryable_failures
+        }
+        nonretryable_failures = [
+            outcome
+            for outcome in remaining_failures
+            if outcome.candidate.identity.document_id not in retryable_ids
+        ]
+        retried_failures = []
+        recovered_retry_failures = []
+        if retryable_failures and self._wait_for_provider_retry():
+            retry_outcomes = self._pipeline.retry_current_run_failures(
+                [outcome.candidate for outcome in retryable_failures]
+            )
+            retried_failures = [
+                outcome
+                for outcome in retry_outcomes
+                if outcome.status == "unresolved"
+                and outcome.reason_code == "URL_DOWNLOAD_FAILED"
+            ]
+            retried_failure_ids = {
+                outcome.candidate.identity.document_id
+                for outcome in retried_failures
+            }
+            retried_archiveable = [
+                outcome
+                for outcome in retry_outcomes
+                if outcome.candidate.identity.document_id not in retried_failure_ids
+            ]
+            if retried_archiveable:
+                reports.append(
+                    self._archive_service.archive(
+                        retried_archiveable, self._save_path, finalize=False
+                    )
+                )
+            archived_evidence = tuple(
+                archived
+                for source_report in reports
+                for archived in source_report.outcomes
+            )
+            recovered_retry_failures, retry_still_pending = (
+                partition_redundant_provider_candidates(
+                    [outcome.candidate for outcome in retried_failures],
+                    archived_evidence,
+                    canonical_info_by_document_id=self._canonical_info_by_document_id(
+                        archived_evidence
+                    ),
+                )
+            )
+            self._record_deferred_outcomes(recovered_retry_failures)
+            retry_pending_ids = {
+                candidate.identity.document_id for candidate in retry_still_pending
+            }
+            retried_failures = [
+                outcome
+                for outcome in retried_failures
+                if outcome.candidate.identity.document_id in retry_pending_ids
+            ]
+        elif retryable_failures:
+            retried_failures = list(retryable_failures)
+        terminal_failures = sorted(
+            [
+                *recovered_failures,
+                *nonretryable_failures,
+                *recovered_retry_failures,
+                *retried_failures,
+            ],
+            key=lambda outcome: outcome.candidate.sequence,
+        )
+        if terminal_failures:
+            reports.append(
+                self._archive_service.archive(
+                    terminal_failures, self._save_path, finalize=False
+                )
+            )
+
+        report = merge_reports(reports)
+        report = self._archive_service.finalize(report, self._save_path)
+        if not report.can_complete:
+            self._api._mark_output_run_state(
+                self._output_state_dir,
+                "failed",
+                failure_reason="processing_pipeline_incomplete",
+            )
+            raise ProcessingLoopFailure("PROCESSING_PIPELINE_INCOMPLETE")
+        self._api._commit_output_state(
+            self._output_state_dir,
+            self._working_history,
+            self._business_records,
+        )
+        return report
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._sidecar.clear()
+        if getattr(self._api, "_pipeline_sidecar", None) is self._sidecar:
+            delattr(self._api, "_pipeline_sidecar")
+        try:
+            self._trace_store.flush()
+        except Exception:
+            pass
+        close_extractor = getattr(self._owned_extractor, "close", None)
+        if callable(close_extractor):
+            close_extractor()
+
+
 def build_processing_history_key(info, file_name, pdf_path):
+    from candidate_pipeline import build_compatibility_history_key
+
+    return build_compatibility_history_key(info, file_name, pdf_path)
+
+
+def build_document_trace_id(info, file_name, pdf_path):
     import hashlib
 
     info = info or {}
-    legacy_key = hashlib.md5(
-        f"{info.get('subject', '')}_{file_name}_{info.get('tier', 0)}".encode("utf-8")
-    ).hexdigest()
-    if info.get("is_url", False):
-        expected = info.get("provider_expected_fields") or {}
-        invoice_number = str(expected.get("invoice_number") or expected.get("InvoiceNumber") or "").strip()
-        provider_family = str(info.get("provider_family") or "").strip()
-        email_id = str(info.get("email_id") or "").strip()
-        source_url = str(info.get("source_url") or pdf_path or file_name or "").strip()
-        if provider_family or invoice_number or email_id or source_url:
-            parts = [
-                "url",
-                provider_family or "generic",
-                email_id,
-                invoice_number,
-                source_url,
-            ]
-            return ":".join(parts)
-        return f"url:{legacy_key}"
+    source_locator = str(info.get("source_url") or info.get("filepath") or pdf_path or "").strip()
+    if source_locator and not info.get("is_url", False):
+        source_locator = os.path.normcase(os.path.abspath(source_locator))
+    evidence = {
+        "processing_history_key": build_processing_history_key(info, file_name, pdf_path),
+        "source_message_uid": str(info.get("email_id") or info.get("source_email_id") or "").strip(),
+        "source_filename": str(file_name or "").strip(),
+        "source_locator": source_locator,
+        "source_kind": str(info.get("source_kind") or "").strip(),
+        "source_url": str(info.get("source_url") or "").strip(),
+        "provider_group_key": str(info.get("provider_group_key") or "").strip(),
+    }
+    canonical = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    try:
-        with open(pdf_path, "rb") as source_file:
-            file_digest = hashlib.sha256(source_file.read()).hexdigest()
-        return f"att:{file_digest}"
-    except Exception:
-        return f"att-legacy:{legacy_key}"
+
+def canonical_artifact_role(info_json, file_name=""):
+    info_json = info_json or {}
+    doc_type = str(info_json.get("Type") or "").strip().lower()
+    evidence = f"{doc_type} {file_name}".lower()
+
+    if any(token in evidence for token in ("住宿水单", "水单", "folio", "酒店账单")):
+        return "hotel_folio"
+    ride_evidence = any(token in evidence for token in ("打车", "滴滴", "高德", "约车", "ride"))
+    itinerary_evidence = bool(info_json.get("_is_itinerary")) or any(
+        token in evidence for token in ("行程单", "行程报销单", "itinerary")
+    )
+    if ride_evidence and itinerary_evidence:
+        return "ride_itinerary"
+    if ride_evidence:
+        return "ride_invoice"
+    if "住宿" in evidence or "hotel" in evidence:
+        return "hotel_invoice"
+    return "invoice"
+
+
+def build_business_record_key(code, number, info_json, file_name=""):
+    identity = f"{str(code or '').strip()}_{str(number or '').strip()}"
+    return f"{identity}::{canonical_artifact_role(info_json, file_name)}"
+
+
+def is_business_duplicate(code, number, records, info_json, file_name=""):
+    if not str(code or "").strip() and not str(number or "").strip():
+        return False
+    records = records or {}
+    role = canonical_artifact_role(info_json, file_name)
+    if build_business_record_key(code, number, info_json, file_name) in records:
+        return True
+
+    legacy_key = f"{str(code or '').strip()}_{str(number or '').strip()}"
+    legacy_record = records.get(legacy_key)
+    if not isinstance(legacy_record, dict):
+        return False
+    stored_role = str(legacy_record.get("artifact_role") or "").strip()
+    if not stored_role and legacy_record.get("file"):
+        stored_role = canonical_artifact_role({}, legacy_record["file"])
+    return stored_role == role if stored_role else role == "invoice"
+
+
+def record_business_success(records, code, number, info_json, file_name, date="", amount=""):
+    key = build_business_record_key(code, number, info_json, file_name)
+    records[key] = {
+        "file": file_name,
+        "date": date or info_json.get("Date", ""),
+        "amount": amount or info_json.get("Amount", ""),
+        "artifact_role": canonical_artifact_role(info_json, file_name),
+    }
+    return key
 
 
 class QuotaExceededError(RuntimeError):
@@ -72,92 +536,11 @@ class QuotaExceededError(RuntimeError):
 
 
 def classify_cwt_document_type(info_json, info, file_name, local_cits_fast_path=False):
-    doc_type = str((info_json or {}).get("Type", ""))
-    seller = str((info_json or {}).get("Seller", ""))
-    reason_codes = []
-    file_text = str(file_name or "")
-    file_text_lower = file_text.lower()
-    subject_lower = str((info or {}).get("subject", "")).lower()
-
-    if local_cits_fast_path and doc_type in {"机票", "住宿水单", "非目标公司发票"}:
-        if doc_type == "住宿水单":
-            info_json["_is_folio"] = True
-        reason_codes.append("PRESERVED_LOCAL_CITS_GBT_TYPE")
-        return doc_type, reason_codes
-
-    if "取消" in file_text:
-        info_json["_cwt_cancellation"] = True
-        reason_codes.append("CWT_HOTEL_CANCELLATION")
-        return "住宿确认单", reason_codes
-    if any(kw in seller for kw in ["GBT Travel"]) or "scct" in file_text_lower or "scct" in subject_lower:
-        reason_codes.append("CLASSIFIED_AS_CWT_SERVICE_FEE")
-        return "差旅服务费", reason_codes
-    if any(kw in file_text_lower for kw in ["flight", "air", "机票", "航班", "行程单 - 机票"]):
-        reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT_BY_FILENAME")
-        return "航班行程单", reason_codes
-    if any(kw in doc_type.lower() for kw in ["机票", "航班", "flight", "air"]):
-        reason_codes.append("CLASSIFIED_AS_CWT_FLIGHT")
-        return "航班行程单", reason_codes
-    if any(kw in file_text_lower for kw in ["酒店", "行程单 - 酒店"]):
-        reason_codes.append("CLASSIFIED_AS_CWT_HOTEL_BY_FILENAME")
-        return "住宿确认单", reason_codes
-    reason_codes.append("CLASSIFIED_AS_CWT_HOTEL")
-    return "住宿确认单", reason_codes
+    return _classify_cwt_document_type(info_json, info, file_name, local_cits_fast_path)
 
 
 def normalize_document_type_for_archive(info_json, file_name, cwt_classified=False):
-    doc_type = str((info_json or {}).get("Type", ""))
-    seller = str((info_json or {}).get("Seller", ""))
-    reason_codes = []
-    if cwt_classified:
-        return doc_type, reason_codes
-    if doc_type == "非目标公司发票":
-        reason_codes.append("PRESERVED_NON_TARGET_COMPANY")
-        return doc_type, reason_codes
-
-    file_text = str(file_name or "")
-    file_text_lower = file_text.lower()
-    doc_type_lower = doc_type.lower()
-    folio_signal = (
-        any(kw in doc_type for kw in ["水单", "账单", "结账单", "住宿明细"])
-        or any(kw in doc_type_lower for kw in ["folio"])
-        or any(kw in file_text for kw in ["水单", "结账单", "账单", "住宿明细"])
-        or any(kw in file_text_lower for kw in ["folio"])
-    )
-
-    if folio_signal:
-        doc_type = "住宿水单"
-        info_json["_is_folio"] = True
-        reason_codes.append("CLASSIFIED_AS_HOTEL_FOLIO")
-    elif any(kw in doc_type for kw in ["行程单", "报销单"]) or any(kw in file_text for kw in ["行程单", "行程报销单", "报销单"]):
-        _is_flight = (
-            "机票" in file_text_lower
-            or any(kw in doc_type_lower for kw in ["机票", "航班", "flight", "air"])
-            or any(kw in seller for kw in ["航空", "Airlines", "Air China", "东航", "南航", "国航"])
-        )
-        if _is_flight:
-            doc_type = "航班行程单"
-            reason_codes.append("CLASSIFIED_AS_FLIGHT_ITINERARY")
-        else:
-            doc_type = "打车"
-            info_json["_is_itinerary"] = True
-            reason_codes.append("CLASSIFIED_AS_RIDE_ITINERARY")
-    elif any(kw in doc_type for kw in ["打车", "出租", "滴滴", "高德", "约车"]):
-        doc_type = "打车"
-        reason_codes.append("CLASSIFIED_AS_RIDE_BY_TYPE")
-    elif any(kw in seller for kw in ["滴滴", "高德", "约车", "盛智", "畅行"]):
-        doc_type = "打车"
-        reason_codes.append("CLASSIFIED_AS_RIDE_BY_SELLER")
-    elif any(kw in doc_type for kw in ["火车", "高铁", "铁路"]):
-        doc_type = "火车票"
-        reason_codes.append("CLASSIFIED_AS_TRAIN_BY_TYPE")
-    elif "住宿" in doc_type:
-        doc_type = "住宿发票"
-        reason_codes.append("CLASSIFIED_AS_HOTEL_INVOICE")
-    else:
-        reason_codes.append("CLASSIFICATION_FROM_MODEL_TYPE")
-
-    return doc_type, reason_codes
+    return _normalize_document_type_for_archive(info_json, file_name, cwt_classified)
 
 
 class _FallbackDocumentTraceStore:
@@ -171,8 +554,15 @@ class _FallbackDocumentTraceStore:
         self._records = {}
         self._order = []
         self._archive_index = {}
+        self._url_document_ids = set()
 
-    def start_document(self, source_filename, source_path=None, document_id=None):
+    def start_document(
+        self,
+        source_filename,
+        source_path=None,
+        document_id=None,
+        persistence_is_url=False,
+    ):
         doc_id = document_id or uuid.uuid4().hex
         if doc_id not in self._records:
             self._records[doc_id] = {
@@ -190,6 +580,8 @@ class _FallbackDocumentTraceStore:
             if source_path:
                 self._records[doc_id]["source_path"] = source_path
             self._order.append(doc_id)
+        if persistence_is_url:
+            self._url_document_ids.add(doc_id)
         return doc_id
 
     def get_record(self, document_id):
@@ -272,8 +664,11 @@ class _FallbackDocumentTraceStore:
         temp_path = f"{self.output_path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
             for document_id in self._order:
+                record = self._records[document_id]
+                if document_id in self._url_document_ids:
+                    record = sanitize_url_trace_record(record)
                 json.dump(
-                    self._records[document_id],
+                    record,
                     handle,
                     ensure_ascii=False,
                     default=str,
@@ -297,9 +692,13 @@ class _FallbackDocumentTraceStore:
         return ranks.get(severity, 0)
 
 class InvoiceAppAPI:
-    def __init__(self):
+    def __init__(self, truth_audit_timeout_seconds=None, revision_resolver=None):
         self._run_context = load_run_context()
-        ensure_run_context_dirs(self._run_context)
+        if revision_resolver is None:
+            from run_evidence import default_revision
+
+            revision_resolver = default_revision
+        self._revision_resolver = revision_resolver
         self._diag_lock = threading.Lock()
         self._packaged_diag_enabled = bool(getattr(sys, "frozen", False))
         self._packaged_diag_poll_count = 0
@@ -315,6 +714,16 @@ class InvoiceAppAPI:
         self.quota_exhausted = False
         self.quota_message = ""
         self._worker_thread = None
+        self._truth_audit_thread = None
+        self._truth_audit_job = None
+        if truth_audit_timeout_seconds is None:
+            truth_audit_timeout_seconds = DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS
+        self._truth_audit_timeout_seconds = max(0.001, float(truth_audit_timeout_seconds))
+        self._admission_lock = threading.RLock()
+        self._run_lifecycle = RunLifecycle()
+        self._active_run_handle = None
+        self._active_temp_dir = None
+        self._terminal_frontend_run_id = ""
         self._settings_store = UserSettingsStore()
         self._requested_save_path = ""
         self._effective_save_path = ""
@@ -332,6 +741,7 @@ class InvoiceAppAPI:
         self._last_export_path = ""
         self._active_run_config = {}
         self._timing_metrics = {}
+        self._run_state_store = RunStateStore(state_sink=self._apply_run_state_snapshot)
         self._install_packaged_thread_excepthook()
         self.build_identity = load_build_identity()
         self._validate_runtime_build_identity()
@@ -344,6 +754,76 @@ class InvoiceAppAPI:
         ensure_run_context_dirs(self._run_context)
         self._current_run_id = self._run_context.get("run_id", "")
         return self._run_context
+
+    def _prepare_run_lifecycle(self):
+        active = self._active_run_handle
+        if active is not None:
+            raise RuntimeError("a run handle is already assigned")
+
+        run_token = uuid.uuid4().hex
+        external_run_id = str(self._current_run_id or self._run_context.get("run_id", "") or "run")
+        lifecycle_run_id = f"{external_run_id}-{run_token}"
+        staging_dir = make_run_staging_dir(self._run_context, lifecycle_run_id)
+        handle = self._run_lifecycle.begin(lifecycle_run_id, staging_dir)
+        run_root = str(self._run_context.get("run_root", "") or "").strip()
+        temp_root = Path(run_root).resolve() / "temp" if run_root else Path.cwd() / "temp"
+        self._active_temp_dir = temp_root / lifecycle_run_id
+        self._active_run_handle = handle
+        self._terminal_frontend_run_id = ""
+        return handle
+
+    def _apply_run_state_snapshot(self, snapshot):
+        previous_state = getattr(self, "run_state", "idle")
+        self.progress = int(snapshot.get("progress", 0) or 0)
+        self.status_text = str(snapshot.get("status_text", ""))
+        self.logs = copy.deepcopy(list(snapshot.get("logs", [])))
+        self.discovered_categories = set(snapshot.get("new_categories", []))
+        self.stats = copy.deepcopy(dict(snapshot.get("stats", {})))
+        self.processed_invoices = copy.deepcopy(list(snapshot.get("processed_invoices", [])))
+        self.error_invoices = copy.deepcopy(list(snapshot.get("error_invoices", [])))
+        self._is_running = bool(snapshot.get("is_running", False))
+        self.run_state = str(snapshot.get("run_state", "idle"))
+        self.last_error = str(snapshot.get("last_error", ""))
+        self._stop_requested = bool(snapshot.get("stop_requested", False))
+        self.quota_exhausted = bool(snapshot.get("quota_exhausted", False))
+        self.quota_message = str(snapshot.get("quota_message", ""))
+        if previous_state != self.run_state:
+            self._safe_emit_run_state_event(previous_state, self.run_state)
+
+    def _active_staging_path(self):
+        if self._active_run_handle is not None:
+            return str(self._active_run_handle.staging_dir)
+        return str(self._run_context.get("staging_dir") or "staging")
+
+    @staticmethod
+    def _resolve_truth_audit_paths(context, run_id):
+        context = dict(context or {})
+        configured_root = str(context.get("run_root") or "").strip()
+        if configured_root:
+            run_root = Path(configured_root).resolve()
+        else:
+            configured_monitoring = str(context.get("monitoring_dir") or "").strip()
+            run_root = (
+                Path(configured_monitoring).resolve().parent
+                if configured_monitoring
+                else Path.cwd().resolve()
+            )
+        monitoring_dir = run_root / "monitoring"
+        safe_run_id = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "-",
+            str(run_id or "run"),
+        ).strip("-.") or "run"
+        artifact_dir = monitoring_dir / "quarantined" / safe_run_id
+        return TruthAuditPaths(
+            run_root=run_root,
+            monitoring_dir=monitoring_dir,
+            artifact_dir=artifact_dir,
+            report_path=artifact_dir / "email_truth_audit.json",
+            error_path=artifact_dir / "email_truth_audit_error.json",
+            index_path=artifact_dir / "truth_audit_index.json",
+            run_config_path=monitoring_dir / "run_config.json",
+        )
 
     def _monitoring_path(self, filename):
         run_context = self._refresh_run_context()
@@ -501,17 +981,18 @@ class InvoiceAppAPI:
             "extract_result_count",
             "url_result_count",
         }
-        return {key: value for key, value in summary.items() if key in allowed_keys}
+        allowed = {key: value for key, value in summary.items() if key in allowed_keys}
+        return sanitize_persistence_payload(allowed)
 
     def _packaged_diag_write(self, stage, function_name, outcome, summary=None, exc=None):
         if not self._packaged_diag_enabled:
             return
 
         exc_type = ""
-        exc_message = ""
+        exc_message_hash = ""
         if exc is not None:
             exc_type = getattr(getattr(exc, "__class__", None), "__name__", "") or type(exc).__name__
-            exc_message = str(exc)
+            exc_message_hash = stable_hash(str(exc))
 
         self._diag_append_jsonl(
             self._packaged_diag_file(),
@@ -525,10 +1006,10 @@ class InvoiceAppAPI:
                 "pid": os.getpid(),
                 "run_state": self.run_state,
                 "progress": self.progress,
-                "status_text": self.status_text,
+                "status_hash": stable_hash(self.status_text),
                 "summary": self._packaged_diag_summary(summary),
                 "exc_type": exc_type,
-                "exc_message": exc_message,
+                "exc_message_hash": exc_message_hash,
             },
         )
 
@@ -632,15 +1113,66 @@ class InvoiceAppAPI:
             "event": event,
             "run_state": self.run_state,
             "progress": self.progress,
-            "status_text": self.status_text,
+            "status_hash": stable_hash(self.status_text),
             **self._snapshot_counts(),
         }
         if extra:
-            payload.update(extra)
+            safe_extra = sanitize_persistence_payload(dict(extra))
+            handle = self._active_run_handle
+            if (
+                handle is not None
+                and handle.state is RunState.FAILED
+                and safe_extra.get("result") in {"completed", "stopped", "stopped_before_extract", "stopped_after_extract"}
+            ):
+                safe_extra["result"] = "failed"
+                safe_extra["reason"] = handle.error
+            payload.update(safe_extra)
         self._diag_append_jsonl(self._monitoring_path("stage_events.jsonl"), payload)
 
     def _safe_emit_artifact_event(self, kind, path, document_id=None, source_kind=None, reason_code=None, category=None, extra=None):
         if not self._run_context.get("enabled"):
+            return
+        if source_kind == "url":
+            payload = {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "artifact_id": stable_hash(
+                    {"kind": kind, "path": path, "document_id": document_id}
+                ),
+                "path_hash": stable_hash(path),
+                **self._snapshot_counts(),
+            }
+            payload.update(
+                sanitize_persistence_payload(
+                    {
+                        "kind": kind,
+                        "source_kind": source_kind,
+                        "reason_code": reason_code,
+                        "category": category,
+                    }
+                )
+            )
+            if document_id:
+                payload["document_hash"] = stable_hash(document_id)
+            if extra:
+                safe_extra = sanitize_persistence_payload(dict(extra))
+                payload.update(
+                    {
+                        key: value
+                        for key, value in safe_extra.items()
+                        if key in {
+                            "status",
+                            "type",
+                            "category",
+                            "provider",
+                            "provider_family",
+                            "reason_code",
+                        }
+                        or key.endswith(("_count", "_ms", "_seconds"))
+                    }
+                )
+            self._diag_append_jsonl(
+                self._monitoring_path("artifact_events.jsonl"), payload
+            )
             return
         payload = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -687,6 +1219,7 @@ class InvoiceAppAPI:
             "zip_context": info.get("zip_context"),
             "candidate_bucket": info.get("candidate_bucket"),
             "candidate_action": info.get("candidate_action"),
+            "candidate_index": info.get("candidate_index"),
             "source_kind": info.get("source_kind"),
             "prefilter_reason_code": info.get("prefilter_reason_code"),
             "prefilter_signals": info.get("prefilter_signals", {}),
@@ -706,7 +1239,11 @@ class InvoiceAppAPI:
         }
         if extra:
             payload.update(extra)
-        return {key: value for key, value in payload.items() if value is not None}
+        return self._sanitize_url_persistence_payload(payload)
+
+    @staticmethod
+    def _sanitize_url_persistence_payload(payload):
+        return sanitize_persistence_payload(dict(payload or {}))
 
     def _is_controlled_truth_run(self):
         if not self._run_context.get("enabled"):
@@ -769,14 +1306,54 @@ class InvoiceAppAPI:
         locked_to = self._run_context.get("locked_date_to", "") or date_to
         return locked_from, locked_to
 
-    def _safe_write_run_config(self, email_address, auth_code="", api_key=""):
+    def _safe_write_run_config(
+        self,
+        email_address,
+        auth_code="",
+        api_key="",
+        *,
+        request=None,
+    ):
         if not self._run_context.get("enabled"):
             return
+        lifecycle_run_id = str(
+            self._active_run_handle.run_id if self._active_run_handle is not None else ""
+        )
+        canonical_run_id = str(
+            lifecycle_run_id
+            or getattr(request, "run_id", "")
+            or self._current_run_id
+        )
+        paths = self._resolve_truth_audit_paths(self._run_context, canonical_run_id)
+        from run_evidence import RevisionUnavailable, default_hardware
+
+        hardware_mode, hardware_fingerprint = default_hardware()
+        before_exclusive = str(getattr(request, "before_exclusive", "") or "")
+        account_channel = str(getattr(request, "channel_id", "") or "")
+        mailbox = str(getattr(request, "mailbox", "") or "INBOX")
+        run_mode = str(getattr(request, "run_mode", "") or "controlled-run")
+        target_identifier = str(
+            getattr(request, "target_identifier", "")
+            or (self._active_run_config or {}).get("company")
+            or ""
+        )
+        candidate_version = str(
+            getattr(request, "candidate_version", "") or "source"
+        )
+        candidate_revision = str(
+            getattr(request, "trusted_revision", "") or ""
+        ).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", candidate_revision):
+            raise RevisionUnavailable()
         self._diag_write_json(
-            self._monitoring_path("run_config.json"),
+            str(paths.run_config_path),
             {
                 **serialize_run_context(self._run_context),
-                "run_id": self._current_run_id,
+                "run_id": canonical_run_id,
+                "staging_dir": self._active_staging_path(),
+                "monitoring_dir": str(paths.monitoring_dir),
+                "truth_audit_artifact_dir": str(paths.artifact_dir),
+                "truth_audit_index_path": str(paths.index_path),
                 "email_domain": self._packaged_diag_email_domain(email_address),
                 "has_auth_code": bool(auth_code),
                 "has_api_key": bool(api_key),
@@ -785,12 +1362,22 @@ class InvoiceAppAPI:
                 "date_from": self._effective_date_from,
                 "date_to": self._effective_date_to,
                 "active_run_config": dict(self._active_run_config or {}),
+                "before_exclusive": before_exclusive,
+                "account_channel": account_channel,
+                "mailbox": mailbox,
+                "target_company": target_identifier,
+                "run_mode": run_mode,
+                "hardware_mode": hardware_mode,
+                "hardware_fingerprint": hardware_fingerprint,
+                "candidate_revision": candidate_revision,
+                "candidate_version": candidate_version,
                 "controlled_run": True,
                 "stage_map": {
                     "start_processing": "active",
-                    "frontend_processing_worker": "active",
-                    "_run_processing_loop": "active",
-                    "_simulate_processing": "legacy_inactive_not_invoked",
+                    "run_coordinator": "active",
+                    "candidate_pipeline": "active",
+                    "extraction_pipeline": "active",
+                    "archive_service": "active",
                     "cleanup_finalize": "active",
                 },
             },
@@ -798,7 +1385,58 @@ class InvoiceAppAPI:
 
     def _start_truth_audit_async(self, email_address, auth_code):
         if not self._run_context.get("enabled") or not email_address or not auth_code:
+            self._truth_audit_thread = None
+            self._truth_audit_job = None
             return
+
+        context = dict(self._run_context)
+        run_id = str(
+            (self._active_run_handle.run_id if self._active_run_handle is not None else "")
+            or self._current_run_id
+            or context.get("run_id", "")
+            or uuid.uuid4().hex
+        )
+        paths = self._resolve_truth_audit_paths(context, run_id)
+        ready = threading.Event()
+        abandoned = threading.Event()
+        result = {}
+        date_from = self._effective_date_from
+        date_to = self._effective_date_to
+
+        def _write_evidence(source_path, payload, status, reason_code, user_message):
+            self._diag_write_json(str(source_path), payload)
+            index_payload = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "status": status,
+                "reason_code": reason_code,
+                "artifact_path": str(source_path),
+            }
+            self._diag_write_json(str(paths.index_path), index_payload)
+            valid = False
+            try:
+                persisted_index = json.loads(paths.index_path.read_text(encoding="utf-8"))
+                persisted_artifact = Path(persisted_index.get("artifact_path", "")).resolve()
+                persisted_artifact.relative_to(paths.artifact_dir.resolve())
+                valid = bool(
+                    persisted_index.get("run_id") == run_id
+                    and persisted_index.get("status") == status
+                    and persisted_index.get("reason_code") == reason_code
+                    and persisted_artifact == source_path.resolve()
+                    and persisted_artifact.exists()
+                )
+            except Exception:
+                valid = False
+            result.update(
+                {
+                    "valid": valid,
+                    "status": status,
+                    "reason_code": reason_code,
+                    "user_message": user_message,
+                    "source_path": source_path,
+                    "index_path": paths.index_path,
+                }
+            )
 
         def _runner():
             try:
@@ -808,30 +1446,128 @@ class InvoiceAppAPI:
                 report = collect_truth_table(
                     email_address,
                     auth_code,
-                    self._effective_date_from,
-                    self._effective_date_to,
+                    date_from,
+                    date_to,
                 )
-                self._diag_write_json(self._monitoring_path("email_truth_audit.json"), report)
+                if not isinstance(report, dict):
+                    raise ValueError("TRUTH_AUDIT_EVIDENCE_INVALID")
+                _write_evidence(
+                    paths.report_path,
+                    report,
+                    "success",
+                    "TRUTH_AUDIT_OK",
+                    "",
+                )
             except ModuleNotFoundError as exc:
-                self._diag_write_json(
-                    self._monitoring_path("email_truth_audit_error.json"),
+                _write_evidence(
+                    paths.error_path,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "skipped",
                         "reason": "AUDIT_EMAIL_TRUTH_MODULE_MISSING",
-                        "detail": str(exc),
+                        "error_type": type(exc).__name__,
+                        "error_hash": stable_hash(str(exc))[:12],
                     },
+                    "failed",
+                    "AUDIT_EMAIL_TRUTH_MODULE_MISSING",
+                    "真值审计模块不可用，请查看诊断报告。",
                 )
             except Exception as exc:
-                self._diag_write_json(
-                    self._monitoring_path("email_truth_audit_error.json"),
+                reason_code = (
+                    "TRUTH_AUDIT_EVIDENCE_INVALID"
+                    if str(exc) == "TRUTH_AUDIT_EVIDENCE_INVALID"
+                    else "TRUTH_AUDIT_FAILED"
+                )
+                user_message = (
+                    "真值审计证据无效，请查看诊断报告。"
+                    if reason_code == "TRUTH_AUDIT_EVIDENCE_INVALID"
+                    else "真值审计失败，请查看诊断报告。"
+                )
+                _write_evidence(
+                    paths.error_path,
                     {
                         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "error": str(exc),
+                        "reason": reason_code,
+                        "error_type": type(exc).__name__,
+                        "error_hash": stable_hash(str(exc))[:12],
                     },
+                    "failed",
+                    reason_code,
+                    user_message,
                 )
+            finally:
+                ready.set()
 
-        threading.Thread(target=_runner, daemon=True).start()
+        thread = threading.Thread(target=_runner, name="InvoiceFlowTruthAudit", daemon=True)
+        job = TruthAuditJob(
+            run_id=run_id,
+            paths=paths,
+            thread=thread,
+            ready=ready,
+            abandoned=abandoned,
+            result=result,
+        )
+        self._truth_audit_thread = thread
+        self._truth_audit_job = job
+        try:
+            thread.start()
+        except Exception:
+            abandoned.set()
+            self._truth_audit_thread = None
+            self._truth_audit_job = None
+            raise
+        return thread
+
+    def _await_truth_audit(self):
+        job = self._truth_audit_job
+        if job is None:
+            return
+        if job.thread is threading.current_thread():
+            raise RuntimeError("truth audit cannot join its own thread")
+        # The accepted strict audit takes about 5-12 seconds locally; 120 seconds
+        # leaves a conservative production margin while still bounding finalization.
+        deadline = time.monotonic() + self._truth_audit_timeout_seconds
+
+        def _expire_job():
+            job.abandoned.set()
+            self._truth_audit_thread = None
+            if self._truth_audit_job is job:
+                self._truth_audit_job = None
+            raise TruthAuditTimeout("TRUTH_AUDIT_TIMEOUT")
+
+        if not job.ready.wait(self._truth_audit_timeout_seconds):
+            _expire_job()
+
+        active_handle = self._active_run_handle
+        if (
+            job.abandoned.is_set()
+            or active_handle is None
+            or active_handle.run_id != job.run_id
+        ):
+            job.abandoned.set()
+            self._truth_audit_thread = None
+            if self._truth_audit_job is job:
+                self._truth_audit_job = None
+            raise TruthAuditEvidenceError(
+                "TRUTH_AUDIT_EVIDENCE_INVALID",
+                "真值审计证据无效，请查看诊断报告。",
+            )
+
+        if time.monotonic() > deadline:
+            _expire_job()
+        self._truth_audit_thread = None
+        if self._truth_audit_job is job:
+            self._truth_audit_job = None
+        if not job.result.get("valid"):
+            raise TruthAuditEvidenceError(
+                "TRUTH_AUDIT_EVIDENCE_INVALID",
+                "真值审计证据无效，请查看诊断报告。",
+            )
+        if job.result.get("status") != "success":
+            raise TruthAuditEvidenceError(
+                job.result.get("reason_code") or "TRUTH_AUDIT_FAILED",
+                job.result.get("user_message") or "真值审计失败，请查看诊断报告。",
+            )
 
     def _inspect_pdf_health(self, pdf_path):
         if not pdf_path or not str(pdf_path).lower().endswith(".pdf"):
@@ -985,42 +1721,17 @@ class InvoiceAppAPI:
         return ""
 
     def _looks_like_train_ticket(self, doc_type, seller, info_json, info, file_name, pdf_path=""):
-        compact_doc_type = self._compact_text(doc_type)
-        compact_seller = self._compact_text(seller)
-        compact_train = self._compact_text("\u706b\u8f66\u7968")
-        compact_rail = self._compact_text("\u94c1\u8def")
-        compact_bullet = self._compact_text("\u9ad8\u94c1")
-        compact_ticket = self._compact_text("\u94c1\u8def\u7535\u5b50\u5ba2\u7968")
-        compact_rail_seller = self._compact_text("\u4e2d\u56fd\u94c1\u8def")
+        from document_types import looks_like_train_ticket
 
-        if any(token in compact_doc_type for token in (compact_train, compact_rail, compact_bullet)):
-            return True
-        if compact_rail_seller in compact_seller:
-            return True
-
-        departure_city = str((info_json or {}).get("Departure_City", "") or "").strip()
-        destination_city = str((info_json or {}).get("Destination_City", "") or "").strip()
-        context_parts = [
-            str(file_name or ""),
-            str((info or {}).get("subject", "") or ""),
-            str((info or {}).get("attachment_name", "") or ""),
-            str((info or {}).get("original_filename", "") or ""),
-        ]
-        compact_context = self._compact_text(" ".join(part for part in context_parts if part))
-        if departure_city and destination_city and any(
-            token in compact_context for token in (compact_ticket, compact_train, compact_rail, compact_bullet, "12306")
-        ):
-            return True
-
-        if not departure_city or not destination_city:
-            return False
-        if compact_doc_type not in {self._compact_text("\u673a\u7968"), self._compact_text("\u822a\u73ed\u884c\u7a0b\u5355")}:
-            return False
-
-        preview_text = self._extract_pdf_preview_text(pdf_path, max_pages=1)
-        compact_preview = self._compact_text(preview_text)
-        return any(
-            token in compact_preview for token in (compact_ticket, compact_train, compact_rail, compact_bullet, "12306")
+        return looks_like_train_ticket(
+            doc_type,
+            seller,
+            info_json,
+            info,
+            file_name,
+            preview_loader=lambda: self._extract_pdf_preview_text(
+                pdf_path, max_pages=1
+            ),
         )
 
     def _provider_fields_match(self, expected_fields, normalized_snapshot, info_json, recovered_fields=None):
@@ -1163,7 +1874,31 @@ class InvoiceAppAPI:
             self.last_error = last_error
         self._safe_emit_run_state_event(previous_state, run_state)
 
+    def _sync_run_state_store_from_legacy(self):
+        self._run_state_store.update(
+            progress=self.progress,
+            status_text=self.status_text,
+            run_state=self.run_state,
+            last_error=self.last_error,
+            stop_requested=self._stop_requested,
+            quota_exhausted=self.quota_exhausted,
+            quota_message=self.quota_message,
+            statistics=self.stats,
+            processed_invoices=self.processed_invoices,
+            error_invoices=self.error_invoices,
+            categories=self.discovered_categories,
+            logs=self.logs,
+        )
+
     def _begin_run(self, status_text):
+        handle = self._active_run_handle
+        if handle is not None and handle.state in {RunState.COMPLETED, RunState.FAILED}:
+            self._active_run_handle = None
+            handle = None
+        if handle is None:
+            handle = self._prepare_run_lifecycle()
+        if handle.state is RunState.CREATED:
+            handle.advance(RunState.SCANNING)
         self.progress = 0
         self.logs = []
         self._stop_requested = False
@@ -1194,6 +1929,22 @@ class InvoiceAppAPI:
             "msg": message,
         })
 
+    @staticmethod
+    def _url_candidate_label(info):
+        info = info or {}
+        identity = {
+            "source_url": info.get("source_url") or info.get("filepath") or "",
+            "email_id": info.get("email_id") or info.get("source_email_id") or "",
+            "provider_family": info.get("provider_family") or "",
+        }
+        return f"URL-candidate-{stable_hash(identity)[:12]}"
+
+    def _sanitize_url_candidate_logs(self, start_index, info):
+        label = self._url_candidate_label(info)
+        for entry in self.logs[max(0, int(start_index or 0)):]:
+            if isinstance(entry, dict):
+                entry["msg"] = f"URL candidate processing event [{label}]"
+
     def _on_email_fetcher_progress(self, message):
         message = str(message or "").strip()
         if not message:
@@ -1221,6 +1972,7 @@ class InvoiceAppAPI:
         self._stop_requested = True
         self.status_text = message
         self._append_log("停止", message, "text-amber-600")
+        self._sync_run_state_store_from_legacy()
 
     def _resolve_quota_message(self, error_text):
         normalized = str(error_text or "").lower()
@@ -1247,52 +1999,53 @@ class InvoiceAppAPI:
         self.status_text = self.quota_message
         self._append_log("额度", self.quota_message, "text-rose-600")
 
+    @staticmethod
+    def _safe_failure_contract(status_text, error_message):
+        status = str(status_text or "")
+        error = str(error_message or "")
+        normalized = f"{status} {error}".upper()
+        if "MISSING_REQUIRED_CREDENTIALS" in normalized:
+            return "MISSING_REQUIRED_CREDENTIALS", "缺少必要凭证，请填写邮箱、授权码和 API Key。"
+        if "IMAP_LOGIN_FAILED" in normalized or "邮箱登录失败" in status:
+            return "IMAP_LOGIN_FAILED", "邮箱登录失败，请检查授权码和 IMAP 设置。"
+        if "QUOTA_EXHAUSTED" in normalized or "额度" in status:
+            return "QUOTA_EXHAUSTED", "GLM API 额度已耗尽，请充值或更换可用的 API Key。"
+        if "UNRESOLVED_MAILBOX_INPUT" in normalized:
+            return "UNRESOLVED_MAILBOX_INPUT", "部分邮件在重试后仍无法读取，本次任务已失败；已读取产物保留供诊断。"
+        if "MAILBOX_SCAN_FAILED" in normalized:
+            return "MAILBOX_SCAN_FAILED", "邮箱扫描响应异常，本次任务已失败；请重试并查看诊断报告。"
+        if "WORKER_START_FAILED" in normalized or "启动失败" in status:
+            return "WORKER_START_FAILED", "后台任务启动失败，请重试。"
+        return "PROCESSING_FAILED", "处理过程中发生异常，请重试；如持续失败请查看诊断报告。"
+
     def _finish_run(self, success, status_text, last_error=""):
-        if success:
+        handle = self._active_run_handle or self._prepare_run_lifecycle()
+        if handle.state not in {RunState.COMPLETED, RunState.FAILED}:
+            if not success:
+                reason_code, user_message = self._safe_failure_contract(status_text, last_error)
+                handle.fail(
+                    RuntimeError(last_error or status_text or reason_code),
+                    reason_code=reason_code,
+                    user_message=user_message,
+                )
+            self._mark_finalizing()
+            self._start_async_finalizers()
+
+        if self._terminal_frontend_run_id == handle.run_id:
+            return
+        self._terminal_frontend_run_id = handle.run_id
+        effective_success = bool(success and handle.state is RunState.COMPLETED)
+        if effective_success:
             self._set_run_state("completed", status_text=status_text, progress=100, last_error="")
         else:
+            if success:
+                self.logs[:] = [entry for entry in self.logs if entry.get("type") != "完成"]
             failed_progress = self.progress if self.progress and self.progress < 100 else 99
-            self._set_run_state("failed", status_text=status_text, progress=failed_progress, last_error=last_error)
+            lifecycle_error = handle.error or last_error
+            failed_status = status_text if not success else "处理失败"
+            self._set_run_state("failed", status_text=failed_status, progress=failed_progress, last_error=lifecycle_error)
         self._worker_thread = None
 
-    def _legacy_start_async_finalizers_pre_release_prep(self, fetcher=None):
-        def _runner():
-            self._mark_finalizing()
-            self._cleanup_temp_folders()
-            if fetcher is not None:
-                try:
-                    fetcher.disconnect()
-                except Exception as exc:
-                    self.logs.append({
-                        "time": time.strftime("[%H:%M:%S]"),
-                        "type": "ERROR",
-                        "color": "text-error",
-                        "msg": f"Failed to disconnect mailbox cleanly: {exc}",
-                    })
-
-        cleanup_thread = threading.Thread(target=_runner, daemon=True)
-        cleanup_thread.start()
-        return cleanup_thread
-
-    def _legacy_mark_finalizing_pre_release_prep(self):
-        finalizing_progress = self.progress if self.progress >= 95 else 99
-        self._set_run_state("finalizing", status_text="正在完成收尾...", progress=finalizing_progress)
-
-    def _legacy_fail_run_pre_release_prep(self, status_text, error_message, fetcher=None, include_traceback=False):
-        if fetcher is not None:
-            self._start_async_finalizers(fetcher)
-
-        if include_traceback:
-            self._fail_run("澶勭悊寮傚父", error_msg, fetcher=fetcher, include_traceback=True)
-            error_message = f"{error_message} | {traceback.format_exc()}"
-
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "ERROR",
-            "color": "text-error",
-            "msg": f"系统发生异常: {error_message}",
-        })
-        self._finish_run(False, status_text, last_error=error_message)
 
     def _auto_start_local_scan(self):
         self.logs.append({
@@ -1362,10 +2115,17 @@ class InvoiceAppAPI:
         return self._read_json_file(self._run_state_file_path(output_state_dir), {})
 
     def _load_committed_history(self, output_state_dir):
-        # P0 stop-loss: by default do not inherit cross-run history.
-        # We only de-duplicate within the current run unless an explicit
-        # cross-run mode is introduced later.
-        return set()
+        run_state = self._load_output_run_state(output_state_dir)
+        if str(run_state.get("status") or "").strip().lower() != "completed":
+            return set()
+        history = self._read_json_file(self._history_file_path(output_state_dir), [])
+        if not isinstance(history, list):
+            return set()
+        return {
+            str(item).strip()
+            for item in history
+            if isinstance(item, str) and str(item).strip()
+        }
 
     def _commit_output_state(self, output_state_dir, history_keys, business_records):
         committed_history = sorted({str(item).strip() for item in (history_keys or set()) if str(item).strip()})
@@ -1409,6 +2169,8 @@ class InvoiceAppAPI:
             "date_to": "",
             "quick_range": "last_30_days",
             "company": "",
+            "glm_profile_limits": copy.deepcopy(DEFAULT_GLM_PROFILE_LIMITS),
+            "glm_model_candidates": copy.deepcopy(DEFAULT_GLM_MODEL_CANDIDATES),
             "remember_settings": True,
         }
 
@@ -1461,11 +2223,6 @@ class InvoiceAppAPI:
             },
         )
         
-        try:
-            import requests
-        except ImportError:
-            return {"success": False, "message": "连接失败 - 后端缺少 requests 依赖库"}
-            
         # 邮箱连接测试（仅在填写授权码时执行）
         if auth_code:
             try:
@@ -1480,47 +2237,43 @@ class InvoiceAppAPI:
         
         if len(api_key) <= 5:
             return {"success": False, "message": "连接失败 - API Key 格式不正确"}
-            
+
+        runtime = None
         try:
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-            # 构造一个最低成本的试探性请求（智谱 GLM API）
             payload = {
-                "model": "glm-4-flash",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "max_tokens": 5
             }
-            response = requests.post(
-                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=15
+            runtime = GlmRuntime(api_key, settings=self._settings_store.load() or {})
+            runtime.request(
+                "text",
+                payload,
+                lambda body: body["choices"][0]["message"]["content"],
+                attempts=1,
+                timeout_seconds=15,
             )
-            
-            if response.status_code == 200:
-                return {"success": True, "message": "连接成功 - 智谱 GLM 服务已就绪"}
-            elif response.status_code == 401:
+            return {"success": True, "message": "连接成功 - 智谱 GLM 服务已就绪"}
+        except GlmRequestError as exc:
+            if exc.http_status == 401:
                 return {"success": False, "message": "连接失败 - API Key 鉴权未通过或无效"}
-            elif response.status_code == 402:
+            if exc.http_status == 402:
                 return {"success": False, "message": "连接失败 - GLM API 额度已耗尽，请充值或更换 API Key"}
-            elif response.status_code == 429:
+            if exc.http_status == 429 or exc.business_code == 1302 or exc.reason == "rate_limited":
                 return {"success": False, "message": "连接失败 - 触发限流，请求并发过高"}
-            else:
-                err_text = response.text
-                quota_message = self._resolve_quota_message(f"{response.status_code} {err_text}")
-                if quota_message:
-                    return {"success": False, "message": f"连接失败 - {quota_message}"}
-                print(f"GLM API Error HTTP {response.status_code}: {err_text}")
-                return {"success": False, "message": f"连接异常 - 状态码: {response.status_code} - {err_text[:80]}"}
-                
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "API连接失败 - 请求超时，请检查您的网络连接"}
-        except requests.exceptions.ConnectionError:
-            return {"success": False, "message": "API连接失败 - 无法连接到智谱 API 服务器"}
-        except Exception as e:
-            return {"success": False, "message": f"网络或API未知异常: {str(e)[:80]}"}
+            if exc.reason == "timeout":
+                return {"success": False, "message": "API连接失败 - 请求超时，请检查您的网络连接"}
+            if exc.reason == "connection_error":
+                return {"success": False, "message": "API连接失败 - 无法连接到智谱 API 服务器"}
+            if exc.http_status is not None:
+                return {"success": False, "message": f"连接异常 - 状态码: {exc.http_status}"}
+            return {"success": False, "message": "网络或API未知异常: GLM 请求失败"}
+        except Exception:
+            return {"success": False, "message": "网络或API未知异常: GLM 请求失败"}
+        finally:
+            if runtime is not None:
+                close_runtime = getattr(runtime, "close", None)
+                if callable(close_runtime):
+                    close_runtime()
 
     def test_email_auth(self, email_address, auth_code):
         if not email_address or not auth_code:
@@ -1532,2561 +2285,479 @@ class InvoiceAppAPI:
             mail.login(email_address, auth_code)
             mail.logout()
             return {"success": True, "message": "邮箱授权验证成功"}
-        except Exception as e:
-            return {"success": False, "message": f"验证失败，错误详情: {str(e)}"}
+        except Exception:
+            return {"success": False, "message": "邮箱授权验证失败，请检查授权码、IMAP 设置或网络"}
 
-    def _simulate_processing(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        """后台线程: 连接邮箱抓取发票，执行 AI 处理与归档分类"""
-        import os
+
+
+    def _processing_worker(self, request, run_handle, dependencies):
+        try:
+            if run_handle is None or run_handle is not self._active_run_handle:
+                raise RuntimeError("reserved run handle ownership is required")
+            if request.run_id != run_handle.run_id:
+                raise RuntimeError("run request does not match reserved handle")
+            coordinator = RunCoordinator(
+                self._run_lifecycle,
+                self._run_state_store,
+                dependencies,
+            )
+            return coordinator.run(request, handle=run_handle)
+        except Exception as exc:
+            self._close_run_dependencies(dependencies)
+            self._packaged_diag_write(
+                "coordinator_worker_exception",
+                "_processing_worker",
+                "exception",
+                exc=exc,
+            )
+            if run_handle is not None and run_handle.state in {RunState.COMPLETED, RunState.FAILED}:
+                return None
+            if run_handle is not None:
+                self._finalize_admission_failure(
+                    run_handle,
+                    exc,
+                    reason_code="COORDINATOR_START_FAILED",
+                )
+            return None
+        finally:
+            current = threading.current_thread()
+            with self._admission_lock:
+                if self._worker_thread is current:
+                    self._worker_thread = None
+
+    def _build_run_dependencies(
+        self,
+        request,
+        *,
+        email_address,
+        auth_code,
+        api_key,
+    ):
+        from datetime import datetime, timedelta
+        import inspect
+
         from email_fetcher import EmailFetcher
         from invoice_extractor import InvoiceExtractor
-        
-        fetcher = None
-        self._begin_run("鍒濆鍖栧鐞嗗紩鎿?..")
-        
-        self.status_text = "初始化处理引擎..."
-        range_msg = f"扫描时间: {date_from} 到 {date_to}" if date_from and date_to else "扫描时间: 默认近 30 天"
-        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "信息:", "color": "text-blue-400", "msg": f"后端收到配置，正在初始化连接... ({range_msg})"})
-        
-        if not email_address or not auth_code or not api_key:
-            self.status_text = "启动失败"
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": "未提供完整凭证(邮箱、授权码、或 API Key)，请返回设置。"})
-            self._finish_run(False, "鍚姩澶辫触", last_error="MISSING_REQUIRED_CREDENTIALS")
-            return
-            
-        try:
-            # 1. 连接邮箱
-            self.status_text = "正在连接邮箱服务..."
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": f"正在登录邮箱 {email_address}..."})
-            
-            # 通过邮箱通道注册表选择 IMAP 服务器
-            channel = resolve_channel(email_address)
-            fetcher = EmailFetcher(email_address, auth_code, imap_server=channel["imap_host"], staging_dir="staging")
-            if not fetcher.connect():
-                self.status_text = "登录失败"
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": "邮箱 IMAP 登录失败，请检查授权码或网络。"})
-                self._finish_run(False, "鐧诲綍澶辫触", last_error="IMAP_LOGIN_FAILED")
-                return
-                
-            # 2. 搜索邮件
-            self.progress = 10
-            self.status_text = "正在扫描邮件..."
-            
-            from datetime import datetime, timedelta
-            # 处理时间范围
-            since_date = date_from if date_from else (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            
-            # IMAP 的 BEFORE 是非包含边界的。为了包含 date_to 当天，必须加一天 (exclusive boundary)
-            if date_to:
-                dt_to = datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
-                before_date = dt_to.strftime("%Y-%m-%d")
-            else:
-                before_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-            
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": f"开始检索 {since_date} 至 {before_date} 的邮件..."})
-            
-            email_fetch_started_at = time.perf_counter()
-            email_ids = fetcher.fetch_emails_by_date(since_date=since_date, before_date=before_date)
-            self._record_timing_metric("email_fetch", time.perf_counter() - email_fetch_started_at)
-            total_emails = len(email_ids)
-            self.stats["emails"] = total_emails
-            
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "成功:", "color": "text-emerald-400", "msg": f"共找到 {total_emails} 封邮件符合时间范围。"})
-            
-            if total_emails == 0:
-                self._mark_finalizing()
-                self.status_text = "扫描完成，无邮件"
-                fetcher.disconnect()
-                self._finish_run(True, "鎵弿瀹屾垚锛屾棤閭欢")
-                self._is_running = False
-                return
-            
-            # 3. 提取附件并保存到 staging
-            self.progress = 30
-            self.status_text = "正在下载发票附件..."
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "运行:", "color": "text-blue-400", "msg": "开始提取邮件附件及正文发票链接..."})
-            
-            attachment_extract_started_at = time.perf_counter()
-            attachments_info = fetcher.extract_attachments(email_ids)
-            self._record_timing_metric("attachment_extract", time.perf_counter() - attachment_extract_started_at)
-            total_attachments = len(attachments_info)
-            
-            # 4. 初始化核心处理逻辑并执行
-            self._run_processing_loop(attachments_info, api_key, save_path, since_date, before_date)
-            
-            # 在处理结束前执行清理
-            self._cleanup_temp_folders()
-            self._start_async_finalizers(fetcher)
-            self._finish_run(True, "鎵瑰鐞嗗凡瀹屾垚")
-            self.status_text = "批处理已完成"
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "完成:", "color": "text-emerald-400", "msg": f"扫描完成。总处理附件: {total_attachments}。"})
-            self._is_running = False
+        from run_evidence import RunEvidenceWriter
 
-        except Exception as e:
-            error_msg = str(e) or "未知错误"
-            import traceback
-            full_traceback = traceback.format_exc()
-            self.status_text = "处理异常"
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "ERROR", "color": "text-error", "msg": f"系统发生异常: {error_msg} | {full_traceback}"})
-            traceback.print_exc()
-            self.progress = 99
-            self._is_running = False
+        resources = {"fetcher": None, "pipeline": None}
 
-    def _legacy_processing_worker_pre_release_prep(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        '''
-        from email_fetcher import EmailFetcher
+        account_label = f"{request.channel_id}:{request.account_id}"
 
-        fetcher = None
-        self._begin_run("鍒濆鍖栧鐞嗗紩鎿?..")
-        range_msg = f"鎵弿鏃堕棿: {date_from} 鍒?{date_to}" if date_from and date_to else "鎵弿鏃堕棿: 榛樿杩?30 澶?
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "淇℃伅:",
-            "color": "text-blue-400",
-            "msg": f"鍚庣鏀跺埌閰嶇疆锛屾鍦ㄥ垵濮嬪寲杩炴帴... ({range_msg})",
-        })
+        def sanitize_runtime_message(message):
+            text = str(message or "")
+            replacements = {
+                str(email_address or ""): account_label,
+                str(auth_code or ""): "[redacted-auth]",
+                str(api_key or ""): "[redacted-api-key]",
+            }
+            for sensitive, replacement in replacements.items():
+                if sensitive:
+                    text = re.sub(re.escape(sensitive), replacement, text, flags=re.IGNORECASE)
+            return text
 
-        if not email_address or not auth_code or not api_key:
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "閿欒:",
-                "color": "text-red-400",
-                "msg": "鏈彁渚涘畬鏁村嚟璇?閭銆佹巿鏉冪爜銆佹垨 API Key)锛岃杩斿洖璁剧疆銆?",
-            })
-            self._finish_run(False, "鍚姩澶辫触", last_error="MISSING_REQUIRED_CREDENTIALS")
-            return
-
-        try:
-            self._set_run_state("running", status_text="姝ｅ湪杩炴帴閭鏈嶅姟...")
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "杩愯:",
-                "color": "text-blue-400",
-                "msg": f"姝ｅ湪鐧诲綍閭 {email_address}...",
-            })
-
-            channel = resolve_channel(email_address)
-            fetcher = EmailFetcher(email_address, auth_code, imap_server=channel["imap_host"], staging_dir="staging")
-            if not fetcher.connect():
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "閿欒:",
-                    "color": "text-red-400",
-                    "msg": "閭 IMAP 鐧诲綍澶辫触锛岃妫€鏌ユ巿鏉冪爜鎴栫綉缁溿€?",
-                })
-                self._finish_run(False, "鐧诲綍澶辫触", last_error="IMAP_LOGIN_FAILED")
-                return
-
-            self.progress = 10
-            self.status_text = "姝ｅ湪鎵弿閭欢..."
-
-            from datetime import datetime, timedelta
-            since_date = date_from if date_from else (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            if date_to:
-                dt_to = datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
-                before_date = dt_to.strftime("%Y-%m-%d")
-            else:
-                before_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "杩愯:",
-                "color": "text-blue-400",
-                "msg": f"寮€濮嬫绱?{since_date} 鑷?{before_date} 鐨勯偖浠?..",
-            })
-
-            email_ids = fetcher.fetch_emails_by_date(since_date=since_date, before_date=before_date)
-            total_emails = len(email_ids)
-            self.stats["emails"] = total_emails
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "鎴愬姛:",
-                "color": "text-emerald-400",
-                "msg": f"鍏辨壘鍒?{total_emails} 灏侀偖浠剁鍚堟椂闂磋寖鍥淬€?",
-            })
-
-            if total_emails == 0:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self._finish_run(True, "鎵弿瀹屾垚锛屾棤閭欢")
-                return
-
-            self.progress = 30
-            self.status_text = "姝ｅ湪涓嬭浇鍙戠エ闄勪欢..."
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "杩愯:",
-                "color": "text-blue-400",
-                "msg": "寮€濮嬫彁鍙栭偖浠堕檮浠跺強姝ｆ枃鍙戠エ閾炬帴...",
-            })
-
-            attachments_info = fetcher.extract_attachments(email_ids)
-            total_attachments = len(attachments_info)
-            self._run_processing_loop(attachments_info, api_key, save_path, since_date, before_date)
-
-            self._mark_finalizing()
-            self._start_async_finalizers(fetcher)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "瀹屾垚:",
-                "color": "text-emerald-400",
-                "msg": f"鎵弿瀹屾垚銆傛€诲鐞嗛檮浠? {total_attachments}銆?",
-            })
-            self._finish_run(True, "鎵瑰鐞嗗凡瀹屾垚")
-
-        except Exception as e:
-            error_msg = str(e) or "鏈煡閿欒"
-            self._fail_run("澶勭悊寮傚父", error_msg, fetcher=fetcher, include_traceback=True)
-
-        '''
-
-    def _processing_worker(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        self._packaged_diag_write(
-            "worker_enter",
-            "_processing_worker",
-            "success",
-            summary={
-                "effective_save_path": save_path,
-                "date_from": date_from,
-                "date_to": date_to,
-                "email_domain": self._packaged_diag_email_domain(email_address),
-                "has_auth_code": bool(auth_code),
-                "has_api_key": bool(api_key),
-            },
-        )
-        from datetime import datetime, timedelta
-        from email_fetcher import EmailFetcher
-        self._packaged_diag_write("worker_imports_ready", "_processing_worker", "success")
-
-        fetcher = None
-        self._begin_run("正在初始化任务...")
-        self._packaged_diag_write("worker_begin_run_done", "_processing_worker", "success")
-        self._safe_emit_stage_event(
-            "frontend_processing_worker",
-            "enter",
-            {
-                "requested_save_path": self._requested_save_path,
-                "effective_save_path": save_path,
-                "date_from": date_from,
-                "date_to": date_to,
-                **self._sensitive_summary(email_address, auth_code, api_key),
-            },
-        )
-        range_msg = f"扫描范围: {date_from} -> {date_to}" if date_from and date_to else "扫描范围: 默认最近 30 天"
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "信息",
-            "color": "text-blue-400",
-            "msg": f"后端已接收请求，正在准备邮箱会话（{range_msg}）。",
-        })
-
-        if not email_address or not auth_code or not api_key:
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "错误",
-                "color": "text-red-400",
-                "msg": "缺少必要凭证：邮箱、授权码或 API Key。",
-            })
-            self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": "missing_credentials"})
-            self._finish_run(False, "启动失败", last_error="MISSING_REQUIRED_CREDENTIALS")
-            return
-
-        try:
-            self._packaged_diag_write(
-                "before_progress_gt_5",
-                "_processing_worker",
-                "success",
-                summary={"target_progress": 10},
-            )
-            self._set_run_state("running", status_text="正在连接邮箱...", progress=10)
-            self._packaged_diag_write("after_progress_10", "_processing_worker", "success")
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": f"正在连接邮箱 {email_address}...",
-            })
-
+        def connect(_request):
             channel = resolve_channel(email_address)
             fetcher = EmailFetcher(
                 email_address,
                 auth_code,
                 imap_server=channel["imap_host"],
-                staging_dir=self._run_context.get("staging_dir") or "staging",
+                staging_dir=self._active_staging_path(),
                 monitoring_dir=self._run_context.get("monitoring_dir"),
-                progress_callback=self._on_email_fetcher_progress,
+                progress_callback=lambda message: self._on_email_fetcher_progress(
+                    sanitize_runtime_message(message)
+                ),
             )
-            self._packaged_diag_write("network_connect_before", "_processing_worker", "success")
-            connect_result = fetcher.connect()
-            self._packaged_diag_write(
-                "network_connect_after",
-                "_processing_worker",
-                "success" if connect_result else "failure",
-                summary={"connect_result": bool(connect_result)},
+            resources["fetcher"] = fetcher
+            self._append_log(
+                "运行",
+                f"正在连接邮箱通道 {request.channel_id}（账户 {request.account_id}）...",
+                "text-blue-400",
             )
-            if not connect_result:
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "错误",
-                    "color": "text-red-400",
-                    "msg": "邮箱登录失败，请检查授权码和 IMAP 设置。",
-                })
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": "imap_login_failed"})
-                self._finish_run(False, "邮箱登录失败", last_error="IMAP_LOGIN_FAILED")
-                return
+            if not fetcher.connect():
+                raise ImapLoginError("IMAP_LOGIN_FAILED")
+            return fetcher
 
-            self._set_run_state("running", status_text="正在扫描邮件...", progress=20)
-            since_date = date_from if date_from else (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-            if date_to:
-                before_date = (datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            else:
-                before_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-
-            self._raw_date_range_display = f"{since_date} -> {date_to or since_date}"
+        def scan(fetcher, _request):
+            since_date = request.date_from or (
+                datetime.now() - timedelta(days=30)
+            ).strftime("%Y-%m-%d")
+            before_date = (
+                datetime.strptime(request.date_to, "%Y-%m-%d") + timedelta(days=1)
+            ).strftime("%Y-%m-%d") if request.date_to else (
+                datetime.now() + timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+            self._raw_date_range_display = f"{since_date} -> {request.date_to or since_date}"
             self._imap_query_range_display = f"SINCE {since_date} / BEFORE {before_date}"
-
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": f"原始用户范围：{self._raw_date_range_display}",
-            })
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": f"实际 IMAP 查询：{self._imap_query_range_display}",
-            })
-
-            self._packaged_diag_write("network_scan_before", "_processing_worker", "success")
-            email_ids = fetcher.fetch_emails_by_date(since_date=since_date, before_date=before_date)
-            self._packaged_diag_write(
-                "network_scan_after",
-                "_processing_worker",
-                "success",
-                summary={"scan_result_count": len(email_ids)},
+            self._coordinator_since_date = since_date
+            self._coordinator_before_date = before_date
+            self._append_log("运行", f"原始用户范围：{self._raw_date_range_display}", "text-blue-400")
+            self._append_log("运行", f"实际 IMAP 查询：{self._imap_query_range_display}", "text-blue-400")
+            email_ids = fetcher.fetch_emails_by_date(
+                since_date=since_date,
+                before_date=before_date,
             )
-            total_emails = len(email_ids)
-            self.stats["emails"] = total_emails
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "信息",
-                "color": "text-emerald-400",
-                "msg": f"共匹配到 {total_emails} 封邮件。",
-            })
-
+            self.stats["emails"] = len(email_ids)
+            self._append_log("信息", f"共匹配到 {len(email_ids)} 封邮件。", "text-emerald-400")
             if self._stop_requested:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "stopped_before_extract", "emails": total_emails})
-                self._finish_run(True, "已安全停止")
-                return
+                self._sync_run_state_store_from_legacy()
+            return email_ids
 
-            if total_emails == 0:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "完成",
-                    "color": "text-emerald-400",
-                    "msg": "未找到符合条件的邮件，任务已结束。",
-                })
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "completed", "emails": total_emails, "attachments": 0})
-                self._finish_run(True, "处理完成")
-                return
+        def candidate(fetcher_email_ids, _request):
+            fetcher = resources["fetcher"]
+            self._append_log("运行", "正在下载并提取附件...", "text-blue-400")
+            attachments = fetcher.extract_attachments(fetcher_email_ids)
+            self._append_log("信息", f"共提取到 {len(attachments)} 个附件。", "text-emerald-400")
+            return attachments
 
-            self._set_run_state("running", status_text="正在提取附件...", progress=30)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "运行",
-                "color": "text-blue-400",
-                "msg": "正在下载并提取附件...",
-            })
-
-            self._packaged_diag_write("extract_attachments_before", "_processing_worker", "success")
-            attachments_info = fetcher.extract_attachments(email_ids)
-            self._packaged_diag_write(
-                "extract_attachments_after",
-                "_processing_worker",
-                "success",
-                summary={"extract_result_count": len(attachments_info)},
+        def extract(attachments, _request):
+            compatibility_hook = self.__dict__.get("_run_processing_loop")
+            if callable(compatibility_hook):
+                resources["compatibility_report"] = compatibility_hook(
+                    attachments,
+                    api_key,
+                    request.save_path,
+                    getattr(self, "_coordinator_since_date", request.date_from),
+                    getattr(self, "_coordinator_before_date", request.date_to),
+                    request.rules_text,
+                )
+                self._sync_run_state_store_from_legacy()
+                return [resources["compatibility_report"]]
+            extractor_parameters = inspect.signature(InvoiceExtractor).parameters.values()
+            supports_glm_settings = any(
+                parameter.name == "glm_settings"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in extractor_parameters
             )
-            total_attachments = len(attachments_info)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "信息",
-                "color": "text-emerald-400",
-                "msg": f"共提取到 {total_attachments} 个附件。",
-            })
+            extractor_kwargs = {"api_key": api_key, "output_dir": request.save_path}
+            if supports_glm_settings:
+                extractor_kwargs["glm_settings"] = self._settings_store.load() or {}
+            extractor = InvoiceExtractor(**extractor_kwargs)
+            pipeline = self._create_processing_pipeline_session(
+                attachments,
+                api_key,
+                request.save_path,
+                getattr(self, "_coordinator_since_date", request.date_from),
+                getattr(self, "_coordinator_before_date", request.date_to),
+                request.rules_text,
+                _extractor=extractor,
+                _owned_extractor=extractor,
+            )
+            resources["pipeline"] = pipeline
+            return pipeline.extract()
 
-            if self._stop_requested:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "stopped_after_extract", "emails": total_emails, "attachments": total_attachments})
-                self._finish_run(True, "已安全停止")
-                return
-
-            self._run_processing_loop(attachments_info, api_key, save_path, since_date, before_date, rules_text)
-
+        def archive(outcomes, _request):
+            if "compatibility_report" in resources:
+                if self.quota_exhausted:
+                    raise QuotaExhaustedError(self.quota_message or "QUOTA_EXHAUSTED")
+                report = resources["compatibility_report"]
+                if report is None:
+                    report = type(
+                        "CompatibilityArchiveReport",
+                        (),
+                        {"can_complete": True, "archived_count": 0},
+                    )()
+                return report
+            pipeline = resources["pipeline"]
+            try:
+                report = pipeline.archive(outcomes)
+            except ProcessingLoopFailure:
+                statuses = {str(getattr(outcome, "status", "")) for outcome in outcomes}
+                if "quota_exhausted" in statuses or self.quota_exhausted:
+                    raise QuotaExhaustedError("QUOTA_EXHAUSTED") from None
+                if "auth_failed" in statuses:
+                    raise RemoteAuthError("REMOTE_AUTH_FAILED") from None
+                raise
             if self.quota_exhausted:
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": self.quota_message or "QUOTA_EXHAUSTED"})
-                self._fail_run("GLM API 额度不足", self.quota_message or "GLM API 额度已耗尽，请充值或更换可用的 API Key。", fetcher=fetcher)
-                return
+                raise QuotaExhaustedError(self.quota_message or "QUOTA_EXHAUSTED")
+            self._cwt_cancellation_matching(request.save_path)
+            self._sync_run_state_store_from_legacy()
+            return report
 
-            if self._stop_requested:
-                self._mark_finalizing()
-                self._start_async_finalizers(fetcher)
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "完成",
-                    "color": "text-amber-600",
-                    "msg": "已完成安全停止，已处理结果已保留。",
-                })
-                self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "stopped", "emails": total_emails, "attachments": total_attachments})
-                self._finish_run(True, "已安全停止")
-                return
+        def report_callback(_context, _result):
+            self._await_truth_audit()
 
-            # CWT 取消撮合后处理: 找到匹配的预订确认单，移入 Manual_Check
-            self._cwt_cancellation_matching(save_path)
+        def pipeline_close():
+            try:
+                pipeline = resources.get("pipeline")
+                if pipeline is not None:
+                    pipeline.close()
+            finally:
+                self._sync_run_state_store_from_legacy()
 
-            self._mark_finalizing()
-            self._start_async_finalizers(fetcher)
-            self.logs.append({
-                "time": time.strftime("[%H:%M:%S]"),
-                "type": "完成",
-                "color": "text-emerald-400",
-                "msg": f"处理循环已完成，共处理 {total_attachments} 个附件。",
-            })
-            self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "completed", "emails": total_emails, "attachments": total_attachments})
-            self._finish_run(True, "处理完成")
-        except Exception as exc:
-            self._packaged_diag_write("worker_exception", "_processing_worker", "exception", exc=exc)
-            self._safe_emit_stage_event("frontend_processing_worker", "exit", {"result": "failed", "reason": str(exc) or "UNKNOWN_ERROR"})
-            self._fail_run("处理失败", str(exc) or "UNKNOWN_ERROR", fetcher=fetcher, include_traceback=True)
+        def disconnect_callback(_context, fetcher):
+            fetcher.disconnect()
 
-    def _run_processing_loop(self, attachments_info, api_key, save_path, since_date=None, before_date=None, rules_text=""):
-        self._packaged_diag_write(
-            "run_loop_enter",
-            "_run_processing_loop",
-            "success",
-            summary={"attachments": len(attachments_info or [])},
+        def cleanup_callback(context):
+            self._cleanup_temp_folders(
+                staging_dir=context.staging_dir,
+                temp_dir=self._active_temp_dir,
+            )
+
+        return RunDependencies(
+            connect=connect,
+            scan=scan,
+            candidate=candidate,
+            extract=extract,
+            archive=archive,
+            report_service=ReportService(
+                report_callback=report_callback,
+                disconnect_callback=disconnect_callback,
+                cleanup_callback=cleanup_callback,
+                timeout_seconds=self._truth_audit_timeout_seconds + 1.0,
+                evidence_writer=RunEvidenceWriter(
+                    version_resolver=lambda: request.candidate_version,
+                ),
+                evidence_required=request.evidence_required,
+            ),
+            cancel_requested=lambda: bool(self._stop_requested),
+            secrets={"auth_code": auth_code, "api_key": api_key},
+            finalizer_session=lambda: resources.get("fetcher"),
+            pipeline_close=pipeline_close,
+            state_flush=self._sync_run_state_store_from_legacy,
         )
-        import copy
-        import os
-        import traceback
+
+
+    def _run_processing_loop(
+        self,
+        attachments_info,
+        api_key,
+        save_path,
+        since_date=None,
+        before_date=None,
+        rules_text="",
+    ):
+        import inspect
         from invoice_extractor import InvoiceExtractor
-        
-        total_attachments = len(attachments_info)
-        if total_attachments == 0:
-            self._safe_emit_stage_event("_run_processing_loop", "enter", {"attachments": 0, "save_path": save_path})
-            self._safe_emit_stage_event("_run_processing_loop", "exit", {"result": "completed", "attachments": 0})
-            return
 
-        self._safe_emit_stage_event(
-            "_run_processing_loop",
-            "enter",
-            {
-                "attachments": total_attachments,
-                "save_path": save_path,
-                "since_date": since_date,
-                "before_date": before_date,
-            },
+        if not attachments_info:
+            return self._run_processing_loop_with_extractor(
+                attachments_info,
+                api_key,
+                save_path,
+                since_date,
+                before_date,
+                rules_text,
+                _extractor=None,
+            )
+        extractor_parameters = inspect.signature(InvoiceExtractor).parameters.values()
+        supports_glm_settings = any(
+            parameter.name == "glm_settings"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in extractor_parameters
         )
-            
-        extractor = InvoiceExtractor(api_key=api_key, output_dir=save_path)
+        extractor_kwargs = {"api_key": api_key, "output_dir": save_path}
+        if supports_glm_settings:
+            extractor_kwargs["glm_settings"] = self._settings_store.load() or {}
+        owned_extractor = InvoiceExtractor(**extractor_kwargs)
+        try:
+            return self._run_processing_loop_with_extractor(
+                attachments_info,
+                api_key,
+                save_path,
+                since_date,
+                before_date,
+                rules_text,
+                _extractor=owned_extractor,
+            )
+        finally:
+            close_extractor = getattr(owned_extractor, "close", None)
+            if callable(close_extractor):
+                close_extractor()
+
+    def _run_processing_loop_with_extractor(
+        self,
+        attachments_info,
+        api_key,
+        save_path,
+        since_date=None,
+        before_date=None,
+        rules_text="",
+        _extractor=None,
+        _worker_extractor_factory=None,
+        _archive_operation=None,
+        _pairing_finalizer=None,
+    ):
+        from app_archive_adapter import AppArchiveAdapter
+        from archive_service import ArchiveService
+        from candidate_pipeline import CandidatePipeline, CandidatePreflight
+        from extraction_pipeline import ExtractionPipeline, SharedRuntimeRemoteExtractor
+
+        del AppArchiveAdapter, ArchiveService, CandidatePipeline, CandidatePreflight
+        del ExtractionPipeline, SharedRuntimeRemoteExtractor
+        session = self._create_processing_pipeline_session(
+            attachments_info,
+            api_key,
+            save_path,
+            since_date,
+            before_date,
+            rules_text,
+            _extractor=_extractor,
+            _worker_extractor_factory=_worker_extractor_factory,
+            _archive_operation=_archive_operation,
+            _pairing_finalizer=_pairing_finalizer,
+        )
+        try:
+            outcomes = session.extract()
+            return session.archive(outcomes)
+        finally:
+            session.close()
+
+    def _create_processing_pipeline_session(
+        self,
+        attachments_info,
+        api_key,
+        save_path,
+        since_date=None,
+        before_date=None,
+        rules_text="",
+        *,
+        _extractor=None,
+        _worker_extractor_factory=None,
+        _archive_operation=None,
+        _pairing_finalizer=None,
+        _owned_extractor=None,
+    ):
+        from app_archive_adapter import AppArchiveAdapter
+        from archive_service import ArchiveService
+        from candidate_pipeline import CandidatePipeline, CandidatePreflight
+        from extraction_pipeline import ExtractionPipeline, SharedRuntimeRemoteExtractor
+        from invoice_extractor import InvoiceExtractor
+        from pdf_converter import PDFConverter
+
+        candidates = CandidatePipeline().collect(attachments_info)
         output_state_dir = self._output_state_dir(save_path)
-        extractor.processed_records_file = os.path.join(output_state_dir, "processed_records.json")
-        self._packaged_diag_write("run_loop_extractor_ready", "_run_processing_loop", "success")
-        history_file_path = self._history_file_path(output_state_dir)
-        previous_run_state = self._load_output_run_state(output_state_dir)
-        previous_run_status = str(previous_run_state.get("status") or "").strip().lower()
-        if previous_run_status:
-            if previous_run_status != "completed":
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "提示",
-                    "color": "text-amber-400",
-                    "msg": f"检测到上轮未完成运行状态（{previous_run_status}），本轮已忽略未提交的历史去重缓存。",
-                })
-            else:
-                self.logs.append({
-                    "time": time.strftime("[%H:%M:%S]"),
-                    "type": "信息",
-                    "color": "text-blue-400",
-                    "msg": "历史去重已关闭；本轮仅对当前任务内的重复附件和重复链接做去重。",
-                })
-        self._mark_output_run_state(output_state_dir, "running", previous_status=previous_run_status or "none")
-        
-        # --- PHASE 1: RECONCILIATION GROUND TRUTH ---
-        ground_truth_files = {info['filepath']: info for info in attachments_info}
-        processed_filepaths = set()
-        
-        # Load business logic deduplication records
-        business_records = extractor.load_processed_records()
-        committed_history = self._load_committed_history(output_state_dir)
-        working_history = set(committed_history)
+        business_records = _extractor.load_processed_records() if _extractor else {}
+        working_history = set(self._load_committed_history(output_state_dir))
+        sidecar = {}
+        sidecar_lock = threading.Lock()
+        self._pipeline_sidecar = sidecar
         trace_store = self._create_document_trace_store(
             output_path=self._run_context.get("debug_trace_path") or None
         )
-        phase2_completed = False
-        phase2_had_error = False
-        loop_result = "completed"
-        browser_first_recorded = False
+        for candidate in candidates:
+            trace_store.start_document(
+                source_filename=candidate.source_filename,
+                source_path=candidate.source_path,
+                document_id=candidate.identity.document_id,
+                persistence_is_url=candidate.identity.source_kind == "url",
+            )
+        self._mark_output_run_state(output_state_dir, "running")
 
-        def _build_normalized_fields(fields):
-            if not fields or not isinstance(fields, dict):
-                return None
+        worker_factory = _worker_extractor_factory
+        if worker_factory is None:
+            def worker_factory(runtime):
+                return InvoiceExtractor(
+                    api_key=api_key,
+                    output_dir=save_path,
+                    glm_runtime=runtime,
+                    close_glm_runtime=False,
+                )
 
-            raw_date = str(fields.get("Date", ""))
-            clean_date = raw_date.replace("/", "").replace("-", "").replace("年", "").replace("月", "").replace("日", "").strip()
-            raw_amount = str(fields.get("Amount", ""))
-            clean_amount = raw_amount.replace(",", "").replace("¥", "").replace("￥", "").replace("元", "").replace(" ", "").strip()
+        preflight = CandidatePreflight(
+            api=self,
+            extractor=_extractor,
+            working_history=working_history,
+            sidecar=sidecar,
+            sidecar_lock=sidecar_lock,
+            converter_factory=lambda: PDFConverter(
+                staging_dir=self._active_staging_path(), timeout_ms=30000
+            ),
+        )
+        remote = SharedRuntimeRemoteExtractor(
+            owner_extractor=_extractor,
+            sidecar=sidecar,
+            sidecar_lock=sidecar_lock,
+            worker_factory=worker_factory,
+            custom_rules=rules_text,
+            since_date=since_date,
+            before_date=before_date,
+        )
 
-            return {
-                "Date": clean_date if clean_date else "未知",
-                "Amount": clean_amount if clean_amount else "未知",
-                "Purchaser": str(fields.get("Purchaser", "")),
-                "Seller": str(fields.get("Seller", "")),
-                "Type": str(fields.get("Type", "")),
-                "InvoiceCode": str(fields.get("InvoiceCode", "")).strip(),
-                "InvoiceNumber": str(fields.get("InvoiceNumber", "")).strip(),
-                "is_invoice": fields.get("is_invoice", True),
-            }
-
-        def _mark_combine_not_applicable(document_id, reason_code, message):
-            trace_store.set_fields(
-                document_id,
-                combine_keys={"status": "not_applicable", "reason_code": reason_code},
-                combine_result={
-                    "status": "not_applicable",
-                    "reason_code": reason_code,
-                    "message": message,
-                },
+        def _progress(completed, total, percent):
+            self.progress = min(90, 45 + int(percent * 0.45))
+            self.status_text = f"正在解析发票 ({completed}/{total})..."
+            self._safe_emit_stage_event(
+                "extraction_pipeline",
+                "progress",
+                {"completed": completed, "total": total, "percent": percent},
             )
 
-        def _record_combine_candidate(document_id, combine_type, role, meta):
-            if not document_id:
-                return
+        def _trace(event):
+            trace_store.set_fields(event["document_id"], extraction_result=dict(event))
+            self._safe_emit_stage_event("extraction_pipeline", "trace", dict(event))
 
-            trace_store.set_fields(
-                document_id,
-                combine_keys={
-                    "combine_type": combine_type,
-                    "document_role": role,
-                    "date": meta.get("date", ""),
-                    "amount": meta.get("amount", ""),
-                    "seller": meta.get("seller", ""),
-                    "filename": meta.get("filename", ""),
-                    "reason_code": f"{combine_type.upper()}_COMBINE_CANDIDATE",
-                },
-            )
+        adapter = AppArchiveAdapter(
+            api=self,
+            extractor=_extractor,
+            save_path=save_path,
+            business_records=business_records,
+            trace_store=trace_store,
+            pairing_finalizer=_pairing_finalizer,
+        )
+        archive_service = ArchiveService(
+            normalizer=adapter.normalize,
+            classifier=adapter.classify,
+            archive_operation=_archive_operation or adapter.archive_operation,
+            dedupe_key=adapter.dedupe_key,
+            existing_dedupe_keys=business_records.keys(),
+            finalizer=adapter.finalize,
+            event_sink=lambda event: self._safe_emit_stage_event(
+                "archive_service", "artifact", event
+            ),
+        )
 
-        def _record_combine_result(document_id, status, reason_code, message=None, **extras):
-            if not document_id:
-                return
-
-            payload = {"status": status, "reason_code": reason_code}
-            if message:
-                payload["message"] = message
-            payload.update(extras)
-            trace_store.set_fields(document_id, combine_result=payload)
-
-        def _build_history_key(info, file_name, pdf_path):
-            return build_processing_history_key(info, file_name, pdf_path)
-
-        def _finalize_trace_defaults():
-            for record in trace_store.iter_records():
-                document_id = record["document_id"]
-                archive_target = record.get("archive_target")
-                archive_folder = os.path.basename(os.path.dirname(archive_target)) if archive_target else ""
-                combine_applicable = archive_folder in {"打车", "住宿发票"}
-
-                if record.get("combine_keys") is None:
-                    if combine_applicable:
-                        trace_store.set_fields(
-                            document_id,
-                            combine_keys={
-                                "status": "pending",
-                                "reason_code": "COMBINE_KEYS_NOT_RECORDED",
-                            },
-                        )
-                    else:
-                        trace_store.set_fields(
-                            document_id,
-                            combine_keys={
-                                "status": "not_applicable",
-                                "reason_code": "COMBINE_NOT_APPLICABLE",
-                            },
-                        )
-
-                if record.get("combine_result") is None:
-                    if combine_applicable:
-                        trace_store.set_fields(
-                            document_id,
-                            combine_result={
-                                "status": "not_evaluated" if (phase2_had_error or not phase2_completed) else "not_matched",
-                                "reason_code": "COMBINE_NOT_EVALUATED" if (phase2_had_error or not phase2_completed) else "COMBINE_NO_MATCH",
-                                "message": "Combine stage did not emit a document-specific result.",
-                            },
-                        )
-                    else:
-                        trace_store.set_fields(
-                            document_id,
-                            combine_result={
-                                "status": "not_applicable",
-                                "reason_code": "COMBINE_NOT_APPLICABLE",
-                                "message": "Document did not enter a combine-enabled archive folder.",
-                            },
-                        )
-
-        try:
-            # 处理每个附件
-            success_count = 0
-            processed_provider_groups = set()
-            for i, info in enumerate(attachments_info):
-                if self._stop_requested:
-                    loop_result = "stopped"
-                    self._append_log("停止", "已收到停止指令，当前文件处理完毕后结束本次运行。", "text-amber-600")
-                    break
-                if not self._is_running:
-                    break
-                    
-                source_filename = os.path.basename(info['filepath'])
-                file_name = source_filename
-                pdf_path = info['filepath']
-                tier_info = info.get('tier', '未知')
-                
-                try:
-                    time.sleep(0.2) # 确保磁盘 IO 已完成
-                    print(f">>> [{i+1}/{total_attachments}] 开始处理文件: {file_name}")
-                    import hashlib
-                    document_id = hashlib.md5(
-                        f"{info.get('filepath', '')}|{info.get('subject', '')}|{file_name}|{info.get('tier', 0)}|{i}".encode("utf-8")
-                    ).hexdigest()
-                    trace_store.start_document(
-                        source_filename=source_filename,
-                        source_path=info.get("filepath"),
-                        document_id=document_id,
-                    )
-                    prefilter_reason_code = info.get("prefilter_reason_code")
-                    prefilter_metadata = self._attachment_diag_metadata(
-                        info,
-                        file_name=file_name,
-                        document_id=document_id,
-                        extra={
-                            "tier": info.get("tier", 0),
-                            "candidate_index": i + 1,
-                        },
-                    )
-                    if info.get("candidate_action") == "retain_only":
-                        should_capture_evidence = True
-                        aggregation_key = ""
-                        if info.get("is_url", False):
-                            should_capture_evidence, aggregation_key = self._should_capture_email_level_url_evidence(info)
-                        if not should_capture_evidence:
-                            trace_store.set_fields(
-                                document_id,
-                                naming_result={"status": "skipped", "reason_code": prefilter_reason_code or "EMAIL_LEVEL_URL_EVIDENCE_AGGREGATED"},
-                            )
-                            _mark_combine_not_applicable(
-                                document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "Email-level URL evidence was already retained for this email, so duplicate low-confidence URLs were collapsed.",
-                            )
-                            trace_store.record_failure_event(
-                                document_id,
-                                prefilter_reason_code or "EMAIL_LEVEL_URL_EVIDENCE_AGGREGATED",
-                                "prefilter",
-                                "Duplicate low-confidence URL was collapsed into existing email-level audit evidence.",
-                                severity="skipped",
-                            )
-                            processed_filepaths.add(pdf_path)
-                            continue
-                        if aggregation_key:
-                            prefilter_metadata = dict(prefilter_metadata)
-                            prefilter_metadata.update(
-                                {
-                                    "email_level_url_evidence": True,
-                                    "email_level_url_evidence_key": aggregation_key,
-                                }
-                            )
-                        retained_path = self._retain_artifact(
-                            save_path,
-                            pdf_path,
-                            "prefilter_b_retained",
-                            "P0 预过滤判定为 B 层 durable retention 候选",
-                            prefilter_metadata,
-                        )
-                        self.stats["errors"] += 1
-                        self.logs.append({
-                            "time": time.strftime("[%H:%M:%S]"),
-                            "type": "保全:",
-                            "color": "text-blue-400",
-                            "msg": f"前置过滤 B 层候选已保全: {os.path.basename(retained_path)}",
-                        })
-                        self.error_invoices.append({
-                            "id": f"inv_prefilter_{time.time()}_{i}",
-                            "date": "---",
-                            "amount": "---",
-                            "category": "预过滤保全",
-                            "merchant": "高/中置信度候选",
-                            "path": retained_path,
-                            "name": os.path.basename(retained_path),
-                            "sColor": "bg-blue-500",
-                            "status": "已保全待判断",
-                            "reason": prefilter_reason_code or "P0_B_RETENTION",
-                            "rColor": "text-blue-600 border-blue-200 bg-blue-50",
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result={"status": "skipped", "reason_code": prefilter_reason_code or "P0_B_RETENTION"},
-                            archive_target=retained_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Prefilter B-layer retain-only candidate did not enter archive/combine.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            prefilter_reason_code or "P0_B_RETENTION",
-                            "prefilter",
-                            "前置过滤判定为 B 层 durable retention 候选。",
-                            severity="fallback",
-                        )
-                        processed_filepaths.add(pdf_path)
-                        continue
-
-                    if info.get("candidate_action") == "manual_review":
-                        review_path = self._send_to_manual_check(
-                            save_path,
-                            pdf_path,
-                            prefilter_reason_code or "P0_C_MANUAL_REVIEW",
-                            metadata=prefilter_metadata,
-                            is_url=info.get("is_url", False),
-                        )
-                        self.stats["errors"] += 1
-                        self.logs.append({
-                            "time": time.strftime("[%H:%M:%S]"),
-                            "type": "复核:",
-                            "color": "text-yellow-400",
-                            "msg": f"前置过滤 C 层候选已进入待人工复核: {os.path.basename(review_path)}",
-                        })
-                        self.error_invoices.append({
-                            "id": f"inv_prefilter_{time.time()}_{i}",
-                            "date": "---",
-                            "amount": "---",
-                            "category": "人工复核",
-                            "merchant": "低置信度候选",
-                            "path": review_path,
-                            "name": os.path.basename(review_path),
-                            "sColor": "bg-yellow-500",
-                            "status": "待人工复核",
-                            "reason": prefilter_reason_code or "P0_C_MANUAL_REVIEW",
-                            "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50",
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result={"status": "skipped", "reason_code": prefilter_reason_code or "P0_C_MANUAL_REVIEW"},
-                            archive_target=review_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Prefilter C-layer candidate was routed to Manual_Check before archive/combine.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            prefilter_reason_code or "P0_C_MANUAL_REVIEW",
-                            "prefilter",
-                            "前置过滤判定为 C 层人工复核候选。",
-                            severity="fallback",
-                        )
-                        processed_filepaths.add(pdf_path)
-                        continue
-
-                    # --- State Persistence Check ---
-                    # 生成唯一 ID 以防重复提交大模型
-                    history_key = _build_history_key(info, file_name, pdf_path)
-
-                    if history_key in working_history:
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-blue-400", "msg": f"本轮内重复已跳过: {file_name}"})
-                        self.progress = 50 + int(((i + 1) / total_attachments) * 45)
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result={"status": "skipped", "reason_code": "CURRENT_RUN_DUPLICATE_SKIP"},
-                            archive_target=None,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Document was skipped because it duplicated another item in the current run.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            "CURRENT_RUN_DUPLICATE_SKIP",
-                            "dedupe",
-                            "命中当前任务内重复项，已跳过。",
-                            severity="skipped",
-                        )
-                        processed_filepaths.add(pdf_path)
-                        continue
-                        
-                    self.progress = 50 + int(((i + 1) / total_attachments) * 45)  # 50% -> 95%
-                    self.status_text = f"正在解析发票 (第 {i+1} 个，共 {total_attachments} 个)..."
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "解析:", "color": "text-purple-400", "msg": f"AI 正在识别: {file_name}"})
-                    
-                    # --- 网页链接发票无头下载支持 (Link Download) ---
-                    if info.get('is_url', False):
-                        provider_group_key = str(info.get("provider_group_key", "") or "")
-                        if provider_group_key and provider_group_key in processed_provider_groups:
-                            trace_store.set_fields(
-                                document_id,
-                                naming_result={"status": "skipped", "reason_code": "PROVIDER_GROUP_ALREADY_PROCESSED"},
-                            )
-                            _mark_combine_not_applicable(
-                                document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "Provider recovery group was already handled by an earlier candidate.",
-                            )
-                            processed_filepaths.add(pdf_path)
-                            continue
-
-                        if self._should_gate_controlled_run_url(info):
-                            should_capture_evidence, aggregation_key = self._should_capture_email_level_url_evidence(info)
-                            if not should_capture_evidence:
-                                trace_store.set_fields(
-                                    document_id,
-                                    naming_result={"status": "skipped", "reason_code": "CONTROLLED_RUN_NON_PROVIDER_URL_AGGREGATED"},
-                                )
-                                _mark_combine_not_applicable(
-                                    document_id,
-                                    "COMBINE_NOT_APPLICABLE",
-                                    "Controlled truth run collapsed duplicate non-provider URLs into a single email-level audit record.",
-                                )
-                                trace_store.record_failure_event(
-                                    document_id,
-                                    "CONTROLLED_RUN_NON_PROVIDER_URL_AGGREGATED",
-                                    "execution_gate",
-                                    "Duplicate non-provider URL was collapsed into an existing email-level controlled-run audit record.",
-                                    severity="skipped",
-                                )
-                                processed_filepaths.add(pdf_path)
-                                continue
-                            gate_reason_code = "CONTROLLED_RUN_NON_PROVIDER_URL_SKIPPED"
-                            gate_message = (
-                                "Controlled truth run skipped non-provider URL execution to preserve audit evidence "
-                                "and avoid blocking the main chain on non-target webpages."
-                            )
-                            gate_metadata = dict(prefilter_metadata)
-                            gate_metadata.update(
-                                {
-                                    "prefilter_reason_code": gate_reason_code,
-                                    "original_prefilter_reason_code": prefilter_reason_code or "",
-                                    "controlled_run_url_gate": True,
-                                    "controlled_run_url_gate_reason": gate_message,
-                                    "email_level_url_evidence": True,
-                                    "email_level_url_evidence_key": aggregation_key,
-                                }
-                            )
-                            retained_path = self._retain_artifact(
-                                save_path,
-                                info.get("source_url") or pdf_path,
-                                "controlled_run_non_provider_url",
-                                gate_message,
-                                gate_metadata,
-                            )
-                            self.stats["errors"] += 1
-                            self.logs.append(
-                                {
-                                    "time": time.strftime("[%H:%M:%S]"),
-                                    "type": "淇濆叏:",
-                                    "color": "text-blue-400",
-                                    "msg": f"鍙楁帶璺戞壒宸蹭繚鍏ㄩ潪 provider URL锛?{os.path.basename(retained_path)}",
-                                }
-                            )
-                            self.error_invoices.append(
-                                {
-                                    "id": f"inv_controlled_url_{time.time()}_{i}",
-                                    "date": "---",
-                                    "amount": "---",
-                                    "category": "鍙楁帶璺戞壒淇濆叏",
-                                    "merchant": "闈?provider URL",
-                                    "path": retained_path,
-                                    "name": os.path.basename(retained_path),
-                                    "sColor": "bg-blue-500",
-                                    "status": "宸蹭繚鍏ㄥ緟鍒ゆ柇",
-                                    "reason": gate_reason_code,
-                                    "rColor": "text-blue-600 border-blue-200 bg-blue-50",
-                                }
-                            )
-                            trace_store.set_fields(
-                                document_id,
-                                naming_result={"status": "skipped", "reason_code": gate_reason_code},
-                                archive_target=retained_path,
-                            )
-                            _mark_combine_not_applicable(
-                                document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "Controlled truth run URL gate skipped non-provider URL execution before archive/combine.",
-                            )
-                            trace_store.record_failure_event(
-                                document_id,
-                                gate_reason_code,
-                                "execution_gate",
-                                gate_message,
-                                severity="fallback",
-                            )
-                            processed_filepaths.add(pdf_path)
-                            continue
-
-                        if not browser_first_recorded:
-                            self._packaged_diag_write(
-                                "browser_first_before",
-                                "_run_processing_loop",
-                                "success",
-                                summary={"file_name": file_name},
-                            )
-                        from pdf_converter import PDFConverter
-                        converter = PDFConverter(
-                            staging_dir=self._run_context.get("staging_dir") or "staging",
-                            timeout_ms=30000,
-                        )
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "抓取:", "color": "text-blue-400", "msg": f"正在启动无头浏览器抓取网页: {file_name[:30]}"})
-                        try:
-                            url_recovery_started_at = time.perf_counter()
-                            link_results = converter.process_invoice_links(
-                                pdf_path,
-                                info.get('subject', 'Link_Invoice'),
-                                f"url_{i}",
-                                return_metadata=True,
-                                candidate_info=info,
-                            )
-                            self._record_timing_metric("url_recovery", time.perf_counter() - url_recovery_started_at)
-                            if not browser_first_recorded:
-                                self._packaged_diag_write(
-                                    "browser_first_after",
-                                    "_run_processing_loop",
-                                    "success" if bool(link_results) else "failure",
-                                    summary={
-                                        "file_name": file_name,
-                                        "url_result_count": len(link_results or []),
-                                    },
-                                )
-                                browser_first_recorded = True
-                        except Exception as exc:
-                            self._record_timing_metric("url_recovery", time.perf_counter() - url_recovery_started_at)
-                            if not browser_first_recorded:
-                                self._packaged_diag_write(
-                                    "browser_first_exception",
-                                    "_run_processing_loop",
-                                    "exception",
-                                    summary={"file_name": file_name},
-                                    exc=exc,
-                                )
-                                browser_first_recorded = True
-                            raise
-                        if not link_results:
-                            self.stats["errors"] += 1
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"抓取发票链接失败或遇反爬验证码: {file_name}"})
-                            trace_store.set_fields(
-                                document_id,
-                                naming_result={"status": "skipped", "reason_code": "URL_DOWNLOAD_FAILED"},
-                            )
-                            _mark_combine_not_applicable(
-                                document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "Document failed before archive stage during URL download.",
-                            )
-                            trace_store.record_failure_event(
-                                document_id,
-                                "URL_DOWNLOAD_FAILED",
-                                "source_download",
-                                "抓取发票链接失败或遇反爬验证码。",
-                                severity="failure",
-                            )
-                            processed_filepaths.add(pdf_path) # [Fix] Mark URL links as processed on failure
-                            continue
-                        link_result = dict(link_results[0] or {})
-                        if provider_group_key:
-                            processed_provider_groups.add(provider_group_key)
-
-                        link_status = str(link_result.get("status") or "").strip().lower()
-                        if link_status in {"failed", "skipped"}:
-                            link_reason_code = str(link_result.get("reason_code") or "URL_DOWNLOAD_FAILED").strip() or "URL_DOWNLOAD_FAILED"
-                            link_message = (
-                                str(link_result.get("message") or "").strip()
-                                or str(link_result.get("failure_stage") or "").strip()
-                                or "URL processing terminated before a usable PDF entered the main chain."
-                            )
-                            is_runtime_filtered = link_reason_code == "URL_NON_INVOICE_PAGE_SKIPPED"
-                            bucket_suffix = "url_runtime_filtered" if is_runtime_filtered else "url_runtime_failed"
-                            retained_path = self._retain_artifact(
-                                save_path,
-                                link_result.get("resolved_url") or info.get("source_url") or pdf_path,
-                                bucket_suffix,
-                                link_message,
-                                self._attachment_diag_metadata(
-                                    info,
-                                    file_name=file_name,
-                                    document_id=document_id,
-                                    extra={
-                                        "tier": tier_info,
-                                        "url_runtime_result": link_result,
-                                    },
-                                ),
-                            )
-                            self.stats["errors"] += 1
-                            if is_runtime_filtered:
-                                self.logs.append(
-                                    {
-                                        "time": time.strftime("[%H:%M:%S]"),
-                                        "type": "保全:",
-                                        "color": "text-blue-400",
-                                        "msg": f"运行时过滤了非票据页面，已保留证据: {os.path.basename(retained_path)}",
-                                    }
-                                )
-                                self.error_invoices.append(
-                                    {
-                                        "id": f"inv_url_filtered_{time.time()}_{i}",
-                                        "date": "---",
-                                        "amount": "---",
-                                        "category": "保留记录",
-                                        "merchant": "运行时过滤",
-                                        "path": retained_path,
-                                        "name": os.path.basename(retained_path),
-                                        "sColor": "bg-blue-500",
-                                        "status": "已保全待判断",
-                                        "reason": link_reason_code,
-                                        "rColor": "text-blue-600 border-blue-200 bg-blue-50",
-                                    }
-                                )
-                                failure_severity = "fallback"
-                            else:
-                                self.logs.append(
-                                    {
-                                        "time": time.strftime("[%H:%M:%S]"),
-                                        "type": "错误:",
-                                        "color": "text-red-400",
-                                        "msg": f"链接抓取失败，已保留证据: {os.path.basename(retained_path)}",
-                                    }
-                                )
-                                self.error_invoices.append(
-                                    {
-                                        "id": f"inv_url_failed_{time.time()}_{i}",
-                                        "date": "---",
-                                        "amount": "---",
-                                        "category": "解析失败",
-                                        "merchant": "链接抓取",
-                                        "path": retained_path,
-                                        "name": os.path.basename(retained_path),
-                                        "sColor": "bg-yellow-500",
-                                        "status": "处理异常",
-                                        "reason": link_reason_code,
-                                        "rColor": "text-red-600 border-red-200 bg-red-50",
-                                    }
-                                )
-                                failure_severity = "failure"
-                            trace_store.set_fields(
-                                document_id,
-                                source_download_result=link_result,
-                                naming_result={"status": "skipped", "reason_code": link_reason_code},
-                                archive_target=retained_path,
-                            )
-                            _mark_combine_not_applicable(
-                                document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "URL runtime handling terminated before archive/combine.",
-                            )
-                            trace_store.record_failure_event(
-                                document_id,
-                                link_reason_code,
-                                "source_download",
-                                link_message,
-                                severity=failure_severity,
-                            )
-                            processed_filepaths.add(pdf_path)
-                            continue
-
-                        if link_result.get("status") == "provider_recovery_failed":
-                            provider_family = str(link_result.get("provider_family") or info.get("provider_family") or "").lower()
-                            bucket_suffix = str(link_result.get("retention_bucket_suffix") or provider_family or "unknown_provider").strip().strip("\\/")
-                            if not bucket_suffix:
-                                bucket_suffix = "unknown_provider"
-                            recovery_reason_code = link_result.get("reason_code") or f"PROVIDER_RECOVERY_FAILED_{provider_family.upper() or 'UNKNOWN'}"
-                            recovery_message = (
-                                link_result.get("provider_recovery_message")
-                                or f"{provider_family or 'Provider'} recovery failed before a confirmed invoice PDF could enter the main chain."
-                            )
-                            retained_path = self._retain_artifact(
-                                save_path,
-                                info.get("source_url") or pdf_path,
-                                os.path.join("provider_recovery_failed", bucket_suffix),
-                                recovery_message,
-                                self._attachment_diag_metadata(
-                                    info,
-                                    file_name=file_name,
-                                    document_id=document_id,
-                                    extra={
-                                        "tier": tier_info,
-                                        "provider_recovery": link_result,
-                                    },
-                                ),
-                            )
-                            self.stats["errors"] += 1
-                            self.logs.append({
-                                "time": time.strftime("[%H:%M:%S]"),
-                                "type": "淇濆叏:",
-                                "color": "text-red-400",
-                                "msg": f"百望恢复失败，已保全审计对象: {os.path.basename(retained_path)}",
-                            })
-                            trace_store.set_fields(
-                                document_id,
-                                source_download_result=link_result,
-                                naming_result={"status": "skipped", "reason_code": recovery_reason_code},
-                                archive_target=retained_path,
-                            )
-                            _mark_combine_not_applicable(
-                                document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "Provider recovery failed before archive stage.",
-                            )
-                            trace_store.record_failure_event(
-                                document_id,
-                                recovery_reason_code,
-                                "source_download",
-                                recovery_message,
-                                severity="failure",
-                            )
-                            processed_filepaths.add(pdf_path)
-                            continue
-
-                        info = dict(info)
-                        info.update({
-                            "resolved_url": link_result.get("resolved_url", ""),
-                            "download_mode": link_result.get("download_mode", ""),
-                            "wrapper_detected": link_result.get("wrapper_detected", False),
-                            "provider_family": link_result.get("provider_family", info.get("provider_family", "")),
-                            "provider_recovered_fields": link_result.get("selected_fields", {}),
-                            "provider_recovery_status": link_result.get("status", ""),
-                            "body_excerpt": link_result.get("body_excerpt", ""),
-                            "page_title": link_result.get("page_title", ""),
-                        })
-                        trace_store.set_fields(document_id, source_download_result=link_result)
-                        pdf_path = link_result["pdf_path"]
-                        file_name = os.path.basename(pdf_path)
-                        time.sleep(0.5) # 确保无头浏览器下载的 PDF 磁盘 IO 写入完成
-
-                    pdf_health = None
-                    if str(pdf_path).lower().endswith(".pdf"):
-                        pdf_health = self._inspect_pdf_health(pdf_path)
-                        if pdf_health:
-                            trace_store.set_fields(document_id, pdf_health=pdf_health)
-                    if (
-                        info.get("is_url")
-                        and str(info.get("download_mode") or "").strip().lower() == "page_pdf"
-                        and pdf_health
-                        and (
-                            int(pdf_health.get("size_bytes", 0) or 0) < 2048
-                            or not bool(pdf_health.get("starts_with_pdf_magic"))
-                            or int(pdf_health.get("page_count", 0) or 0) <= 0
-                        )
-                    ):
-                        retained_path = self._retain_artifact(
-                            save_path,
-                            info.get("resolved_url") or info.get("source_url") or pdf_path,
-                            "url_runtime_failed",
-                            "URL generated a tiny or invalid PDF shell before a usable invoice document was available.",
-                            self._attachment_diag_metadata(
-                                info,
-                                file_name=file_name,
-                                document_id=document_id,
-                                extra={
-                                    "tier": tier_info,
-                                    "pdf_health": pdf_health,
-                                    "source_download_result": info.get("source_download_result", {}),
-                                },
-                            ),
-                        )
-                        self.stats["errors"] += 1
-                        self.logs.append({
-                            "time": time.strftime("[%H:%M:%S]"),
-                            "type": "错误:",
-                            "color": "text-red-400",
-                            "msg": f"链接生成的 PDF 壳无效，已保留证据: {os.path.basename(retained_path)}",
-                        })
-                        self.error_invoices.append({
-                            "id": f"inv_url_shell_{time.time()}_{i}",
-                            "date": "---",
-                            "amount": "---",
-                            "category": "解析失败",
-                            "merchant": "链接抓取",
-                            "path": retained_path,
-                            "name": os.path.basename(retained_path),
-                            "sColor": "bg-yellow-500",
-                            "status": "处理异常",
-                            "reason": "URL_INVALID_PDF_SHELL",
-                            "rColor": "text-red-600 border-red-200 bg-red-50",
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            pdf_health=pdf_health,
-                            naming_result={"status": "skipped", "reason_code": "URL_INVALID_PDF_SHELL"},
-                            archive_target=retained_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "URL generated a tiny or invalid PDF shell before archive/combine.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            "URL_INVALID_PDF_SHELL",
-                            "source_download",
-                            "URL generated a tiny or invalid PDF shell before a usable invoice document was available.",
-                            severity="failure",
-                        )
-                        processed_filepaths.add(pdf_path)
-                        continue
-                    
-                    # Step A: 转图片
-                    base64_img = extractor.pdf_to_base64_image(pdf_path)
-                    pdf_health = self._apply_render_health(pdf_health, base64_img)
-                    if pdf_health:
-                        trace_store.set_fields(document_id, pdf_health=pdf_health)
-                    if not base64_img:
-                        self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"无法读取附件图像: {file_name}"})
-                        self._record_error_log(save_path, info.get('subject', file_name), "PDF损坏或不是标准发票格式")
-                        retained_path = self._retain_artifact(
-                            save_path,
-                            pdf_path,
-                            "unreadable",
-                            "本地预处理失败，无法转成可供识别的图像",
-                            self._attachment_diag_metadata(
-                                info,
-                                file_name=file_name,
-                                document_id=document_id,
-                                extra={
-                                    "tier": tier_info,
-                                    "pdf_health": pdf_health,
-                                },
-                            ),
-                        )
-                        self.error_invoices.append({
-                            "id": f"inv_{time.time()}_{i}",
-                            "date": "---",
-                            "amount": "---",
-                            "category": "预处理失败",
-                            "merchant": "无法读取附件",
-                            "path": retained_path,
-                            "name": os.path.basename(retained_path),
-                            "artifact_kind": "retention",
-                            "sColor": "bg-yellow-500",
-                            "status": "已保全待确认",
-                            "reason": "无法读取附件图像，已保全原件",
-                            "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result={"status": "skipped", "reason_code": "PDF_TO_IMAGE_FAILED"},
-                            archive_target=retained_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Document failed during image conversion before archive/combine.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            "PDF_TO_IMAGE_FAILED",
-                            "preprocess",
-                            "无法读取附件图像。",
-                            severity="failure",
-                        )
-                        processed_filepaths.add(pdf_path) # [Fix] Mark as processed on failure
-                        continue
-                        
-                    # Step B: 前置成本控制 (Cost Filter)
-                    # 利用本地 PyMuPDF 先查一次文本里的年份
-                    cost_gate_valid = True
-                    try:
-                        import fitz
-                        temp_doc = fitz.open(pdf_path)
-                        full_text = ""
-                        for p in range(min(2, len(temp_doc))):
-                            full_text += temp_doc.load_page(p).get_text()
-                        temp_doc.close()
-                        
-                        start_year = since_date.split('-')[0] if since_date else ""
-                        end_year = before_date.split('-')[0] if before_date else ""
-                        
-                        # 如果文本中有绝对不是当前年份的强烈特征，且没有当前年份，可以考虑阻断 (此处采取保守策略，如果文本为空则放行图文API)
-                        if full_text.strip():
-                            if start_year and end_year and start_year == end_year:
-                                if "20" in full_text and start_year not in full_text:
-                                    # Very loose check: if there's a 20xx but our year isn't there, might be an old invoice. 
-                                    pass # For safety, we rely on the final Date Gatekeeper, but this is the hook for future strict OCR filtering
-                    except Exception:
-                        pass
-                        
-                    # Step C: LLM 信息提取
-                    extraction_started_at = time.perf_counter()
-                    try:
-                        info_json = extractor.extract_info_via_llm(
-                            base64_img,
-                            custom_rules=rules_text,
-                            pdf_path=pdf_path,
-                            document_context={
-                                **(info or {}),
-                                "search_since_date": since_date or "",
-                                "search_before_date": before_date or "",
-                            },
-                        )
-                    except Exception as extraction_error:
-                        quota_message = self._resolve_quota_message(extraction_error)
-                        if quota_message:
-                            raise QuotaExceededError(quota_message) from extraction_error
-                        raise
-                    finally:
-                        self._record_timing_metric("extract_total", time.perf_counter() - extraction_started_at)
-                    extraction_trace = copy.deepcopy(getattr(extractor, "last_extraction_trace", {}) or {})
-                    extraction_timing = copy.deepcopy(getattr(extractor, "last_timing_trace", {}) or {})
-                    trace_store.set_fields(
-                        document_id,
-                        extractor_raw_result=extraction_trace or None,
-                        extractor_timing=extraction_timing or None,
-                    )
-                    timing_name_map = {
-                        "track_a_ocr_ms": "track_a_ocr",
-                        "track_a_llm_ms": "track_a_llm",
-                        "track_b_vision_ms": "track_b_vision",
-                    }
-                    for timing_key, metric_name in timing_name_map.items():
-                        timing_ms = extraction_timing.get(timing_key)
-                        if timing_ms is None:
-                            continue
-                        self._record_timing_metric(metric_name, float(timing_ms) / 1000.0)
-                    if extraction_trace.get("reason_code") == "TRACK_A_FAILED_TRACK_B_FALLBACK":
-                        trace_store.record_failure_event(
-                            document_id,
-                            "TRACK_A_FAILED_TRACK_B_FALLBACK",
-                            "extraction",
-                            extraction_trace.get("track_a", {}).get("message"),
-                            severity="fallback",
-                        )
-                    if not info_json:
-                        self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"大模型全部引擎提取失败，移入人工区: {file_name}"})
-                        self._record_error_log(save_path, info.get('subject', file_name), "大模型未能识别出标准的 JSON 数据")
-                        
-                        # 直接抛给 route_and_rename_file 进行 Manual_Check 兜底保存
-                        manual_success, result_path = extractor.route_and_rename_file(pdf_path, None)
-                        naming_trace = copy.deepcopy(getattr(extractor, "last_route_trace", {}) or {})
-                        if not manual_success:
-                            result_path = self._retain_artifact(
-                                save_path,
-                                pdf_path,
-                                "model_failed_fallback",
-                                "模型彻底失败且人工区复制失败，保全原件",
-                                {
-                                    "subject": info.get("subject", ""),
-                                    "tier": tier_info,
-                                    "file_name": file_name
-                                }
-                            )
-                        elif result_path:
-                            self.audit_counts["manual_check"] += 1
-                            self._safe_emit_artifact_event(
-                                "manual_check",
-                                result_path,
-                                document_id=document_id,
-                                source_kind=info.get("source_kind"),
-                                reason_code=naming_trace.get("reason_code") or "ROUTE_TO_MANUAL_CHECK",
-                                category=MANUAL_REVIEW_FOLDER,
-                                extra=self._attachment_diag_metadata(
-                                    info,
-                                    file_name=file_name,
-                                    document_id=document_id,
-                                ),
-                            )
-                        trace_store.set_fields(
-                            document_id,
-                            classification_result={"status": "failed", "reason_code": "EXTRACTOR_ALL_ENGINES_FAILED"},
-                            naming_result=naming_trace or {"status": "failed", "reason_code": "ROUTE_TO_MANUAL_CHECK"},
-                            archive_target=result_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Document did not reach combine stage after extraction failure.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            "EXTRACTOR_ALL_ENGINES_FAILED",
-                            "extraction",
-                            "大模型未能识别出标准的 JSON 数据。",
-                            severity="failure",
-                        )
-                        if naming_trace.get("reason_code"):
-                            trace_store.record_failure_event(
-                                document_id,
-                                naming_trace["reason_code"],
-                                "naming",
-                                naming_trace.get("error_message") or "解析失败后进入待人工复核兜底。",
-                                severity="fallback" if naming_trace.get("used_manual_check") else "failure",
-                            )
-                        processed_filepaths.add(pdf_path)
-                        artifact_kind = "manual_check" if manual_success and result_path else "retention"
-                        category = "待人工复核" if artifact_kind == "manual_check" else "保留记录"
-                        status = "待人工复核" if artifact_kind == "manual_check" else "已保全待确认"
-                        reason = "解析失败移入待人工复核" if artifact_kind == "manual_check" else "解析失败，原件已保全待确认"
-                        self.error_invoices.append({
-                            "id": f"inv_{time.time()}_{i}", "date": "---", "amount": "---", "category": category,
-                            "merchant": "模型提取彻底失败", "path": result_path, "name": os.path.basename(result_path),
-                            "artifact_kind": artifact_kind,
-                            "sColor": "bg-yellow-500", "status": status, "reason": reason,
-                            "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
-                        })
-                        continue
-                        
-                    # 行程单/水单豁免: 先识别文件名关键词，判断为行程单/水单则强制豁免 is_invoice 过滤
-                    doc_type_peek = str(info_json.get("Type", ""))
-                    normalized_snapshot = _build_normalized_fields(info_json)
-                    acceptance_check = self._evaluate_document_acceptance(
-                        info,
-                        info_json,
-                        normalized_snapshot,
-                        pdf_health,
-                        pdf_path,
-                    )
-                    trace_store.set_fields(document_id, document_acceptance=acceptance_check)
-                    if not acceptance_check.get("accepted", True):
-                        retained_path = self._retain_artifact(
-                            save_path,
-                            pdf_path,
-                            acceptance_check.get("bucket") or "provider_guard_rejected",
-                            acceptance_check.get("message") or "Downloaded result rejected by document acceptance gate.",
-                            self._attachment_diag_metadata(
-                                info,
-                                file_name=file_name,
-                                document_id=document_id,
-                                extra={
-                                    "tier": tier_info,
-                                    "pdf_health": pdf_health,
-                                    "normalized_snapshot": normalized_snapshot,
-                                    "document_acceptance": acceptance_check,
-                                },
-                            ),
-                        )
-                        self.stats["errors"] += 1
-                        self.logs.append({
-                            "time": time.strftime("[%H:%M:%S]"),
-                            "type": "保全:",
-                            "color": "text-yellow-400",
-                            "msg": f"下载结果被文档验收闸门拦截: {os.path.basename(retained_path)}",
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            normalized_fields=normalized_snapshot,
-                            classification_result={
-                                "status": "rejected",
-                                "reason_code": acceptance_check.get("reason_code"),
-                                "provider_family": acceptance_check.get("provider_family", ""),
-                            },
-                            naming_result={"status": "skipped", "reason_code": acceptance_check.get("reason_code")},
-                            archive_target=retained_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Document was rejected by the provider/entity acceptance gate before archive/combine.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            acceptance_check.get("reason_code") or "DOCUMENT_ACCEPTANCE_REJECTED",
-                            "document_acceptance",
-                            acceptance_check.get("message") or "Downloaded result rejected by document acceptance gate.",
-                            severity="failure",
-                        )
-                        processed_filepaths.add(pdf_path)
-                        continue
-                    is_itinerary_or_folio = (
-                        any(kw in file_name for kw in ["行程单", "行程报销单", "报销单", "folio", "Folio", "水单", "结账单", "账单", "住宿明细"])
-                        or any(kw in doc_type_peek for kw in ["行程单", "报销单", "水单", "结账单", "账单", "住宿明细", "folio", "Folio"])
-                    )
-
-                    is_invoice = info_json.get("is_invoice", True)
-                    if not is_itinerary_or_folio and (str(is_invoice).lower() == "false" or is_invoice is False):
-                        retained_path = self._retain_artifact(
-                            save_path,
-                            pdf_path,
-                            "model_rejected",
-                            "模型判定为非票据，转人工复核保全",
-                            {
-                                "subject": info.get("subject", ""),
-                                "tier": tier_info,
-                                "file_name": file_name,
-                                "rejection_reason": info_json.get("rejection_reason", ""),
-                                "model_type": info_json.get("Type", "")
-                            }
-                        )
-                        self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "保全:", "color": "text-yellow-400", "msg": f"模型拒绝文件已转人工复核保全: {os.path.basename(retained_path)}"})
-                        self.error_invoices.append({
-                            "id": f"inv_{time.time()}_{i}",
-                            "date": info_json.get("Date", "---"),
-                            "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                            "category": "保留记录",
-                            "merchant": info_json.get("Seller", "未知开票方"),
-                            "path": retained_path,
-                            "name": os.path.basename(retained_path),
-                            "artifact_kind": "retention",
-                            "sColor": "bg-yellow-500",
-                            "status": "已保全待确认",
-                            "reason": info_json.get("rejection_reason", "模型判定为非票据，原件已保全"),
-                            "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            normalized_fields=normalized_snapshot,
-                            classification_result={
-                                "status": "rejected",
-                                "reason_code": "MODEL_REJECTED_NOT_INVOICE",
-                                "model_type": info_json.get("Type", ""),
-                                "is_itinerary_or_folio": is_itinerary_or_folio,
-                                "rejection_reason": info_json.get("rejection_reason", ""),
-                            },
-                            naming_result={"status": "skipped", "reason_code": "MODEL_REJECTED_NOT_INVOICE"},
-                            archive_target=retained_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Document was rejected as non-invoice before archive/combine.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            "MODEL_REJECTED_NOT_INVOICE",
-                            "classification",
-                            info_json.get("rejection_reason", "模型判定为非票据。"),
-                            severity="failure",
-                        )
-                        processed_filepaths.add(pdf_path) # Mark as intentionally discarded
-                        continue
-
-                    clean_date = normalized_snapshot.get("Date", "") if normalized_snapshot else ""
-
-                    # 日期合法性校验：发票年份不得超过邮件搜索结束日期的年份 (防止截图等被误归档)
-                    if clean_date and len(clean_date) >= 4:
-                        try:
-                            year = int(clean_date[:4])
-                            # 允许范围: 2000 ~ 搜索结束年份
-                            max_year = int(before_date[:4]) if before_date and len(before_date) >= 4 else 2025
-                            print(f">>> [年份校验] file={file_name}, date={clean_date}, year={year}, before_date={before_date}, max_year={max_year}")
-                            if year > max_year or year < 2000:
-                                self.logs.append({
-                                    "time": time.strftime("[%H:%M:%S]"),
-                                    "type": "标记:",
-                                    "color": "text-yellow-400",
-                                    "msg": f"日期异常 ({clean_date})，已记录 DATE_OUT_OF_RANGE 标记并继续主链路",
-                                })
-                                trace_store.set_fields(
-                                    document_id,
-                                    normalized_fields=normalized_snapshot,
-                                    classification_result={
-                                        "status": "flagged",
-                                        "reason_code": "DATE_OUT_OF_RANGE",
-                                        "detected_date": clean_date,
-                                        "max_year": max_year,
-                                    },
-                                )
-                                trace_store.record_failure_event(
-                                    document_id,
-                                    "DATE_OUT_OF_RANGE",
-                                    "normalization",
-                                    f"年份超出合法范围 (≤{max_year})。",
-                                    severity="fallback",
-                                )
-                        except (ValueError, TypeError):
-                            pass
-
-                    info_json["Date"] = normalized_snapshot.get("Date", "未知") if normalized_snapshot else "未知"
-                    info_json["Amount"] = normalized_snapshot.get("Amount", "未知") if normalized_snapshot else "未知"
-
-                    purchaser = str(info_json.get("Purchaser", ""))
-                    doc_type = str(info_json.get("Type", ""))
-                    seller = str(info_json.get("Seller", ""))
-
-                    # 1. 通用分类归一化 (LLM Type + 文件名 + 商户名 三重检查)
-                    original_doc_type = doc_type
-                    classification_reason_codes = []
-                    
-                    # 1a. 国旅运通 (CWT) 优先检测 — 必须在通用分类之前
-                    #     多信号检测: 发件人(@citsgbt.com) / Seller / Subject / 文件名
-                    #     支持转发场景: notification@citsgbt.com 被转发时 sender 非原始
-                    #     GBT Travel Services 是国旅运通的海外出票实体（SCCT号发票→差旅服务费）
-                    #     取消知会: 文件名含"取消" → 标记 _cwt_cancellation，后续撮合送 Manual_Check
-                    _is_cwt = (
-                        "citsgbt.com" in str(info.get("sender", "")).lower()
-                        or any(kw in seller for kw in ["国旅运通", "CWT", "Carlson Wagonlit", "citsgbt", "GBT Travel"])
-                        or any(kw in str(info.get("subject", "")).lower() for kw in ["citsgbt", "国旅运通", "cwt", "cits gbt", "scct"])
-                        or any(kw in file_name.lower() for kw in ["citsgbt", "国旅运通", "cwt", "scct"])
-                    )
-                    if _is_cwt:
-                        doc_type, cwt_reason_codes = classify_cwt_document_type(
-                            info_json,
-                            info,
-                            file_name,
-                            local_cits_fast_path=(
-                                extraction_trace.get("engine") == "local_cits_gbt_pdf"
-                                or extraction_trace.get("reason_code") == "LOCAL_CITS_GBT_PDF_FAST_PATH"
-                            ),
-                        )
-                        classification_reason_codes.extend(cwt_reason_codes)
-                    else:
-                        doc_type, normalized_reason_codes = normalize_document_type_for_archive(info_json, file_name)
-                        classification_reason_codes.extend(normalized_reason_codes)
-                    if self._compact_text(doc_type) in {
-                        self._compact_text("\u673a\u7968"),
-                        self._compact_text("\u822a\u73ed\u884c\u7a0b\u5355"),
-                    } and self._looks_like_train_ticket(
-                        original_doc_type,
-                        seller,
-                        info_json,
-                        info,
-                        file_name,
-                        pdf_path=pdf_path,
-                    ):
-                        doc_type = "\u706b\u8f66\u7968"
-                        classification_reason_codes.append("CLASSIFIED_AS_TRAIN_BY_STRONG_EVIDENCE")
-                    info_json["Type"] = doc_type
-
-                    is_exempt = is_exempt_type(doc_type)
-
-                    # 3. 公司抬头分流 (仅针对非豁免票据，如餐饮、住宿发票等)
-                    if not is_exempt:
-                        active_company = self._resolve_active_company()
-                        purchaser_relation = classify_purchaser_relation(purchaser, active_company)
-                        if purchaser_relation == "non_target":
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "拦截:", "color": "text-yellow-400", "msg": f"购买方与目标公司不匹配 ({purchaser})，已分流到非目标公司发票"})
-                            info_json["Type"] = "非目标公司发票"
-                            classification_reason_codes.append("CLASSIFIED_AS_NON_TARGET_COMPANY")
-                        elif purchaser_relation == "unknown":
-                            review_path = self._send_to_manual_check(
-                                save_path,
-                                pdf_path,
-                                "COMPANY_PURCHASER_UNKNOWN",
-                                metadata=self._attachment_diag_metadata(
-                                    info,
-                                    file_name=file_name,
-                                    document_id=document_id,
-                                    extra={
-                                        "tier": tier_info,
-                                        "seller": seller,
-                                        "purchaser": purchaser,
-                                        "doc_type": doc_type,
-                                        "target_company": active_company,
-                                    },
-                                ),
-                                is_url=info.get("is_url", False),
-                            )
-                            self.stats["errors"] += 1
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "复核:", "color": "text-yellow-400", "msg": f"购买方字段缺失或低置信度，已移入待人工复核: {os.path.basename(review_path)}"})
-                            trace_store.set_fields(
-                                document_id,
-                                normalized_fields=normalized_snapshot,
-                                classification_result={
-                                    "status": "manual_review",
-                                    "original_type": original_doc_type,
-                                    "final_type": info_json.get("Type", ""),
-                                    "category": MANUAL_REVIEW_FOLDER,
-                                    "is_invoice": is_invoice,
-                                    "is_exempt": is_exempt,
-                                    "purchaser_relation": purchaser_relation,
-                                },
-                                naming_result={"status": "manual_check", "reason_code": "COMPANY_PURCHASER_UNKNOWN"},
-                                archive_target=review_path,
-                            )
-                            self.error_invoices.append({
-                                "id": f"inv_{time.time()}_{i}",
-                                "date": info_json.get("Date", "---"),
-                                "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                                "category": "待人工复核",
-                                "merchant": info_json.get("Seller", "未知开票方"),
-                                "path": review_path,
-                                "name": os.path.basename(review_path),
-                                "artifact_kind": "manual_check",
-                                "sColor": "bg-yellow-500",
-                                "status": "待人工复核",
-                                "reason": "购买方字段缺失或低置信度，需人工确认是否属于目标公司",
-                                "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50",
-                            })
-                            processed_filepaths.add(pdf_path)
-                            continue
-
-                    # Step C: 回传记录前端
-                    category_name = get_archive_folder(info_json.get("Type", "未知分类"))
-                    self.discovered_categories.add(category_name)
-                    trace_store.set_fields(
-                        document_id,
-                        normalized_fields=normalized_snapshot,
-                        classification_result={
-                            "status": "classified",
-                            "original_type": original_doc_type,
-                            "final_type": info_json.get("Type", ""),
-                            "category": category_name,
-                            "is_invoice": is_invoice,
-                            "is_exempt": is_exempt,
-                            "is_itinerary_or_folio": is_itinerary_or_folio,
-                            "reason_code": classification_reason_codes[-1] if classification_reason_codes else "CLASSIFICATION_FROM_MODEL_TYPE",
-                            "reason_codes": classification_reason_codes,
-                        },
-                    )
-                    
-                    # --- Business Logic Deduplication (拦截重复发票) ---
-                    invoice_code = info_json.get("InvoiceCode", "").strip()
-                    invoice_number = info_json.get("InvoiceNumber", "").strip()
-                    if invoice_code or invoice_number:
-                        if extractor.is_duplicate(invoice_code, invoice_number, business_records):
-                            self.stats["errors"] += 1
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "去重:", "color": "text-yellow-400", "msg": f"已触发发票去重机制 (发票代码/号码相同): {file_name}"})
-                            processed_filepaths.add(pdf_path)
-                            duplicate_path = self._retain_artifact(
-                                save_path,
-                                pdf_path,
-                                "duplicates",
-                                "命中业务去重规则，保留原件供复核",
-                                {
-                                    "subject": info.get("subject", ""),
-                                    "tier": tier_info,
-                                    "file_name": file_name,
-                                    "invoice_code": invoice_code,
-                                    "invoice_number": invoice_number
-                                }
-                            )
-                            
-                            # Log as duplicate in error output for visibility
-                            self.error_invoices.append({
-                                "id": f"inv_{time.time()}_{i}",
-                                "date": info_json.get("Date", "---"),
-                                "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                                "category": category_name,
-                                "merchant": info_json.get("Seller", "未知开票方"),
-                                "path": duplicate_path,
-                                "name": file_name,
-                                "sColor": "bg-gray-400",
-                                "status": "重复跳过",
-                                "reason": f"代码:{invoice_code} 号码:{invoice_number}",
-                                "rColor": "text-gray-600 border-gray-200 bg-gray-50"
-                            })
-                            trace_store.set_fields(
-                                document_id,
-                                naming_result={"status": "skipped", "reason_code": "BUSINESS_DUPLICATE_SKIPPED"},
-                                archive_target=duplicate_path,
-                            )
-                            _mark_combine_not_applicable(
-                                document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "Document was skipped by business de-duplication before archive/combine.",
-                            )
-                            trace_store.record_failure_event(
-                                document_id,
-                                "BUSINESS_DUPLICATE_SKIPPED",
-                                "dedup",
-                                f"发票代码/号码重复: {invoice_code}/{invoice_number}",
-                                severity="skipped",
-                            )
-                            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "保全:", "color": "text-gray-400", "msg": f"重复票据已保留原件副本: {file_name}"})
-                            continue
-                    
-                    # Step D: 分发与降级逻辑 (Tier 3 阻断)
-                    # CWT 豁免: 已通过多信号检测的 CWT 文档不受 Tier 3 降级
-                    # 这些文档有明确的发件人/Subject/文件名信号，分类可信度高
-                    _cwt_classified = any(
-                        rc.startswith("CLASSIFIED_AS_CWT_") or rc.startswith("CWT_")
-                        for rc in classification_reason_codes
-                    )
-                    if tier_info == 3 and not _cwt_classified:
-                        self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "异常:", "color": "text-yellow-400", "msg": f"边缘触发需人工复核: {file_name}"})
-                        retained_path = self._send_to_manual_check(
-                            save_path,
-                            pdf_path,
-                            "TIER3_MANUAL_REVIEW",
-                            metadata={
-                                "subject": info.get("subject", ""),
-                                "tier": tier_info,
-                                "file_name": file_name,
-                            },
-                            is_url=False,
-                        )
-                        self.error_invoices.append({
-                            "id": f"inv_{time.time()}_{i}",
-                            "date": info_json.get("Date", "---"),
-                            "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                            "category": category_name,
-                            "merchant": info_json.get("Seller", "未知开票方"),
-                            "path": retained_path,
-                            "name": os.path.basename(retained_path),
-                            "sColor": "bg-yellow-500",
-                            "status": "待人工复核",
-                            "reason": "边缘触发",
-                            "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
-                            # 重点：Tier 3 不执行 route_and_rename_file 归档，保留在暂存区或直接标记
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result={"status": "skipped", "reason_code": "TIER3_MANUAL_REVIEW"},
-                            archive_target=retained_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Tier 3 documents do not enter archive/combine.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            "TIER3_MANUAL_REVIEW",
-                            "classification",
-                            "Tier 3 边缘触发，转人工复核。",
-                            severity="failure",
-                        )
-                        processed_filepaths.add(pdf_path)
-                        continue
-                    
-                    # 正常成功提取 (Tier 1, 2, 4)
-                    
-                    # --- Date Gatekeeper 已移除 ---
-                    # 日期过滤仅由 IMAP 邮件搜索阶段控制 (SINCE/BEFORE)
-                    # 发票开票日期不应被限制，因为开票日期可能早于邮件日期
-
-                    # CWT 取消知会 → 直接送 Manual_Check，记录撮合信息
-                    if info_json.get("_cwt_cancellation"):
-                        retained_path = self._send_to_manual_check(
-                            save_path, pdf_path, "CWT_HOTEL_CANCELLATION",
-                            metadata={"subject": info.get("subject", ""), "file_name": file_name},
-                        )
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-amber-400", "msg": f"CWT取消知会已送人工复核: {file_name}"})
-                        if not hasattr(self, '_cwt_cancellation_registry'):
-                            self._cwt_cancellation_registry = []
-                        self._cwt_cancellation_registry.append({
-                            "file_name": file_name,
-                            "manual_check_path": retained_path,
-                        })
-                        trace_store.set_fields(document_id, archive_target=retained_path)
-                        processed_filepaths.add(pdf_path)
-                        continue
-
-                    # 构建归档路由规则: CWT 类型映射到正确的目标文件夹
-                    # 航班行程单→机票, 住宿确认单→住宿发票(与发票/水单排序挨着)
-                    _archive_rules = {}
-                    _cur_type = info_json.get("Type", "")
-                    _mapped_folder = get_archive_folder(_cur_type)
-                    if _mapped_folder != _cur_type:
-                        _archive_rules[_cur_type] = _mapped_folder
-                    success, result_path = extractor.route_and_rename_file(pdf_path, info_json, custom_rules=_archive_rules or None)
-                    naming_trace = copy.deepcopy(getattr(extractor, "last_route_trace", {}) or {})
-                    routed_to_manual_check = bool(
-                        result_path
-                        and (
-                            MANUAL_REVIEW_FOLDER in result_path
-                            or naming_trace.get("used_manual_check")
-                        )
-                    )
-                    
-                    if success and routed_to_manual_check:
-                        self.audit_counts["manual_check"] += 1
-                        self.logs.append({
-                            "time": time.strftime("[%H:%M:%S]"),
-                            "type": "复核:",
-                            "color": "text-yellow-400",
-                            "msg": f"低置信度结果已移入人工复核: {os.path.basename(result_path)}",
-                        })
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result=naming_trace or {"status": "manual_check", "reason_code": "ROUTE_TO_MANUAL_CHECK"},
-                            archive_target=result_path,
-                        )
-                        self._safe_emit_artifact_event(
-                            "manual_check",
-                            result_path,
-                            document_id=document_id,
-                            source_kind=info.get("source_kind"),
-                            reason_code=naming_trace.get("reason_code") or "ROUTE_TO_MANUAL_CHECK",
-                            category=MANUAL_REVIEW_FOLDER,
-                            extra=self._attachment_diag_metadata(
-                                info,
-                                file_name=file_name,
-                                document_id=document_id,
-                                extra={
-                                    "final_type": info_json.get("Type", ""),
-                                    "seller": info_json.get("Seller", ""),
-                                },
-                            ),
-                        )
-                        self.error_invoices.append({
-                            "id": f"inv_{time.time()}_{i}",
-                            "date": info_json.get("Date", "---"),
-                            "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                            "category": "待人工复核",
-                            "merchant": info_json.get("Seller", "未知开票方"),
-                            "path": result_path,
-                            "name": os.path.basename(result_path),
-                            "artifact_kind": "manual_check",
-                            "sColor": "bg-yellow-500",
-                            "status": "待人工复核",
-                            "reason": "识别结果缺少关键字段，已移入待人工复核",
-                            "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50",
-                        })
-                        processed_filepaths.add(pdf_path)
-                        continue
-
-                    if success:
-                        final_category = (
-                            naming_trace.get("target_folder")
-                            or os.path.basename(os.path.dirname(result_path))
-                            or category_name
-                        )
-                        category_name = final_category
-                        success_count += 1
-                        self.stats["invoices"] = success_count
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "成功:", "color": "text-emerald-400", "msg": f"[{category_name}] 归档至: {os.path.basename(result_path)}"})
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result=naming_trace or {"status": "archived", "reason_code": None},
-                            archive_target=result_path,
-                        )
-                        self._safe_emit_artifact_event(
-                            "archive",
-                            result_path,
-                            document_id=document_id,
-                            source_kind=info.get("source_kind"),
-                            reason_code=naming_trace.get("reason_code"),
-                            category=final_category,
-                            extra=self._attachment_diag_metadata(
-                                info,
-                                file_name=file_name,
-                                document_id=document_id,
-                                extra={
-                                    "final_type": info_json.get("Type", ""),
-                                    "seller": info_json.get("Seller", ""),
-                                },
-                            ),
-                        )
-                        
-                        # 同步到前端数据分析模块要用到的发票列
-                        self.processed_invoices.append({
-                            "id": f"inv_{time.time()}_{i}",
-                            "date": info_json.get("Date", "---"),
-                            "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                            "category": final_category,
-                            "merchant": info_json.get("Seller", "未知开票方"),
-                            "path": result_path
-                        })
-                        processed_filepaths.add(pdf_path)
-                        
-                        # 记录成功提取的指纹，避免重复扣费
-                        working_history.add(history_key)
-                            
-                        # 更新 Business 去重字典，整轮成功后再统一持久化
-                        if invoice_code or invoice_number:
-                            dup_key = f"{invoice_code}_{invoice_number}"
-                            business_records[dup_key] = {"file": os.path.basename(result_path), "date": info_json.get("Date", ""), "amount": info_json.get("Amount", "")}
-                    else:
-                        self.stats["errors"] += 1
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "跳过:", "color": "text-yellow-400", "msg": f"未归档或放入人工分类: {file_name} ({result_path})"})
-                        self._record_error_log(save_path, info.get('subject', file_name), result_path)
-                        original_error = result_path
-                        if MANUAL_REVIEW_FOLDER not in result_path:
-                            result_path = self._retain_artifact(
-                                save_path,
-                                pdf_path,
-                                "archive_failures",
-                                "归档阶段失败，保全原件供后续复核",
-                                {
-                                    "subject": info.get("subject", ""),
-                                    "tier": tier_info,
-                                    "file_name": file_name,
-                                    "archive_error": result_path
-                                }
-                            )
-                        else:
-                            self.audit_counts["manual_check"] += 1
-                            self._safe_emit_artifact_event(
-                                "manual_check",
-                                result_path,
-                                document_id=document_id,
-                                source_kind=info.get("source_kind"),
-                                reason_code=naming_trace.get("reason_code") or "ROUTE_TO_MANUAL_CHECK",
-                                category=MANUAL_REVIEW_FOLDER,
-                                extra=self._attachment_diag_metadata(
-                                    info,
-                                    file_name=file_name,
-                                    document_id=document_id,
-                                ),
-                            )
-                        trace_store.set_fields(
-                            document_id,
-                            naming_result=naming_trace or {"status": "failed", "reason_code": "ARCHIVE_COPY_FAILED"},
-                            archive_target=result_path,
-                        )
-                        _mark_combine_not_applicable(
-                            document_id,
-                            "COMBINE_NOT_APPLICABLE",
-                            "Archive stage failed before combine could run.",
-                        )
-                        trace_store.record_failure_event(
-                            document_id,
-                            naming_trace.get("reason_code", "ARCHIVE_STAGE_FAILED"),
-                            "naming",
-                            naming_trace.get("error_message") or original_error,
-                            severity="failure",
-                        )
-                        processed_filepaths.add(pdf_path) # [Fix] Always mark as processed
-                        
-                        # 纳入人工分类的即使失败也要视为已处理，由 Manual_Check 承接
-                        if MANUAL_REVIEW_FOLDER in result_path:
-                            processed_filepaths.add(pdf_path)
-                            self.error_invoices.append({
-                                "id": f"inv_{time.time()}_{i}",
-                                "date": "---",
-                                "amount": "---",
-                            "category": "待人工复核",
-                                "merchant": "无法自动分类",
-                                "path": result_path,
-                                "name": os.path.basename(result_path),
-                                "sColor": "bg-yellow-500",
-                                "status": "待人工复核",
-                                "reason": result_path,
-                                "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
-                            })
-                        else:
-                            self.error_invoices.append({
-                                "id": f"inv_{time.time()}_{i}",
-                                "date": info_json.get("Date", "---"),
-                                "amount": f"¥ {info_json.get('Amount', '0.00')}",
-                                "category": category_name,
-                                "merchant": info_json.get("Seller", "未知开票方"),
-                                "path": result_path,
-                                "name": os.path.basename(result_path),
-                                "sColor": "bg-yellow-500",
-                                "status": "归档失败待复核",
-                                "reason": "归档阶段失败，已保全原件",
-                                "rColor": "text-yellow-600 border-yellow-200 bg-yellow-50"
-                            })
-
-                except Exception as loop_err:
-                    if isinstance(loop_err, QuotaExceededError):
-                        self.stats["errors"] += 1
-                        err_msg = str(loop_err)
-                        self._mark_quota_exhausted(err_msg)
-                        retained_path = self._retain_artifact(
-                            save_path,
-                            pdf_path,
-                            "glm_quota_exhausted",
-                            err_msg,
-                            {
-                                "subject": info.get("subject", ""),
-                                "tier": info.get("tier", 0),
-                                "file_name": file_name,
-                                "error": err_msg,
-                            },
-                        )
-                        self.error_invoices.append({
-                            "id": f"inv_{time.time()}_{i}",
-                            "date": "---",
-                            "amount": "---",
-                            "category": "额度不足/服务异常",
-                            "merchant": "GLM API",
-                            "path": retained_path,
-                            "name": os.path.basename(retained_path),
-                            "sColor": "bg-red-500",
-                            "status": "额度不足/服务异常",
-                            "reason": err_msg,
-                            "rColor": "text-red-600 border-red-200 bg-red-50"
-                        })
-                        trace_store.set_fields(document_id, archive_target=retained_path)
-                        trace_store.record_failure_event(
-                            document_id,
-                            "GLM_QUOTA_EXHAUSTED",
-                            "extraction",
-                            err_msg,
-                            severity="failure",
-                        )
-                        processed_filepaths.add(pdf_path)
-                        loop_result = "quota_exhausted"
-                        break
-
-                    self.stats["errors"] += 1
-                    err_msg = str(loop_err)
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"处理单张发票失败: {file_name} - {err_msg}"})
-                    retained_path = self._retain_artifact(
-                        save_path,
-                        pdf_path,
-                        "processing_errors",
-                        "处理单张票据时抛出异常，转人工复核保全",
-                        {
-                            "subject": info.get("subject", ""),
-                            "tier": info.get("tier", 0),
-                            "file_name": file_name,
-                            "error": err_msg
-                        }
-                    )
-                    self.error_invoices.append({
-                        "id": f"inv_{time.time()}_{i}",
-                        "date": "---",
-                        "amount": "---",
-                        "category": "解析失败",
-                        "merchant": "系统错误",
-                        "path": retained_path,
-                        "name": os.path.basename(retained_path),
-                        "sColor": "bg-yellow-500",
-                        "status": "处理异常",
-                        "reason": err_msg,
-                        "rColor": "text-red-600 border-red-200 bg-red-50"
-                    })
-                    trace_store.set_fields(document_id, archive_target=retained_path)
-                    _mark_combine_not_applicable(
-                        document_id,
-                        "COMBINE_NOT_APPLICABLE",
-                        "Unhandled document exception prevented archive/combine.",
-                    )
-                    trace_store.record_failure_event(
-                        document_id,
-                        "DOCUMENT_PROCESSING_EXCEPTION",
-                        "pipeline",
-                        err_msg,
-                        severity="failure",
-                    )
-                    import traceback
-                    self._record_error_log(save_path, info.get('subject', file_name), f"代码执行异常: {err_msg} - {traceback.format_exc().splitlines()[-1] if traceback.format_exc().splitlines() else ''}")
-                    processed_filepaths.add(pdf_path) # [Fix] Always mark as processed when exception hits
-                finally:
-                    time.sleep(0.5)
-
-            # --- PHASE 1: EXECUTE RECONCILIATION ---
-            import shutil
-            orphans = []
-            for og_path, og_info in ground_truth_files.items():
-                if og_path not in processed_filepaths and os.path.exists(og_path):
-                    orphans.append((og_path, og_info))
-            
-            if orphans:
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "对账:", "color": "text-red-500", "msg": f"警告：发现 {len(orphans)} 个未被处理的遗漏附件，正在强制转移至待处理区 (raw_invoices)。"})
-                raw_invoices_dir = os.path.join(save_path, "raw_invoices")
-                os.makedirs(raw_invoices_dir, exist_ok=True)
-                
-                import uuid
-                for orphan_path, orphan_info in orphans:
-                    try:
-                        orphan_filename = os.path.basename(orphan_path)
-                        short_uuid = uuid.uuid4().hex[:6]
-                        final_orphan_path = os.path.join(raw_invoices_dir, f"遗漏_{short_uuid}_{orphan_filename}")
-                        shutil.copy2(orphan_path, final_orphan_path)
-                        self.audit_counts["raw_invoices"] += 1
-                        orphan_document_id = None
-                        for record in trace_store.iter_records():
-                            if record.get("source_path") == orphan_path:
-                                orphan_document_id = record["document_id"]
-                                break
-                        
-                        self.error_invoices.append({
-                            "id": f"inv_orphan_{time.time()}_{len(self.error_invoices)}",
-                            "date": "---",
-                            "amount": "---",
-                            "category": "系统遗漏",
-                            "merchant": "未知开票方",
-                            "path": final_orphan_path,
-                            "name": orphan_filename,
-                            "sColor": "bg-red-500",
-                            "status": "处理中断遗漏",
-                            "reason": "Pipeline 断层遗漏",
-                            "rColor": "text-red-600 border-red-200 bg-red-50"
-                        })
-                        self.stats["errors"] += 1
-                        self._record_error_log(save_path, orphan_info.get('subject', orphan_filename), "Pipeline 断层对账遗漏兜底")
-                        self._safe_emit_artifact_event(
-                            "raw_invoices",
-                            final_orphan_path,
-                            document_id=orphan_document_id,
-                            source_kind=orphan_info.get("source_kind"),
-                            reason_code="PIPELINE_ORPHAN_RECOVERED",
-                            category="raw_invoices",
-                            extra=self._attachment_diag_metadata(
-                                orphan_info,
-                                file_name=orphan_filename,
-                                document_id=orphan_document_id,
-                            ),
-                        )
-                        if orphan_document_id:
-                            trace_store.set_fields(
-                                orphan_document_id,
-                                naming_result={"status": "skipped", "reason_code": "PIPELINE_ORPHAN_RECOVERED"},
-                                archive_target=final_orphan_path,
-                            )
-                            _mark_combine_not_applicable(
-                                orphan_document_id,
-                                "COMBINE_NOT_APPLICABLE",
-                                "Orphaned document was recovered after pipeline reconciliation.",
-                            )
-                            trace_store.record_failure_event(
-                                orphan_document_id,
-                                "PIPELINE_ORPHAN_RECOVERED",
-                                "reconciliation",
-                                "Pipeline 断层遗漏，已进入 raw_invoices 兜底。",
-                                severity="failure",
-                            )
-                    except Exception as e:
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"无法转移遗漏文件 {orphan_path}: {str(e)}"})
-                        
-            # --- PHASE 2: 票据撮合与交替重命名 ---
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": "开始执行发票↔行程单/水单撮合..."})
-            
-            def _reconcile_ride_documents(ride_folder_path):
-                """打车文件夹内的发票↔行程单撮合 + 交替重命名"""
-                if not os.path.isdir(ride_folder_path):
-                    return
-                
-                invoices = []
-                itineraries = []
-                
-                for fname in os.listdir(ride_folder_path):
-                    fpath = os.path.join(ride_folder_path, fname)
-                    if not os.path.isfile(fpath):
-                        continue
-                    meta = parse_archived_filename(fname)
-                    meta["path"] = fpath
-                    meta["filename"] = fname
-                    meta["document_id"] = trace_store.get_document_id_by_archive_target(fpath)
-                    
-                    # 判断是发票还是行程单
-                    if is_ride_itinerary_filename(fname):
-                        itineraries.append(meta)
-                        _record_combine_candidate(meta["document_id"], "ride", "itinerary", meta)
-                    else:
-                        invoices.append(meta)
-                        _record_combine_candidate(meta["document_id"], "ride", "invoice", meta)
-                
-                if not invoices or not itineraries:
-                    reason_code = "RIDE_COMBINE_INSUFFICIENT_CANDIDATES"
-                    for meta in invoices + itineraries:
-                        _record_combine_result(
-                            meta.get("document_id"),
-                            "not_matched",
-                            reason_code,
-                            "打车目录缺少发票或行程单，无法撮合。",
-                        )
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-gray-400", "msg": f"打车目录: 发票{len(invoices)}张, 行程单{len(itineraries)}张, 无法撮合"})
-                    return
-                
-                # 金额匹配: 精确匹配或 1.03 税务容差；打车月末集中开票，不做日期约束。
-                matched = match_ride_pairs(invoices, itineraries)
-                
-                # 交替重命名
-                for idx, (inv, itn) in enumerate(matched, 1):
-                    inv_document_id = inv.get("document_id")
-                    itn_document_id = itn.get("document_id")
-                    try:
-                        rename = build_ride_pair_renames(inv, itn, idx)
-                        inv_new = rename.invoice_filename
-                        itn_new = rename.supporting_filename
-                        
-                        inv_new_path = os.path.join(ride_folder_path, inv_new)
-                        itn_new_path = os.path.join(ride_folder_path, itn_new)
-                        
-                        os.rename(inv["path"], inv_new_path)
-                        os.rename(itn["path"], itn_new_path)
-                        trace_store.move_archive_target(inv["path"], inv_new_path)
-                        trace_store.move_archive_target(itn["path"], itn_new_path)
-                        _record_combine_result(
-                            inv_document_id,
-                            "matched",
-                            "RIDE_COMBINE_MATCHED",
-                            "打车发票已成功撮合并重命名。",
-                            paired_with=os.path.basename(itn_new_path),
-                            pair_index=idx,
-                            final_filename=inv_new,
-                        )
-                        _record_combine_result(
-                            itn_document_id,
-                            "matched",
-                            "RIDE_COMBINE_MATCHED",
-                            "打车行程单已成功撮合并重命名。",
-                            paired_with=os.path.basename(inv_new_path),
-                            pair_index=idx,
-                            final_filename=itn_new,
-                        )
-                        
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": f"✅ {rename.pair_label}配对 #{idx}: {inv_new} ↔ {itn_new}"})
-                    except Exception as e:
-                        _record_combine_result(
-                            inv_document_id,
-                            "rename_failed",
-                            "RIDE_COMBINE_RENAME_FAILED",
-                            str(e),
-                        )
-                        _record_combine_result(
-                            itn_document_id,
-                            "rename_failed",
-                            "RIDE_COMBINE_RENAME_FAILED",
-                            str(e),
-                        )
-                        trace_store.record_failure_event(
-                            inv_document_id,
-                            "RIDE_COMBINE_RENAME_FAILED",
-                            "combine",
-                            str(e),
-                            severity="failure",
-                        )
-                        trace_store.record_failure_event(
-                            itn_document_id,
-                            "RIDE_COMBINE_RENAME_FAILED",
-                            "combine",
-                            str(e),
-                            severity="failure",
-                        )
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"重命名失败: {e}"})
-                
-                # 报告未匹配
-                unmatched_inv = [inv for inv in invoices if inv not in [m[0] for m in matched]]
-                unmatched_itn = [itn for itn in itineraries if itn not in [m[1] for m in matched]]
-                for inv in unmatched_inv:
-                    _record_combine_result(
-                        inv.get("document_id"),
-                        "not_matched",
-                        "RIDE_COMBINE_NO_MATCH",
-                        "未找到可匹配的打车行程单。",
-                    )
-                for itn in unmatched_itn:
-                    _record_combine_result(
-                        itn.get("document_id"),
-                        "not_matched",
-                        "RIDE_COMBINE_NO_MATCH",
-                        "未找到可匹配的打车发票。",
-                    )
-                if unmatched_inv:
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-yellow-400", "msg": f"未匹配发票 {len(unmatched_inv)} 张: {', '.join(u['filename'] for u in unmatched_inv)}"})
-                if unmatched_itn:
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-yellow-400", "msg": f"未匹配行程单 {len(unmatched_itn)} 张: {', '.join(u['filename'] for u in unmatched_itn)}"})
-                
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": f"打车撮合完成: 成功配对 {len(matched)} 组"})
-            
-            def _reconcile_hotel_documents(hotel_folder_path):
-                """住宿文件夹内的发票↔水单撮合 + 交替重命名"""
-                if not os.path.isdir(hotel_folder_path):
-                    return
-                
-                invoices = []
-                folios = []
-                
-                for fname in os.listdir(hotel_folder_path):
-                    fpath = os.path.join(hotel_folder_path, fname)
-                    if not os.path.isfile(fpath):
-                        continue
-                    meta = parse_archived_filename(fname)
-                    meta["path"] = fpath
-                    meta["filename"] = fname
-                    meta["document_id"] = trace_store.get_document_id_by_archive_target(fpath)
-                    
-                    # 住宿确认单/航班行程单不参与发票↔水单撮合
-                    if is_hotel_order_filename(fname):
-                        _record_combine_result(
-                            meta.get("document_id"),
-                            "not_applicable",
-                            "COMBINE_ORDER_EXCLUDED",
-                            "订单确认单不参与发票↔水单撮合。",
-                        )
-                        continue
-                    if is_hotel_folio_filename(fname):
-                        folios.append(meta)
-                        _record_combine_candidate(meta["document_id"], "hotel", "folio", meta)
-                    else:
-                        invoices.append(meta)
-                        _record_combine_candidate(meta["document_id"], "hotel", "invoice", meta)
-                
-                if not invoices or not folios:
-                    reason_code = "HOTEL_COMBINE_INSUFFICIENT_CANDIDATES"
-                    for meta in invoices + folios:
-                        _record_combine_result(
-                            meta.get("document_id"),
-                            "not_matched",
-                            reason_code,
-                            "住宿目录缺少发票或水单，无法撮合。",
-                        )
-                    self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-gray-400", "msg": f"住宿目录: 发票{len(invoices)}张, 水单{len(folios)}张, 无法撮合"})
-                    return
-                
-                # 联合主键匹配: 金额精确 + 日期 0-3 天容差；日期解析失败时仅凭金额。
-                matched = match_hotel_pairs(invoices, folios)
-                
-                # 交替重命名
-                for idx, (inv, fol) in enumerate(matched, 1):
-                    inv_document_id = inv.get("document_id")
-                    fol_document_id = fol.get("document_id")
-                    try:
-                        rename = build_hotel_pair_renames(inv, fol, idx)
-                        inv_new = rename.invoice_filename
-                        fol_new = rename.supporting_filename
-                        
-                        inv_new_path = os.path.join(hotel_folder_path, inv_new)
-                        fol_new_path = os.path.join(hotel_folder_path, fol_new)
-                        
-                        os.rename(inv["path"], inv_new_path)
-                        os.rename(fol["path"], fol_new_path)
-                        trace_store.move_archive_target(inv["path"], inv_new_path)
-                        trace_store.move_archive_target(fol["path"], fol_new_path)
-                        _record_combine_result(
-                            inv_document_id,
-                            "matched",
-                            "HOTEL_COMBINE_MATCHED",
-                            "住宿发票已成功撮合并重命名。",
-                            paired_with=os.path.basename(fol_new_path),
-                            pair_index=idx,
-                            final_filename=inv_new,
-                        )
-                        _record_combine_result(
-                            fol_document_id,
-                            "matched",
-                            "HOTEL_COMBINE_MATCHED",
-                            "住宿水单已成功撮合并重命名。",
-                            paired_with=os.path.basename(inv_new_path),
-                            pair_index=idx,
-                            final_filename=fol_new,
-                        )
-                        
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": f"✅ 住宿配对 #{idx}: {inv_new} ↔ {fol_new}"})
-                    except Exception as e:
-                        _record_combine_result(
-                            inv_document_id,
-                            "rename_failed",
-                            "HOTEL_COMBINE_RENAME_FAILED",
-                            str(e),
-                        )
-                        _record_combine_result(
-                            fol_document_id,
-                            "rename_failed",
-                            "HOTEL_COMBINE_RENAME_FAILED",
-                            str(e),
-                        )
-                        trace_store.record_failure_event(
-                            inv_document_id,
-                            "HOTEL_COMBINE_RENAME_FAILED",
-                            "combine",
-                            str(e),
-                            severity="failure",
-                        )
-                        trace_store.record_failure_event(
-                            fol_document_id,
-                            "HOTEL_COMBINE_RENAME_FAILED",
-                            "combine",
-                            str(e),
-                            severity="failure",
-                        )
-                        self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"重命名失败: {e}"})
-                
-                unmatched_inv = [inv for inv in invoices if inv not in [m[0] for m in matched]]
-                unmatched_fol = [fol for fol in folios if fol not in [m[1] for m in matched]]
-                for inv in unmatched_inv:
-                    _record_combine_result(
-                        inv.get("document_id"),
-                        "not_matched",
-                        "HOTEL_COMBINE_NO_MATCH",
-                        "未找到可匹配的住宿水单。",
-                    )
-                for fol in unmatched_fol:
-                    _record_combine_result(
-                        fol.get("document_id"),
-                        "not_matched",
-                        "HOTEL_COMBINE_NO_MATCH",
-                        "未找到可匹配的住宿发票。",
-                    )
-
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-blue-400", "msg": f"住宿撮合完成: 成功配对 {len(matched)} 组"})
-            
-            # 执行撮合
-            ride_folder = os.path.join(save_path, "打车")
-            hotel_folder = os.path.join(save_path, "住宿发票")
-            
-            try:
-                _reconcile_ride_documents(ride_folder)
-            except Exception as e:
-                phase2_had_error = True
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"打车撮合异常: {e}"})
-            
-            try:
-                _reconcile_hotel_documents(hotel_folder)
-            except Exception as e:
-                phase2_had_error = True
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"住宿撮合异常: {e}"})
-            
-            phase2_completed = True
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "完成:", "color": "text-emerald-400", "msg": "Phase 2 撮合全部完成"})
-
-        except Exception as main_loop_err:
-            loop_result = "failed"
-            print(f">>> [错误] 核心处理循环发生异常: {main_loop_err}")
-            self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"批量处理异常: {main_loop_err}"})
-            self._safe_emit_stage_event("_run_processing_loop", "exit", {"result": "failed", "reason": str(main_loop_err)})
-        finally:
-            _finalize_trace_defaults()
-            try:
-                trace_store.flush()
-            except Exception as trace_err:
-                self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "错误:", "color": "text-red-400", "msg": f"诊断 trace 写入失败: {trace_err}"})
-            if loop_result == "failed" or self.quota_exhausted:
-                failure_reason = "quota_exhausted" if self.quota_exhausted else "processing_failed"
-                self._mark_output_run_state(
-                    output_state_dir,
-                    "failed",
-                    failure_reason=failure_reason,
-                    history_count=len(committed_history),
-                    business_record_count=len(business_records or {}),
-                )
-            elif self._stop_requested:
-                self._mark_output_run_state(
-                    output_state_dir,
-                    "aborted",
-                    failure_reason="safe_stop_requested",
-                    history_count=len(committed_history),
-                    business_record_count=len(business_records or {}),
-                )
-            else:
-                self._commit_output_state(output_state_dir, working_history, business_records)
-            if loop_result != "failed":
-                self._safe_emit_stage_event(
-                    "_run_processing_loop",
-                    "exit",
-                    {
-                        "result": loop_result,
-                        "attachments": total_attachments,
-                    },
-                )
+        pipeline = ExtractionPipeline(
+            local_parser=preflight,
+            remote_extractor=remote,
+            max_workers=2,
+            verified_ceiling=remote.verified_ceiling,
+            stop_requested=lambda: bool(getattr(self, "_stop_requested", False)),
+            progress_callback=_progress,
+            trace_sink=_trace,
+        )
+        return _ProcessingPipelineSession(
+            api=self,
+            candidates=candidates,
+            pipeline=pipeline,
+            archive_service=archive_service,
+            save_path=save_path,
+            output_state_dir=output_state_dir,
+            working_history=working_history,
+            business_records=business_records,
+            sidecar=sidecar,
+            trace_store=trace_store,
+            owned_extractor=_owned_extractor,
+            provider_retry_delay_seconds=20.0,
+        )
 
     def _retain_artifact(self, save_path, source_path, bucket, reason, metadata=None):
         """在 staging 清理前保留一份可追踪的原件副本。"""
         import json
-        import re
         import shutil
         import uuid
 
         retention_dir = os.path.join(save_path, "_audit_retention", bucket)
         os.makedirs(retention_dir, exist_ok=True)
+        runtime_metadata = dict(metadata or {})
+        safe_metadata = self._sanitize_url_persistence_payload(runtime_metadata)
 
         is_url_placeholder = (
-            metadata
+            runtime_metadata
             and (
-                metadata.get("source_kind") == "url"
+                runtime_metadata.get("source_kind") == "url"
                 or str(source_path).startswith(("http://", "https://"))
             )
             and (not source_path or not os.path.exists(source_path))
         )
 
         if is_url_placeholder:
-            subject = str((metadata or {}).get("subject", "LinkRetention"))
-            safe_subject = re.sub(r"\s+", "_", re.sub(r'[\\/:*?"<>|]+', "_", subject)).strip(" _")[:40] or "LinkRetention"
-            candidate_index = int((metadata or {}).get("candidate_index", 1) or 1)
-            original_name = f"LinkRetention_{safe_subject}_{candidate_index}.url.txt"
+            url_evidence = build_url_evidence(source_path, bucket)
+            candidate_index = int(runtime_metadata.get("candidate_index", 1) or 1)
+            original_name = (
+                f"LinkRetention_{url_evidence['source_hash'][:16]}_"
+                f"{candidate_index}.url.txt"
+            )
             target_name = original_name
             target_path = os.path.join(retention_dir, target_name)
             while os.path.exists(target_path):
@@ -4094,7 +2765,7 @@ class InvoiceAppAPI:
                 target_name = f"{stem}_{uuid.uuid4().hex[:6]}{ext}"
                 target_path = os.path.join(retention_dir, target_name)
             with open(target_path, "w", encoding="utf-8") as fh:
-                fh.write(str(source_path))
+                json.dump(url_evidence, fh, ensure_ascii=False, indent=2)
         else:
             if not source_path or not os.path.exists(source_path):
                 return source_path
@@ -4111,13 +2782,20 @@ class InvoiceAppAPI:
 
         sidecar = f"{target_path}.json"
         payload = {
-            "reason": reason,
-            "original_path": self._user_safe_source_reference(source_path),
-            "retained_path": target_path,
+            "kind": "retention",
+            "status": "retained",
+            "reason_code": str(bucket),
+            "reason_hash": stable_hash(reason),
+            "source_hash": stable_hash(
+                source_path if is_url_placeholder else self._user_safe_source_reference(source_path)
+            ),
+            "retained_name_hash": stable_hash(os.path.basename(target_path)),
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        if metadata:
-            payload["metadata"] = metadata
+        if is_url_placeholder:
+            payload.update(url_evidence)
+        if safe_metadata:
+            payload["metadata"] = safe_metadata
 
         try:
             with open(sidecar, "w", encoding="utf-8") as fh:
@@ -4128,15 +2806,15 @@ class InvoiceAppAPI:
         self.audit_counts["retention"] = int(self.audit_counts.get("retention", 0) or 0) + 1
         self._safe_emit_artifact_event(
             "retention",
-            target_path,
-            document_id=(metadata or {}).get("document_id"),
-            source_kind=(metadata or {}).get("source_kind"),
-            reason_code=(metadata or {}).get("prefilter_reason_code") or bucket,
+            os.path.basename(target_path),
+            document_id=safe_metadata.get("document_hash"),
+            source_kind=safe_metadata.get("source_kind"),
+            reason_code=safe_metadata.get("prefilter_reason_code") or bucket,
             category=bucket,
             extra={
                 "bucket": bucket,
-                "retention_reason": reason,
-                "metadata": metadata or {},
+                "retention_reason_hash": stable_hash(reason),
+                "metadata": safe_metadata,
             },
         )
 
@@ -4145,12 +2823,13 @@ class InvoiceAppAPI:
     def _send_to_manual_check(self, save_path, source_path, reason, metadata=None, is_url=False):
         """把待人工复核候选写入用户输出目录下的中文复核目录。"""
         import json
-        import re
         import shutil
         import uuid
 
         manual_dir = os.path.join(save_path, MANUAL_REVIEW_FOLDER)
         os.makedirs(manual_dir, exist_ok=True)
+        runtime_metadata = dict(metadata or {})
+        safe_metadata = self._sanitize_url_persistence_payload(runtime_metadata)
 
         def _unique_path(filename):
             target_path = os.path.join(manual_dir, filename)
@@ -4162,38 +2841,40 @@ class InvoiceAppAPI:
             return target_path
 
         if is_url:
-            subject = ""
-            if metadata:
-                subject = str(metadata.get("subject", "LinkReview"))
-            safe_subject = re.sub(r'\s+', '_', re.sub(r'[\\/:*?"<>|]+', '_', subject)).strip(" _")[:40] or "LinkReview"
-            candidate_index = 1
-            if metadata:
-                candidate_index = int(metadata.get("candidate_index", 1) or 1)
-            target_path = _unique_path(f"P0_LinkReview_{safe_subject}_{candidate_index}.url.txt")
+            url_evidence = build_url_evidence(source_path, reason)
+            candidate_index = int(runtime_metadata.get("candidate_index", 1) or 1)
+            target_path = _unique_path(
+                f"P0_LinkReview_{url_evidence['source_hash'][:16]}_"
+                f"{candidate_index}.url.txt"
+            )
             with open(target_path, "w", encoding="utf-8") as fh:
-                fh.write(str(source_path))
-            original_path = self._user_safe_source_reference(source_path)
+                json.dump(url_evidence, fh, ensure_ascii=False, indent=2)
         else:
             if not source_path or not os.path.exists(source_path):
                 return source_path
             original_name = os.path.basename(source_path)
             prefix = "P0_Review"
-            if metadata and metadata.get("file_name"):
-                original_name = os.path.basename(str(metadata["file_name"]))
+            if runtime_metadata.get("file_name"):
+                original_name = os.path.basename(str(runtime_metadata["file_name"]))
             target_path = _unique_path(f"{prefix}_{original_name}")
             shutil.copy2(source_path, target_path)
-            original_path = self._user_safe_source_reference(source_path)
 
         sidecar = f"{target_path}.json"
         payload = {
-            "reason": reason,
-            "original_path": original_path,
-            "review_path": target_path,
+            "kind": "manual_check",
+            "status": "pending_review",
+            "reason_hash": stable_hash(reason),
+            "source_hash": stable_hash(
+                source_path if is_url else self._user_safe_source_reference(source_path)
+            ),
+            "review_name_hash": stable_hash(os.path.basename(target_path)),
             "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "is_url": is_url,
         }
-        if metadata:
-            payload["metadata"] = metadata
+        if is_url:
+            payload.update(url_evidence)
+        if safe_metadata:
+            payload["metadata"] = safe_metadata
 
         try:
             with open(sidecar, "w", encoding="utf-8") as fh:
@@ -4204,14 +2885,15 @@ class InvoiceAppAPI:
         self.audit_counts["manual_check"] = int(self.audit_counts.get("manual_check", 0) or 0) + 1
         self._safe_emit_artifact_event(
             "manual_check",
-            target_path,
-            document_id=(metadata or {}).get("document_id"),
-            source_kind=(metadata or {}).get("source_kind"),
-            reason_code=reason,
+            os.path.basename(target_path),
+            document_id=safe_metadata.get("document_hash"),
+            source_kind=safe_metadata.get("source_kind"),
+            reason_code="manual_review",
             category=MANUAL_REVIEW_FOLDER,
             extra={
                 "is_url": bool(is_url),
-                "metadata": metadata or {},
+                "reason_hash": stable_hash(reason),
+                "metadata": safe_metadata,
             },
         )
 
@@ -4271,7 +2953,14 @@ class InvoiceAppAPI:
                         pass
                     self.logs.append({"time": time.strftime("[%H:%M:%S]"), "type": "撮合:", "color": "text-amber-400", "msg": f"匹配到取消对应的预订: {fn} ↔ {cancel_fn}"})
 
-    def _record_error_log(self, save_path, email_title, error_reason):
+    def _record_error_log(
+        self,
+        save_path,
+        email_title,
+        error_reason,
+        *,
+        url_candidate_info=None,
+    ):
         """记录错误日志到对应的 csv 文件中"""
         import os
         import csv
@@ -4281,6 +2970,10 @@ class InvoiceAppAPI:
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
             
+        if url_candidate_info:
+            email_title = self._url_candidate_label(url_candidate_info)
+            error_reason = f"URL_CANDIDATE_ERROR:{stable_hash(error_reason)[:16]}"
+
         log_file = os.path.join(save_path, "异常发票处理日志.csv")
         file_exists = os.path.exists(log_file)
         
@@ -4298,18 +2991,16 @@ class InvoiceAppAPI:
         except Exception as e:
             print(f"Failed to write error log: {e}")
 
-    def _cleanup_temp_folders(self):
+    def _cleanup_temp_folders(self, staging_dir=None, temp_dir=None):
         """自动清理程序执行过程中产生的临时文件夹"""
-        import os
         import shutil
-        current_dir = os.getcwd()
-        if self._run_context.get("enabled"):
-            temp_paths = [
-                self._run_context.get("staging_dir"),
-                os.path.join(self._run_context.get("run_root", ""), "temp"),
-            ]
-        else:
-            temp_paths = [os.path.join(current_dir, t_dir) for t_dir in ["staging", "temp"]]
+
+        if staging_dir is None and self._active_run_handle is not None:
+            staging_dir = self._active_run_handle.staging_dir
+        if temp_dir is None:
+            temp_dir = self._active_temp_dir
+        temp_paths = [staging_dir, temp_dir]
+        failures = []
 
         for target_path in temp_paths:
             if not target_path or not os.path.exists(target_path) or not os.path.isdir(target_path):
@@ -4318,13 +3009,18 @@ class InvoiceAppAPI:
                 shutil.rmtree(target_path)
                 print(f"Cleaned up temp folder: {target_path}")
             except Exception as e:
-                print(f"Failed to clean up {target_path}: {e}")
+                failure_id = stable_hash(f"{type(e).__name__}:{e}")[:12]
+                print(f"Failed to clean temporary folder [{failure_id}]")
                 self.logs.append({
                     "time": time.strftime("[%H:%M:%S]"),
                     "type": "ERROR",
                     "color": "text-error",
-                    "msg": f"Failed to clean temporary folder {target_path}: {e}",
+                    "msg": f"Failed to clean temporary folder [{failure_id}]",
                 })
+                failures.append((type(e).__name__, failure_id))
+        if failures:
+            exc_type, failure_id = failures[0]
+            raise RuntimeError(f"cleanup failed:{exc_type}:{failure_id}:count={len(failures)}")
 
     def _legacy_export_result_detail_pre_release_prep(self, export_path=""):
         try:
@@ -4397,58 +3093,46 @@ class InvoiceAppAPI:
         self._last_export_path = export_file
         return {"success": True, "message": "结果明细已导出", "path": export_file}
 
-    def _legacy_start_processing_pre_release_prep(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        '''
-        """前端点击执行时调用：新开线程防止卡死界面"""
-        import os
-        print(f"Start processing with rules: {rules_text}, save to: {save_path}, date range: {date_from} to {date_to}")
-        if self._is_running or (self._worker_thread and self._worker_thread.is_alive()):
-            return {"success": False, "message": "任务已在运行中"}
-            
-        # 目录保护：启动前先确保保存路径存在
-        try:
-            if not os.path.exists(save_path):
-                os.makedirs(save_path, exist_ok=True)
-        except Exception as e:
-            return {"success": False, "message": f"无法创建保存目录: {e}"}
-            
-        self._set_run_state("running", status_text="鍑嗗涓?", progress=5, last_error="")
-        self.status_text = "准备中"
-        
-        thread = threading.Thread(target=self._processing_worker, args=(rules_text, save_path, date_from, date_to, email_address, auth_code, api_key))
-        thread.daemon = True
-        thread.start()
-        self._worker_thread = thread
-        return {"success": True, "message": "任务已启动"}
-
-        '''
 
     def _start_async_finalizers(self, fetcher=None):
-        def _runner():
-            self._safe_emit_stage_event("cleanup_finalize", "enter")
-            self._cleanup_temp_folders()
-
-            if fetcher is not None:
-                try:
-                    fetcher.disconnect()
-                except Exception as exc:
-                    self.logs.append({
-                        "time": time.strftime("[%H:%M:%S]"),
-                        "type": "ERROR",
-                        "color": "text-error",
-                        "msg": f"Failed to disconnect mailbox cleanly: {exc}",
-                    })
-            self._safe_emit_stage_event("cleanup_finalize", "exit")
-
-        cleanup_thread = threading.Thread(target=_runner, daemon=True)
-        cleanup_thread.start()
-        return cleanup_thread
+        handle = self._active_run_handle or self._prepare_run_lifecycle()
+        if handle.state not in {RunState.FINALIZING, RunState.COMPLETED, RunState.FAILED}:
+            handle.advance(RunState.REPORTING)
+        if self.run_state != "finalizing":
+            self._mark_finalizing()
+        self._safe_emit_stage_event("cleanup_finalize", "enter")
+        staging_dir = handle.staging_dir
+        temp_dir = self._active_temp_dir
+        callbacks = [("report", self._await_truth_audit)]
+        if fetcher is not None:
+            callbacks.append(("disconnect", fetcher.disconnect))
+        callbacks.append(
+            (
+                "cleanup",
+                lambda: self._cleanup_temp_folders(staging_dir=staging_dir, temp_dir=temp_dir),
+            )
+        )
+        state = handle.finalize(callbacks)
+        self._safe_emit_stage_event(
+            "cleanup_finalize",
+            "exit",
+            {"result": "failed" if state is RunState.FAILED else "completed"},
+        )
+        return state
 
     def _mark_finalizing(self):
         finalizing_progress = self.progress if self.progress >= 95 else 99
         self._set_run_state("finalizing", status_text="正在收尾...", progress=finalizing_progress)
 
-    def _fail_run(self, status_text, error_message, fetcher=None, include_traceback=False):
+    def _fail_run(
+        self,
+        status_text,
+        error_message,
+        fetcher=None,
+        include_traceback=False,
+        reason_code="",
+        user_message="",
+    ):
         active_exc = sys.exc_info()[1]
         self._packaged_diag_write(
             "fail_run",
@@ -4457,20 +3141,28 @@ class InvoiceAppAPI:
             summary={"include_traceback": bool(include_traceback)},
             exc=active_exc,
         )
+        handle = self._active_run_handle
+        if handle is None:
+            handle = self._prepare_run_lifecycle()
+        if not reason_code or not user_message:
+            inferred_code, inferred_message = self._safe_failure_contract(status_text, error_message)
+            reason_code = reason_code or inferred_code
+            user_message = user_message or inferred_message
+        handle.fail(
+            active_exc or RuntimeError(error_message or reason_code),
+            reason_code=reason_code,
+            user_message=user_message,
+        )
         self._mark_finalizing()
         self._start_async_finalizers(fetcher)
-
-        if include_traceback:
-            import traceback
-            error_message = f"{error_message} | {traceback.format_exc()}"
 
         self.logs.append({
             "time": time.strftime("[%H:%M:%S]"),
             "type": "ERROR",
             "color": "text-error",
-            "msg": f"System exception: {error_message}",
+            "msg": f"System exception: {handle.error}",
         })
-        self._finish_run(False, status_text, last_error=error_message)
+        self._finish_run(False, status_text, last_error=handle.error)
 
     def _validate_date_range(self, date_from, date_to):
         date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -4604,6 +3296,8 @@ class InvoiceAppAPI:
         return list(grouped.values())
 
     def stop_processing(self):
+        if self.run_state == "finalizing":
+            return {"success": False, "message": "任务正在收尾，请稍候"}
         if not self._is_running or not (self._worker_thread and self._worker_thread.is_alive()):
             return {"success": False, "message": "当前没有正在运行的任务"}
         self._request_safe_stop()
@@ -4713,190 +3407,487 @@ class InvoiceAppAPI:
         self._last_export_path = export_file
         return {"success": True, "message": "运行摘要已导出", "path": export_file}
 
-    def start_processing(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
-        import os
+    def _finalize_admission_failure(self, handle, exc, *, reason_code="WORKER_START_FAILED"):
+        if handle.state in {RunState.COMPLETED, RunState.FAILED}:
+            return handle.state
+        handle.fail(
+            exc,
+            reason_code=reason_code,
+            user_message=str(
+                getattr(exc, "user_message", "") or "后台任务启动失败，请重试。"
+            ),
+        )
+        self._run_state_store.update(
+            run_state="finalizing",
+            progress=99,
+            status_text="正在收尾...",
+        )
+        staging_dir = handle.staging_dir
+        temp_dir = self._active_temp_dir
+        state = handle.finalize(
+            [
+                ("report", self._await_truth_audit),
+                (
+                    "cleanup",
+                    lambda: self._cleanup_temp_folders(
+                        staging_dir=staging_dir,
+                        temp_dir=temp_dir,
+                    ),
+                ),
+            ]
+        )
+        error = handle.error
+        self._run_state_store.terminalize(
+            "failed",
+            status_text="启动失败",
+            last_error=error,
+            reason_code=reason_code,
+            logs=[
+                {
+                    "time": time.strftime("[%H:%M:%S]"),
+                    "type": "ERROR",
+                    "color": "text-error",
+                    "msg": f"System exception: {error}",
+                }
+            ],
+        )
+        self._worker_thread = None
+        return state
 
-        if self._is_running or (self._worker_thread and self._worker_thread.is_alive()):
+    def _build_admission_candidate(
+        self,
+        *,
+        rules_text,
+        save_path,
+        date_from,
+        date_to,
+        email_address,
+        auth_code,
+        api_key,
+    ):
+        run_context = dict(load_run_context() or {})
+        requested_save_path = str(
+            save_path
+            or (
+                run_context.get("output_dir", "")
+                if run_context.get("enabled")
+                else resolve_default_save_path()
+            )
+        )
+        effective_save_path = str(
+            run_context.get("output_dir", requested_save_path)
+            if run_context.get("enabled")
+            else requested_save_path
+        )
+        effective_date_from = str(
+            (run_context.get("locked_date_from", "") if run_context.get("enabled") else "")
+            or date_from
+            or ""
+        )
+        effective_date_to = str(
+            (run_context.get("locked_date_to", "") if run_context.get("enabled") else "")
+            or date_to
+            or ""
+        )
+        date_error = self._validate_date_range(effective_date_from, effective_date_to)
+        if date_error:
+            return None, None, date_error
+
+        email_text = str(email_address or "")
+        email_domain = email_text.rsplit("@", 1)[-1].lower() if "@" in email_text else ""
+        candidate = _RunAdmissionCandidate(
+            rules_text=str(rules_text or ""),
+            requested_save_path=requested_save_path,
+            effective_save_path=effective_save_path,
+            date_from=effective_date_from,
+            date_to=effective_date_to,
+            account_id=stable_hash(email_text)[:12],
+            channel_id=email_domain.split(".", 1)[0] or "email",
+            email_domain=email_domain,
+            run_context_json=json.dumps(run_context, ensure_ascii=False, sort_keys=True),
+            started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        return candidate, _RunAdmissionSecrets(email_text, auth_code, api_key), ""
+
+    def _restore_failed_admission(self, previous, previous_settings, settings_existed, settings_touched):
+        if settings_touched:
+            try:
+                if settings_existed:
+                    self._settings_store.save(previous_settings)
+                else:
+                    self._settings_store.clear()
+            except Exception:
+                pass
+        for name, value in previous.items():
+            setattr(self, name, value)
+
+    def _reset_run_state_for_admission(self, run_id):
+        reset_kwargs = {
+            "status_text": "正在准备运行...",
+            "run_state": "running",
+            "progress": 5,
+        }
+        try:
+            self._run_state_store.reset(run_id, **reset_kwargs)
+            return
+        except Exception:
+            previous_store = self._run_state_store
+            self._run_state_store = RunStateStore(
+                event_sink=getattr(previous_store, "_event_sink", None),
+                state_sink=self._apply_run_state_snapshot,
+            )
+            try:
+                self._run_state_store.reset(run_id, **reset_kwargs)
+            except Exception:
+                pass
+            raise RuntimeError("run state initialization failed") from None
+
+    @staticmethod
+    def _admission_missing_directories(context, save_path):
+        targets = {
+            str(context.get(key) or "").strip()
+            for key in (
+                "run_root",
+                "output_dir",
+                "staging_dir",
+                "diagnostics_dir",
+                "monitoring_dir",
+                "qc_dir",
+            )
+        }
+        targets.add(str(save_path or "").strip())
+        missing = set()
+        for value in targets:
+            if not value:
+                continue
+            path = Path(value).resolve()
+            while not path.exists() and path != path.parent:
+                missing.add(path)
+                path = path.parent
+        return tuple(sorted(missing, key=lambda item: len(item.parts), reverse=True))
+
+    @staticmethod
+    def _remove_empty_admission_directories(paths):
+        import shutil
+
+        for path in paths:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            except OSError:
+                continue
+
+    @staticmethod
+    def _close_run_dependencies(dependencies):
+        service = getattr(dependencies, "report_service", None)
+        close = getattr(service, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _admit_processing_run(
+        self,
+        *,
+        candidate,
+        secrets,
+    ):
+        with self._admission_lock:
+            worker_active = bool(self._worker_thread and self._worker_thread.is_alive())
+            active_handle = self._active_run_handle
+            handle_active = bool(
+                active_handle
+                and active_handle.state not in {RunState.COMPLETED, RunState.FAILED}
+            )
+            if worker_active or handle_active or not self._run_lifecycle.can_begin:
+                return {"success": False, "message": "任务已在运行中"}
+            if active_handle is not None:
+                self._active_run_handle = None
+
+            previous = {
+                "_run_context": self._run_context,
+                "_current_run_id": self._current_run_id,
+                "_requested_save_path": self._requested_save_path,
+                "_effective_save_path": self._effective_save_path,
+                "_effective_date_from": self._effective_date_from,
+                "_effective_date_to": self._effective_date_to,
+                "_active_run_config": self._active_run_config,
+                "_active_temp_dir": self._active_temp_dir,
+                "_truth_audit_thread": self._truth_audit_thread,
+                "_truth_audit_job": self._truth_audit_job,
+            }
+            previous_settings = {}
+            settings_existed = os.path.exists(self._settings_store.settings_path)
+            settings_touched = False
+            handle = None
+            dependencies = None
+            admission_missing_dirs = ()
+            try:
+                self._run_context = candidate.run_context()
+                self._current_run_id = str(self._run_context.get("run_id", "") or "")
+                admission_missing_dirs = self._admission_missing_directories(
+                    self._run_context,
+                    candidate.effective_save_path,
+                )
+                handle = self._prepare_run_lifecycle()
+                self._reset_run_state_for_admission(handle.run_id)
+                from run_evidence import RevisionUnavailable
+
+                trusted_revision = str(self._revision_resolver() or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{40}", trusted_revision):
+                    raise RevisionUnavailable()
+                ensure_run_context_dirs(self._run_context)
+                previous_settings = self._settings_store.load() or {}
+                self._requested_save_path = candidate.requested_save_path
+                self._effective_save_path = candidate.effective_save_path
+                self._effective_date_from = candidate.date_from
+                self._effective_date_to = candidate.date_to
+
+                active_company = str(previous_settings.get("company") or "").strip()
+                remember_settings = bool(previous_settings.get("remember_settings", True))
+                self._active_run_config = {
+                    "company": active_company,
+                    "save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    "started_at": candidate.started_at,
+                }
+
+                os.makedirs(candidate.effective_save_path, exist_ok=True)
+                settings_payload = (
+                    {
+                        "email": secrets.email_address,
+                        "auth_code": secrets.auth_code,
+                        "api_key": secrets.api_key,
+                        "save_path": candidate.effective_save_path,
+                        "date_from": candidate.date_from,
+                        "date_to": candidate.date_to,
+                        "company": active_company,
+                        "remember_settings": True,
+                    }
+                    if remember_settings
+                    else {"remember_settings": False}
+                )
+                settings_touched = True
+                save_result = self.save_user_settings(settings_payload)
+                if not bool((save_result or {}).get("success")):
+                    raise RuntimeError("settings persistence failed")
+
+                request = RunRequest(
+                    run_id=handle.run_id,
+                    date_from=candidate.date_from,
+                    date_to=candidate.date_to,
+                    save_path=candidate.effective_save_path,
+                    rules_text=candidate.rules_text,
+                    account_id=candidate.account_id,
+                    channel_id=candidate.channel_id,
+                    before_exclusive=(
+                        datetime.strptime(candidate.date_to, "%Y-%m-%d")
+                        + timedelta(days=1)
+                    ).strftime("%Y-%m-%d"),
+                    account_domain=candidate.email_domain,
+                    mailbox="INBOX",
+                    target_identifier=active_company,
+                    run_mode=str(
+                        self._run_context.get("autostart_mode")
+                        or ("controlled-run" if self._run_context.get("enabled") else "interactive")
+                    ),
+                    run_root=str(self._run_context.get("run_root") or ""),
+                    evidence_required=bool(
+                        self._run_context.get("enabled")
+                        and self._run_context.get("run_root")
+                    ),
+                    candidate_version=str(
+                        self._run_context.get("candidate_version") or "source"
+                    ),
+                    trusted_revision=trusted_revision,
+                    validation_required=bool(
+                        self._run_context.get("validation_required", False)
+                    ),
+                    manifest_included_count=int(
+                        self._run_context.get("manifest_included_count", 0) or 0
+                    ),
+                )
+                dependencies = self._build_run_dependencies(
+                    request,
+                    email_address=secrets.email_address,
+                    auth_code=secrets.auth_code,
+                    api_key=secrets.api_key,
+                )
+                self._safe_write_run_config(
+                    secrets.email_address,
+                    auth_code=secrets.auth_code,
+                    api_key=secrets.api_key,
+                    request=request,
+                )
+            except Exception as exc:
+                self._close_run_dependencies(dependencies)
+                if handle is not None:
+                    reason_code = str(
+                        getattr(exc, "reason_code", "") or "WORKER_START_FAILED"
+                    )
+                    self._finalize_admission_failure(
+                        handle,
+                        exc,
+                        reason_code=reason_code,
+                    )
+                self._restore_failed_admission(
+                    previous,
+                    previous_settings,
+                    settings_existed,
+                    settings_touched,
+                )
+                self._remove_empty_admission_directories(admission_missing_dirs)
+                return {"success": False, "message": "后台任务启动失败"}
+
+            self._run_state_store.append_log(
+                "信息",
+                "前端请求已接收，后台任务正在启动。",
+                "text-blue-400",
+            )
+            self._packaged_diag_reset(
+                {
+                    "requested_save_path": candidate.requested_save_path,
+                    "effective_save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    "email_domain": candidate.email_domain,
+                    "has_auth_code": bool(secrets.auth_code),
+                    "has_api_key": bool(secrets.api_key),
+                }
+            )
+            self._packaged_diag_write(
+                "progress_5_written",
+                "start_processing",
+                "success",
+                summary={
+                    "requested_save_path": candidate.requested_save_path,
+                    "effective_save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    "email_domain": candidate.email_domain,
+                    "has_auth_code": bool(secrets.auth_code),
+                    "has_api_key": bool(secrets.api_key),
+                },
+            )
+            self._safe_emit_stage_event(
+                "start_processing",
+                "enter",
+                {
+                    "requested_save_path": candidate.requested_save_path,
+                    "effective_save_path": candidate.effective_save_path,
+                    "date_from": candidate.date_from,
+                    "date_to": candidate.date_to,
+                    **self._sensitive_summary(
+                        secrets.email_address,
+                        secrets.auth_code,
+                        secrets.api_key,
+                    ),
+                },
+            )
+            try:
+                self._start_truth_audit_async(secrets.email_address, secrets.auth_code)
+            except Exception as exc:
+                self._close_run_dependencies(dependencies)
+                self._safe_emit_stage_event(
+                    "start_processing",
+                    "exit",
+                    {"result": "failed", "reason": "WORKER_START_FAILED"},
+                )
+                self._finalize_admission_failure(handle, exc)
+                self._restore_failed_admission(
+                    previous,
+                    previous_settings,
+                    settings_existed,
+                    settings_touched,
+                )
+                return {"success": False, "message": "后台任务启动失败"}
+
+            thread = threading.Thread(
+                target=self._processing_worker,
+                args=(request, handle, dependencies),
+                name="InvoiceFlowWorker",
+                daemon=True,
+            )
+            self._worker_thread = thread
+            self._packaged_diag_write("worker_thread_created", "start_processing", "success")
+            try:
+                thread.start()
+            except Exception as exc:
+                self._close_run_dependencies(dependencies)
+                self._finalize_admission_failure(handle, exc)
+                self._restore_failed_admission(
+                    previous,
+                    previous_settings,
+                    settings_existed,
+                    settings_touched,
+                )
+                return {"success": False, "message": "后台任务启动失败"}
+            self._packaged_diag_write(
+                "worker_thread_started",
+                "start_processing",
+                "success",
+                summary={"thread_is_alive": bool(thread.is_alive())},
+            )
+            self._safe_emit_stage_event("start_processing", "exit", {"result": "started"})
+            return {"success": True, "message": "任务已启动"}
+
+    def start_processing(self, rules_text, save_path, date_from=None, date_to=None, email_address=None, auth_code=None, api_key=None):
+        if not self._run_lifecycle.can_begin or self._is_running or (self._worker_thread and self._worker_thread.is_alive()):
             return {"success": False, "message": "任务已在运行中"}
 
         if not email_address or not auth_code or not api_key:
             return {"success": False, "message": "缺少必要凭证，请填写邮箱、授权码和 API Key"}
 
-        run_context = self._refresh_run_context()
-        requested_save_path = save_path or self.get_default_save_path()
-        effective_save_path = self._effective_save_dir(requested_save_path)
-        effective_date_from, effective_date_to = self._effective_date_range(date_from, date_to)
-        date_error = self._validate_date_range(effective_date_from, effective_date_to)
+        candidate, secrets, date_error = self._build_admission_candidate(
+            rules_text=rules_text,
+            save_path=save_path,
+            date_from=date_from,
+            date_to=date_to,
+            email_address=email_address,
+            auth_code=auth_code,
+            api_key=api_key,
+        )
         if date_error:
             return {"success": False, "message": date_error}
 
-        print(
-            "Start processing",
-            {
-                "run_context_enabled": bool(run_context.get("enabled")),
-                "run_id": run_context.get("run_id", ""),
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "requested_date_from": date_from,
-                "requested_date_to": date_to,
-                "effective_date_from": effective_date_from,
-                "effective_date_to": effective_date_to,
-            },
+        return self._admit_processing_run(
+            candidate=candidate,
+            secrets=secrets,
         )
-        self._requested_save_path = requested_save_path
-        self._effective_save_path = effective_save_path
-        self._effective_date_from = effective_date_from or ""
-        self._effective_date_to = effective_date_to or ""
-        self._current_run_id = run_context.get("run_id", "")
-        ensure_run_context_dirs(run_context)
-
-        try:
-            if effective_save_path and not os.path.exists(effective_save_path):
-                os.makedirs(effective_save_path, exist_ok=True)
-        except Exception as exc:
-            return {"success": False, "message": f"无法创建输出目录: {exc}"}
-
-        current_settings = self._settings_store.load() or {}
-        remember_settings = bool(current_settings.get("remember_settings", True))
-        active_company = str(current_settings.get("company") or "").strip()
-        self._active_run_config = {
-            "company": active_company,
-            "save_path": effective_save_path,
-            "date_from": self._effective_date_from,
-            "date_to": self._effective_date_to,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        if remember_settings:
-            self.save_user_settings({
-                "email": email_address,
-                "auth_code": auth_code,
-                "api_key": api_key,
-                "save_path": effective_save_path,
-                "date_from": effective_date_from or "",
-                "date_to": effective_date_to or "",
-                "company": active_company,
-                "remember_settings": True,
-            })
-        else:
-            self.save_user_settings({"remember_settings": False})
-
-        self._packaged_diag_reset(
-            {
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "date_from": self._effective_date_from,
-                "date_to": self._effective_date_to,
-                "email_domain": self._packaged_diag_email_domain(email_address),
-                "has_auth_code": bool(auth_code),
-                "has_api_key": bool(api_key),
-            }
-        )
-        self._set_run_state("running", status_text="正在准备运行...", progress=5, last_error="")
-        self._packaged_diag_write(
-            "progress_5_written",
-            "start_processing",
-            "success",
-            summary={
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "date_from": self._effective_date_from,
-                "date_to": self._effective_date_to,
-                "email_domain": self._packaged_diag_email_domain(email_address),
-                "has_auth_code": bool(auth_code),
-                "has_api_key": bool(api_key),
-            },
-        )
-        self._safe_emit_stage_event(
-            "start_processing",
-            "enter",
-            {
-                "requested_save_path": requested_save_path,
-                "effective_save_path": effective_save_path,
-                "date_from": self._effective_date_from,
-                "date_to": self._effective_date_to,
-                **self._sensitive_summary(email_address, auth_code, api_key),
-            },
-        )
-        self.logs.append({
-            "time": time.strftime("[%H:%M:%S]"),
-            "type": "信息",
-            "color": "text-blue-400",
-            "msg": "前端请求已接收，后台任务正在启动。",
-        })
-        self._safe_write_run_config(email_address, auth_code=auth_code, api_key=api_key)
-        self._start_truth_audit_async(email_address, auth_code)
-
-        thread = threading.Thread(
-            target=self._processing_worker,
-            args=(rules_text, effective_save_path, self._effective_date_from, self._effective_date_to, email_address, auth_code, api_key),
-            name="InvoiceFlowWorker",
-            daemon=True,
-        )
-        self._packaged_diag_write("worker_thread_created", "start_processing", "success")
-        self._worker_thread = thread
-        thread.start()
-        self._packaged_diag_write(
-            "worker_thread_started",
-            "start_processing",
-            "success",
-            summary={"thread_is_alive": bool(thread.is_alive())},
-        )
-        self._safe_emit_stage_event("start_processing", "exit", {"result": "started"})
-        return {"success": True, "message": "任务已启动"}
 
     def get_processed_records(self):
         """前端数据分析页面调用，获取已处理的账单或发票记录"""
-        return self.processed_invoices
+        self._sync_run_state_store_from_legacy()
+        return self._run_state_store.snapshot()["processed_invoices"]
 
     def get_progress(self):
         """前端轮询进度条和日志调用"""
-        if not self._is_running and self.progress == 0:
-            payload = {
-                "progress": 0,
-                "status_text": "等待任务开始...",
-                "logs": [],
-                "new_categories": [],
-                "stats": {"emails": 0, "invoices": 0, "errors": 0},
-                "is_running": False,
-                "run_state": self.run_state,
-                "last_error": self.last_error,
-                "stop_requested": self._stop_requested,
-                "can_stop": False,
-                "quota_exhausted": self.quota_exhausted,
-                "quota_message": self.quota_message,
-                "build_identity": self.build_identity,
-                "raw_date_range": self._raw_date_range_display,
-                "imap_query_range": self._imap_query_range_display,
-            }
-        else:
-            payload = {
-                "progress": self.progress,
-                "status_text": self.status_text,
-                "logs": self.logs[-20:], # 返回最新的日志
-                "new_categories": list(self.discovered_categories), # 传回后端发现的所有分类
-                "stats": getattr(self, "stats", {"emails": 0, "invoices": 0, "errors": 0}),
-                "is_running": self._is_running,
-                "run_state": self.run_state,
-                "last_error": self.last_error,
-                "stop_requested": self._stop_requested,
-                "can_stop": bool(self._is_running and not self._stop_requested),
-                "quota_exhausted": self.quota_exhausted,
-                "quota_message": self.quota_message,
-                "build_identity": self.build_identity,
-                "raw_date_range": self._raw_date_range_display,
-                "imap_query_range": self._imap_query_range_display,
-            }
+        self._sync_run_state_store_from_legacy()
+        payload = self._run_state_store.frontend_snapshot(
+            build_identity=self.build_identity,
+            raw_date_range=self._raw_date_range_display,
+            imap_query_range=self._imap_query_range_display,
+        )
         self._packaged_diag_log_progress_poll(payload)
         return payload
 
     def get_results(self):
         """前端分析页调用，获取最终的统计数据"""
+        self._sync_run_state_store_from_legacy()
+        state_snapshot = self._run_state_store.snapshot()
+        processed_invoices = state_snapshot["processed_invoices"]
+        error_invoices = state_snapshot["error_invoices"]
+        categories = state_snapshot["new_categories"]
         grouped_errors = self._group_error_invoices()
         summary = self._summarize_stats()
         return {
-            "categories": list(self.discovered_categories),
-            "successInvoices": self.processed_invoices,
-            "errorInvoices": self.error_invoices,
+            "categories": categories,
+            "successInvoices": processed_invoices,
+            "errorInvoices": error_invoices,
             "groupedErrorInvoices": grouped_errors,
             "manual_check_path": self._manual_check_path(),
             "output_path": self._effective_save_path or self._requested_save_path or self.get_default_save_path(),
@@ -4909,7 +3900,7 @@ class InvoiceAppAPI:
             "quota_exhausted": self.quota_exhausted,
             "quota_message": self.quota_message,
             "last_export_path": self._last_export_path,
-            "invoices": self.processed_invoices # 兼容旧的数据结构
+            "invoices": processed_invoices # 兼容旧的数据结构
         }
 
     def choose_directory(self):

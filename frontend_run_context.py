@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 
 _EXPLICIT_RUN_CONTEXT_PATH = ""
@@ -47,6 +48,8 @@ def _empty_run_context():
         "autostart_mode": "",
         "autostart_delay_ms": 0,
         "autostart_token": "",
+        "validation_required": False,
+        "manifest_included_count": 0,
     }
 
 
@@ -114,6 +117,13 @@ def load_run_context():
     except (TypeError, ValueError):
         autostart_delay_ms = 0
     autostart_token = str(file_context.get("autostart_token", "")).strip() if autostart_enabled else ""
+    validation_required = bool(file_context.get("validation_required", False))
+    try:
+        manifest_included_count = max(
+            0, int(file_context.get("manifest_included_count", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        manifest_included_count = 0
 
     return {
         "enabled": enabled,
@@ -135,6 +145,10 @@ def load_run_context():
         "autostart_delay_ms": autostart_delay_ms if controlled_run else 0,
         "autostart_token": autostart_token if controlled_run else "",
         "controlled_run": controlled_run,
+        "validation_required": bool(validation_required and controlled_run),
+        "manifest_included_count": (
+            manifest_included_count if validation_required and controlled_run else 0
+        ),
     }
 
 
@@ -155,6 +169,14 @@ def ensure_run_context_dirs(context):
             os.makedirs(target, exist_ok=True)
 
 
+def make_run_staging_dir(context, run_id):
+    base_dir = str(context.get("staging_dir", "") or "").strip()
+    if not base_dir:
+        base_dir = os.path.join(os.getcwd(), "staging")
+    safe_run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run_id or "run")).strip("-.") or "run"
+    return Path(base_dir).resolve() / safe_run_id
+
+
 def serialize_run_context(context):
     return {
         "enabled": bool(context.get("enabled", False)),
@@ -163,6 +185,7 @@ def serialize_run_context(context):
         "run_id": context.get("run_id", ""),
         "run_root": context.get("run_root", ""),
         "locked_output_path": context.get("output_dir", ""),
+        "staging_dir": context.get("staging_dir", ""),
         "locked_email": context.get("locked_email", ""),
         "locked_date_from": context.get("locked_date_from", ""),
         "locked_date_to": context.get("locked_date_to", ""),
@@ -173,4 +196,8 @@ def serialize_run_context(context):
         "autostart_mode": context.get("autostart_mode", ""),
         "autostart_delay_ms": int(context.get("autostart_delay_ms", 0) or 0),
         "autostart_token": context.get("autostart_token", ""),
+        "validation_required": bool(context.get("validation_required", False)),
+        "manifest_included_count": int(
+            context.get("manifest_included_count", 0) or 0
+        ),
     }

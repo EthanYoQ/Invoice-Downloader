@@ -3,13 +3,14 @@ import email
 import email.utils
 from email.header import decode_header
 import json
+import hashlib
 import logging
 import os
 import re
 import datetime
 import time
 import zipfile
-from urllib.parse import parse_qsl, urljoin, urlparse, unquote
+from urllib.parse import parse_qsl, urlparse, unquote
 from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
@@ -34,12 +35,29 @@ from provider_direct_invoice import (
     infer_direct_invoice_family,
     is_direct_invoice_family_url,
 )
+from pinned_http import PinnedHttpTransport
+from url_security import PublicUrlPolicy
+from url_trace_sanitizer import sanitize_url_for_log, stable_hash
+from mailbox_scanner import MailboxScanner, UnresolvedMailboxInputError
 try:
     from pyzbar.pyzbar import decode
 except ImportError:
     decode = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _safe_exception_identity(exc):
+    exception_type = type(exc).__name__
+    try:
+        exception_detail = str(exc)
+    except Exception:
+        exception_detail = "<unprintable>"
+    fingerprint = hashlib.sha256(
+        f"{exception_type}:{exception_detail}".encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    return exception_type, fingerprint
+
 
 try:
     from zoneinfo import ZoneInfo
@@ -332,45 +350,89 @@ def _match_shadow_noise_page_type(url):
     return False, ""
 
 
-def _expand_bwjf_shortlink(url, timeout=5):
+_SHORTLINK_URL_POLICY = None
+_SHORTLINK_PINNED_TRANSPORT = None
+
+
+def _shortlink_security_stack():
+    global _SHORTLINK_URL_POLICY, _SHORTLINK_PINNED_TRANSPORT
+    if _SHORTLINK_URL_POLICY is None:
+        _SHORTLINK_URL_POLICY = PublicUrlPolicy()
+    if _SHORTLINK_PINNED_TRANSPORT is None:
+        _SHORTLINK_PINNED_TRANSPORT = PinnedHttpTransport()
+    return _SHORTLINK_URL_POLICY, _SHORTLINK_PINNED_TRANSPORT
+
+
+def _expand_bwjf_shortlink(
+    url,
+    timeout=5,
+    *,
+    url_policy=None,
+    pinned_transport=None,
+    session=None,
+    max_redirects=5,
+    max_response_bytes=64 * 1024,
+):
     parsed = urlparse(url.strip())
     host = parsed.netloc.lower()
     path_parts = [part for part in parsed.path.split('/') if part]
     if host != "fp.bwjf.cn" or len(path_parts) != 2 or path_parts[0].lower() != "u" or not path_parts[1]:
         return None
 
+    owns_session = session is None
     try:
         import requests
-    except ImportError:
-        logging.warning("requests unavailable, skipping bwjf shortlink expansion")
-        return None
 
-    try:
-        response = requests.get(
-            url.strip(),
-            allow_redirects=False,
-            timeout=timeout,
-            stream=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        response.close()
+        if url_policy is None or pinned_transport is None:
+            default_policy, default_transport = _shortlink_security_stack()
+        policy = url_policy or default_policy
+        transport = pinned_transport or default_transport
+        request_session = session or requests.Session()
+        target = policy.validate(url.strip())
+        redirected = False
+        redirect_limit = max(0, min(int(max_redirects), 5))
+        response_limit = max(1, min(int(max_response_bytes), 64 * 1024))
+
+        for redirect_count in range(redirect_limit + 1):
+            response = transport.request(
+                request_session,
+                "GET",
+                target,
+                timeout=timeout,
+                max_response_bytes=response_limit,
+                read_body=False,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            location = str((getattr(response, "headers", {}) or {}).get("Location", "")).strip()
+            if status_code not in {301, 302, 303, 307, 308} or not location:
+                break
+            if redirect_count >= redirect_limit:
+                return None
+            target = policy.resolve_redirect(target, location)
+            redirected = True
+        else:
+            return None
     except Exception as exc:
-        logging.warning(f"Failed to expand bwjf shortlink {url}: {exc}")
+        logging.warning(
+            "Failed to expand bwjf shortlink %s (%s)",
+            sanitize_url_for_log(url),
+            type(exc).__name__,
+        )
+        return None
+    finally:
+        if owns_session and "request_session" in locals():
+            request_session.close()
+
+    if not redirected:
         return None
 
-    if response.status_code not in {301, 302, 303, 307, 308}:
-        return None
-
-    location = response.headers.get("Location", "").strip()
-    if not location:
-        return None
-
-    resolved_location = urljoin(url.strip(), location)
+    resolved_location = target.url
     nested_invoice_url = _extract_nested_invoice_url(resolved_location)
     if nested_invoice_url:
         return nested_invoice_url
@@ -1185,18 +1247,33 @@ class EmailFetcher:
         raw_bytes = b""
 
         try:
-            status, msg_data = self.mail.fetch(e_id, fetch_command)
-            attempt["status"] = status
-            raw_bytes, has_tuple_payload = self._extract_fetch_bytes(msg_data)
-            attempt["has_tuple_payload"] = bool(has_tuple_payload)
+            fetched = self._mailbox_scanner().fetch_messages([e_id], query=fetch_command)
+            raw_bytes = fetched.get(e_id, b"")
+            attempt["status"] = "OK" if raw_bytes else "NO_PAYLOAD"
+            attempt["has_tuple_payload"] = bool(raw_bytes)
             attempt["raw_bytes_len"] = len(raw_bytes)
-            if status != "OK":
-                attempt["error"] = f"fetch_status_{status}"
+            if not raw_bytes:
+                attempt["error"] = "uid_fetch_no_payload"
         except Exception as exc:
             attempt["status"] = "EXCEPTION"
-            attempt["error"] = str(exc)
+            attempt["error"] = type(exc).__name__
 
         return raw_bytes, attempt
+
+    def _emit_mailbox_scan_diagnostic(self, payload):
+        self._append_jsonl_best_effort(
+            self._monitoring_path("mailbox_scan_diagnostics.jsonl"),
+            {
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **payload,
+            },
+        )
+
+    def _mailbox_scanner(self):
+        return MailboxScanner(
+            self.mail,
+            diagnostic_callback=self._emit_mailbox_scan_diagnostic,
+        )
 
     def connect(self):
         try:
@@ -1239,144 +1316,34 @@ class EmailFetcher:
             logging.error("Not connected to IMAP server.")
             return []
 
-        self.mail.select(mailbox, readonly=True)
+        def to_date(value, field_name):
+            if value is None:
+                return None
+            if isinstance(value, datetime.datetime):
+                return value.date()
+            if isinstance(value, datetime.date):
+                return value
+            if isinstance(value, str):
+                return datetime.datetime.strptime(value, "%Y-%m-%d").date()
+            raise TypeError(f"{field_name} must be a date or YYYY-MM-DD string")
 
-        if isinstance(since_date, datetime.date):
-            since_date_str = since_date.strftime("%d-%b-%Y")
-        else:
-            try:
-                dt = datetime.datetime.strptime(since_date, "%Y-%m-%d")
-                since_date_str = dt.strftime("%d-%b-%Y")
-            except:
-                since_date_str = since_date
-            
-        search_criteria_parts = [f'(SINCE "{since_date_str}")']
-        
-        if before_date:
-            if isinstance(before_date, datetime.date):
-                before_date_str = before_date.strftime("%d-%b-%Y")
-            else:
-                try:
-                    dt = datetime.datetime.strptime(before_date, "%Y-%m-%d")
-                    before_date_str = dt.strftime("%d-%b-%Y")
-                except:
-                    before_date_str = before_date
-            search_criteria_parts.append(f'(BEFORE "{before_date_str}")')
-
-        search_criteria = " ".join(search_criteria_parts)
-        logging.info(f"Searching emails with criteria: {search_criteria}")
-        self._emit_progress(f"正在 IMAP 搜索：{search_criteria}")
-        
-        status, messages = self.mail.search(None, search_criteria)
-        
-        if status != "OK" or not messages[0]:
-            logging.info("No emails found or search failed.")
-            self._emit_progress("IMAP 搜索完成，命中 0 封邮件。")
-            return []
-
-        email_ids = messages[0].split()
-        logging.info(f"IMAP returned {len(email_ids)} emails. Applying local Python date filter...")
-        self._emit_progress(f"IMAP 搜索完成，命中 {len(email_ids)} 封邮件；正在进行本地日期过滤。")
-        
-        # 本地时间二次强制过滤 (防御 IMAP SINCE/BEFORE 失效)
-        if isinstance(since_date, datetime.date) and not isinstance(since_date, datetime.datetime):
-            since_dt = datetime.datetime.combine(since_date, datetime.datetime.min.time())
-        elif isinstance(since_date, str):
-            since_dt = datetime.datetime.strptime(since_date, "%Y-%m-%d")
-        else:
-            since_dt = since_date
-            
-        before_dt = None
-        if before_date:
-            if isinstance(before_date, datetime.date) and not isinstance(before_date, datetime.datetime):
-                before_dt = datetime.datetime.combine(before_date, datetime.datetime.min.time())
-            elif isinstance(before_date, str):
-                before_dt = datetime.datetime.strptime(before_date, "%Y-%m-%d")
-            else:
-                before_dt = before_date
-
-        valid_email_ids = []
-        total_ids = len(email_ids)
-        batch_size = 100
-        for batch_start in range(0, total_ids, batch_size):
-            chunk = email_ids[batch_start:batch_start + batch_size]
-            processed_ids = set()
-            sequence_set = b",".join(chunk)
-            try:
-                status, msg_data = self.mail.fetch(sequence_set, '(INTERNALDATE BODY[HEADER.FIELDS (DATE)])')
-                if status != "OK" or not msg_data:
-                    valid_email_ids.extend(chunk)
-                    logging.warning(f"Failed to batch fetch email dates for local filter: fetch_status_{status}")
-                else:
-                    fallback_index = 0
-                    for response_part in msg_data:
-                        if not isinstance(response_part, tuple) or len(response_part) < 2:
-                            continue
-
-                        response_id = self._extract_fetch_sequence_id(response_part[0])
-                        if not response_id:
-                            while fallback_index < len(chunk) and chunk[fallback_index] in processed_ids:
-                                fallback_index += 1
-                            response_id = chunk[fallback_index] if fallback_index < len(chunk) else b""
-                            fallback_index += 1
-
-                        if not response_id:
-                            continue
-
-                        processed_ids.add(response_id)
-                        dt_naive = None
-                        parse_error = None
-                        try:
-                            msg = email.message_from_bytes(response_part[1])
-                            date_str = msg.get("Date")
-                            if date_str:
-                                try:
-                                    dt = email.utils.parsedate_to_datetime(date_str)
-                                    dt_naive = self._to_local_naive(dt)
-                                except Exception as e:
-                                    parse_error = e
-                            if dt_naive is None:
-                                dt_naive = self._extract_fetch_internaldate(response_part[0])
-                            if dt_naive is None:
-                                if parse_error:
-                                    logging.warning(f"Failed to parse email date for local filter: {parse_error}")
-                                valid_email_ids.append(response_id)
-                                continue
-                            if dt_naive < since_dt:
-                                continue
-                            if before_dt and dt_naive >= before_dt:
-                                continue
-                            valid_email_ids.append(response_id)
-                        except Exception as e:
-                            # 解析失败仍保留，防错杀
-                            logging.warning(f"Failed to parse email date for local filter: {e}")
-                            valid_email_ids.append(response_id)
-
-                    for e_id in chunk:
-                        if e_id not in processed_ids:
-                            valid_email_ids.append(e_id)
-            except Exception as e:
-                logging.warning(f"Failed to batch fetch email dates for local filter: {e}")
-                valid_email_ids.extend(chunk)
-
-            processed_count = min(batch_start + len(chunk), total_ids)
-            logging.info(
-                f"Local date filter progress: {processed_count}/{total_ids}, retained {len(valid_email_ids)} emails."
-            )
-            self._emit_progress(
-                f"正在进行本地日期过滤：{processed_count}/{total_ids}，当前保留 {len(valid_email_ids)} 封邮件。"
-            )
-
-        logging.info(f"Local filter completed. {len(valid_email_ids)} emails passed.")
-        self._emit_progress(f"本地日期过滤完成，最终保留 {len(valid_email_ids)} 封邮件。")
-        return valid_email_ids
+        since = to_date(since_date, "since_date")
+        before = to_date(before_date, "before_date")
+        self._emit_progress("正在读取邮箱 UID 并进行本地日期过滤。")
+        refs = self._mailbox_scanner().scan(since, before, mailbox=mailbox)
+        email_ids = [ref.uid for ref in refs]
+        logging.info("Local UID date filter retained %s emails.", len(email_ids))
+        self._emit_progress(f"本地日期过滤完成，最终保留 {len(email_ids)} 封邮件。")
+        return email_ids
 
     def _legacy_extract_attachments_pre_release_prep(self, email_ids, mailbox="INBOX"):
         """1.3 Extract direct file attachments via 4-tier funnel filtering"""
+        return self.extract_attachments(email_ids, mailbox=mailbox)
+
         if not self.mail:
             return []
             
-        self.mail.select(mailbox, readonly=True)
+        self._mailbox_scanner().select_mailbox(mailbox)
         results = []
 
         def stage_candidate_file(base_dir, filename, payload):
@@ -1399,10 +1366,10 @@ class EmailFetcher:
             
             for e_id in chunk:
                 try:
-                    status, msg_data = self.mail.fetch(e_id, '(RFC822)')
-                    if status != "OK":
+                    raw_message = self._mailbox_scanner().fetch_messages([e_id]).get(e_id, b"")
+                    if not raw_message:
                         continue
-                    
+                    msg_data = [(b"UID FETCH", raw_message)]
                     for response_part in msg_data:
                         if isinstance(response_part, tuple):
                             msg = email.message_from_bytes(response_part[1])
@@ -1449,7 +1416,11 @@ class EmailFetcher:
                                                 if url:
                                                     normalized_url = normalize_invoice_link_candidate(url)
                                                     if normalized_url != url.strip():
-                                                        logging.info(f"Normalized embedded invoice link: {url} -> {normalized_url}")
+                                                        logging.info(
+                                                            "Normalized embedded invoice link: %s -> %s",
+                                                            sanitize_url_for_log(url),
+                                                            sanitize_url_for_log(normalized_url),
+                                                        )
                                                     links_found.append((normalized_url, text))
                                     except Exception:
                                         pass
@@ -1717,7 +1688,10 @@ class EmailFetcher:
                                     "prefilter_reason_code": decision["prefilter_reason_code"],
                                     "prefilter_signals": decision["prefilter_signals"],
                                 })
-                                logging.info(f"Discovered embedded invoice link: {link}")
+                                logging.info(
+                                    "Discovered embedded invoice link: %s",
+                                    sanitize_url_for_log(link),
+                                )
 
                 except Exception as e:
                     logging.error(f"Error processing email {e_id.decode()}: {e}")
@@ -1731,8 +1705,11 @@ class EmailFetcher:
         if not self.mail:
             return []
 
-        self.mail.select(mailbox, readonly=True)
+        scanner = self._mailbox_scanner()
+        scanner.select_mailbox(mailbox)
         results = []
+        ordered_email_ids = MailboxScanner.normalize_uids(email_ids)
+        unresolved_email_ids = []
 
         def stage_candidate_file(base_dir, filename, payload):
             os.makedirs(base_dir, exist_ok=True)
@@ -1767,10 +1744,13 @@ class EmailFetcher:
                     "staging_error": error_message,
                 })
 
-        chunk_size = 50
-        for i in range(0, len(email_ids), chunk_size):
-            chunk = email_ids[i:i + chunk_size]
-            logging.info(f"Processing chunk {i//chunk_size + 1}/{max(1, (len(email_ids)+chunk_size-1)//chunk_size)}")
+        batch_total = max(1, (len(ordered_email_ids) + scanner.body_batch_size - 1) // scanner.body_batch_size)
+        for batch_index, message_batch in enumerate(
+            scanner.iter_message_batches(ordered_email_ids), start=1
+        ):
+            chunk = list(message_batch.requested_uids)
+            prefetched_messages = dict(message_batch.messages)
+            logging.info(f"Processing chunk {batch_index}/{batch_total}")
 
             for e_id in chunk:
                 email_id_str = self._safe_email_id(e_id)
@@ -1791,6 +1771,7 @@ class EmailFetcher:
                     "entered_main_chain": False,
                     "terminal_status": "uninitialized",
                 }
+                processing_failure_diag = None
 
                 try:
                     selected_msg = None
@@ -1812,7 +1793,17 @@ class EmailFetcher:
                         }:
                             break
 
-                        raw_message_bytes, fetch_attempt = self._fetch_message_bytes(e_id, fetch_command, mode_label)
+                        if attempt_index == 0 and e_id in prefetched_messages:
+                            raw_message_bytes = prefetched_messages[e_id]
+                            fetch_attempt = {
+                                "mode": "UID_BATCH_RFC822",
+                                "status": "OK",
+                                "has_tuple_payload": True,
+                                "raw_bytes_len": len(raw_message_bytes),
+                                "error": "",
+                            }
+                        else:
+                            raw_message_bytes, fetch_attempt = self._fetch_message_bytes(e_id, fetch_command, mode_label)
                         email_diag["fetch_attempts"].append(fetch_attempt)
                         if fetch_attempt["raw_bytes_len"] > 0:
                             email_diag["fetch_has_usable_bytes"] = True
@@ -1829,22 +1820,13 @@ class EmailFetcher:
                             email_diag["mime_parse_success"] = True
                             email_diag["subject"] = decode_str(msg_candidate.get("Subject"))
                             email_diag["sender"] = decode_str(msg_candidate.get("From", ""))
-                        except Exception as exc:
-                            last_terminal_status = "mime_parse_failed"
-                            email_diag["fetch_attempts"][-1]["error"] = str(exc)
-                            if attempt_index < 2:
-                                continue
-                            break
+                        except Exception:
+                            raise
 
                         try:
                             parts_candidate = list(msg_candidate.walk())
-                        except Exception as exc:
-                            parts_candidate = []
-                            last_terminal_status = "mime_structure_unusable"
-                            email_diag["fetch_attempts"][-1]["error"] = str(exc)
-                            if attempt_index < 2:
-                                continue
-                            break
+                        except Exception:
+                            raise
 
                         email_diag["mime_part_count"] = len(parts_candidate)
                         if not parts_candidate:
@@ -1865,6 +1847,7 @@ class EmailFetcher:
                             email_diag["subject"] = email_diag["subject"] or decode_str(last_parsed_msg.get("Subject"))
                             email_diag["sender"] = email_diag["sender"] or decode_str(last_parsed_msg.get("From", ""))
                         email_diag["terminal_status"] = last_terminal_status
+                        unresolved_email_ids.append(e_id)
                         continue
 
                     msg = selected_msg
@@ -1888,31 +1871,29 @@ class EmailFetcher:
                         content_disposition = str(part.get("Content-Disposition"))
 
                         if content_type == "text/plain" and "attachment" not in content_disposition:
-                            try:
-                                payload = part.get_payload(decode=True)
-                                if payload:
-                                    charset = part.get_content_charset() or 'utf-8'
-                                    body_text += payload.decode(charset, errors='ignore')
-                            except Exception:
-                                pass
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                body_text += payload.decode(charset, errors='ignore')
                         elif content_type == "text/html" and "attachment" not in content_disposition:
-                            try:
-                                payload = part.get_payload(decode=True)
-                                if payload:
-                                    charset = part.get_content_charset() or 'utf-8'
-                                    html_content = payload.decode(charset, errors='ignore')
-                                    soup = BeautifulSoup(html_content, 'html.parser')
-                                    body_text += soup.get_text()
-                                    for a in soup.find_all('a', href=True):
-                                        url = a['href']
-                                        text = a.get_text().strip().lower()
-                                        if url:
-                                            normalized_url = normalize_invoice_link_candidate(url)
-                                            if normalized_url != url.strip():
-                                                logging.info(f"Normalized embedded invoice link: {url} -> {normalized_url}")
-                                            links_found.append((normalized_url, text))
-                            except Exception:
-                                pass
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                html_content = payload.decode(charset, errors='ignore')
+                                soup = BeautifulSoup(html_content, 'html.parser')
+                                body_text += soup.get_text()
+                                for a in soup.find_all('a', href=True):
+                                    url = a['href']
+                                    text = a.get_text().strip().lower()
+                                    if url:
+                                        normalized_url = normalize_invoice_link_candidate(url)
+                                        if normalized_url != url.strip():
+                                            logging.info(
+                                                "Normalized embedded invoice link: %s -> %s",
+                                                sanitize_url_for_log(url),
+                                                sanitize_url_for_log(normalized_url),
+                                            )
+                                        links_found.append((normalized_url, text))
 
                         filename = part.get_filename()
                         if not filename:
@@ -2019,9 +2000,9 @@ class EmailFetcher:
                                 "source_kind": "email_body_receipt",
                                 "body_receipt_fields": body_receipt_fields,
                             })
-                        except Exception as stage_exc:
+                        except Exception:
                             email_diag["staging_write_failures"] += 1
-                            logging.error(f"Failed to stage email body receipt {body_receipt_filename}: {stage_exc}")
+                            raise
 
                     while process_queue:
                         attachment_info = process_queue.pop(0)
@@ -2203,26 +2184,9 @@ class EmailFetcher:
 
                         try:
                             filepath = stage_candidate_file(email_staging_path, filename, payload)
-                        except Exception as stage_exc:
+                        except Exception:
                             email_diag["staging_write_failures"] += 1
-                            record_staging_result(
-                                email_diag,
-                                raw_attachment_indices,
-                                filename,
-                                attachment_info.get("content_type", ""),
-                                attachment_info.get("content_disposition", ""),
-                                attachment_info.get("payload_size", len(payload)),
-                                False,
-                                str(stage_exc),
-                            )
-                            self._emit_input_inventory_event({
-                                **inventory_payload,
-                                "inventory_status": "staging_write_failed",
-                                "entered_main_chain": False,
-                                "staging_error": str(stage_exc),
-                            })
-                            logging.error(f"Failed to stage attachment {filename}: {stage_exc}")
-                            continue
+                            raise
 
                         email_diag["staging_write_count"] += 1
                         email_diag["entered_main_chain"] = True
@@ -2306,7 +2270,11 @@ class EmailFetcher:
                                 body_text=body_text,
                             )
                         if decision["candidate_action"] == "drop":
-                            logging.info(f"Dropped A-layer URL candidate: {link} ({decision['prefilter_reason_code']})")
+                            logging.info(
+                                "Dropped A-layer URL candidate: %s (%s)",
+                                sanitize_url_for_log(link),
+                                decision["prefilter_reason_code"],
+                            )
                             continue
 
                         provider_family = decision.get("provider_family", "")
@@ -2342,7 +2310,11 @@ class EmailFetcher:
                         provider_group_key = decision.get("provider_group_key", "")
                         if provider_group_key:
                             if provider_group_key in emitted_provider_groups:
-                                logging.info(f"Skipped duplicate provider-group URL candidate: {link} ({provider_group_key})")
+                                logging.info(
+                                    "Skipped duplicate provider-group URL candidate: %s (%s)",
+                                    sanitize_url_for_log(link),
+                                    stable_hash(provider_group_key),
+                                )
                                 continue
                             emitted_provider_groups.add(provider_group_key)
                         else:
@@ -2352,7 +2324,10 @@ class EmailFetcher:
                                 decision.get("provider_family", ""),
                             )
                             if fallback_group_key in emitted_fallback_groups:
-                                logging.info(f"Skipped duplicate URL candidate: {link}")
+                                logging.info(
+                                    "Skipped duplicate URL candidate: %s",
+                                    sanitize_url_for_log(link),
+                                )
                                 continue
                             emitted_fallback_groups.add(fallback_group_key)
 
@@ -2387,7 +2362,10 @@ class EmailFetcher:
                                 ),
                             })
                         results.append(result_payload)
-                        logging.info(f"Discovered embedded invoice link: {link}")
+                        logging.info(
+                            "Discovered embedded invoice link: %s",
+                            sanitize_url_for_log(link),
+                        )
 
                     if email_diag["entered_main_chain"]:
                         email_diag["terminal_status"] = "entered_main_chain"
@@ -2397,24 +2375,61 @@ class EmailFetcher:
                         email_diag["terminal_status"] = "no_attachment_parts_detected"
 
                 except Exception as exc:
-                    email_diag["terminal_status"] = "processing_exception"
-                    logging.error(f"Error processing email {email_id_str}: {exc}")
+                    exception_type, exception_fingerprint = _safe_exception_identity(exc)
+                    uid_hash = hashlib.sha256(e_id).hexdigest()[:12]
+                    processing_failure_diag = {
+                        "event": "message_processing_exception",
+                        "terminal_status": "processing_exception",
+                        "exception_type": exception_type,
+                        "exception_fingerprint": exception_fingerprint,
+                        "uid_hash": uid_hash,
+                    }
+                    unresolved_email_ids.append(e_id)
+                    logging.error(
+                        "Message processing failed [%s:%s]",
+                        exception_type,
+                        exception_fingerprint,
+                    )
                 finally:
-                    sanitized_attachments = []
-                    for attachment_diag in email_diag["attachments"]:
-                        sanitized_attachments.append({
-                            "filename": attachment_diag.get("filename", ""),
-                            "content_type": attachment_diag.get("content_type", ""),
-                            "content_disposition": attachment_diag.get("content_disposition", ""),
-                            "payload_bytes_len": int(attachment_diag.get("payload_bytes_len", 0) or 0),
-                            "staged": bool(attachment_diag.get("staged")),
-                            "staging_error": attachment_diag.get("staging_error", ""),
-                        })
-                    email_diag["attachments"] = sanitized_attachments
-                    if email_diag["terminal_status"] == "uninitialized":
-                        email_diag["terminal_status"] = "processing_exception"
-                    self._emit_extract_attachments_diagnostic(email_diag)
+                    if processing_failure_diag is not None:
+                        self._emit_mailbox_scan_diagnostic(processing_failure_diag)
+                        self._emit_extract_attachments_diagnostic(processing_failure_diag)
+                    else:
+                        sanitized_attachments = []
+                        for attachment_diag in email_diag["attachments"]:
+                            sanitized_attachments.append({
+                                "filename": attachment_diag.get("filename", ""),
+                                "content_type": attachment_diag.get("content_type", ""),
+                                "content_disposition": attachment_diag.get("content_disposition", ""),
+                                "payload_bytes_len": int(attachment_diag.get("payload_bytes_len", 0) or 0),
+                                "staged": bool(attachment_diag.get("staged")),
+                                "staging_error": attachment_diag.get("staging_error", ""),
+                            })
+                        email_diag["attachments"] = sanitized_attachments
+                        if email_diag["terminal_status"] == "uninitialized":
+                            email_diag["terminal_status"] = "processing_exception"
+                        self._emit_extract_attachments_diagnostic(email_diag)
+                    selected_msg = None
+                    last_parsed_msg = None
+                    msg_candidate = None
+                    msg = None
+                    raw_message_bytes = b""
+                    parts = []
+                    attachments_found = []
+                    process_queue = []
+                    processed_attachments = []
+                    attachment_info = None
+                    processed_attachment = None
+                    payload = None
 
             time.sleep(EMAIL_FETCH_LOOP_PAUSE_SECONDS)
+            prefetched_messages.clear()
+            del prefetched_messages
+            del message_batch
+
+        if unresolved_email_ids:
+            unresolved_error = UnresolvedMailboxInputError(unresolved_email_ids)
+            self._emit_mailbox_scan_diagnostic(unresolved_error.diagnostic_payload())
+            raise unresolved_error
 
         return results

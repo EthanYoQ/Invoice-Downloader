@@ -4,6 +4,11 @@
 用户在前端输入公司简称（如"诺华"），系统用该名称匹配发票上的购买方字段。
 """
 
+from typing import Literal, TypeAlias
+
+
+PurchaserRelation: TypeAlias = Literal["target", "non_target", "unknown"]
+
 DEFAULT_COMPANY = "generic"
 UNKNOWN_PURCHASER_VALUES = {
     "",
@@ -22,7 +27,7 @@ def normalize_company_text(value: str) -> str:
     return str(value or "").strip().lower()
 
 
-def classify_purchaser_relation(purchaser: str, company_name: str) -> str:
+def classify_purchaser_relation(purchaser: str, company_name: str) -> PurchaserRelation:
     """
     将购买方与目标公司关系分为:
     - target: 明确匹配目标公司，或未设置公司过滤
