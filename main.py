@@ -41,7 +41,7 @@ def _coalesce_run_context_path(argv):
     return ""
 
 
-def _parse_args():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument(
         "--run-context",
@@ -49,8 +49,15 @@ def _parse_args():
         default="",
         help="Internal QA run-context JSON path.",
     )
-    args, unknown_args = parser.parse_known_args()
-    coalesced_run_context_path = _coalesce_run_context_path(sys.argv[1:])
+    parser.add_argument(
+        "--url-recovery-worker",
+        dest="url_recovery_worker_path",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args, unknown_args = parser.parse_known_args(argv)
+    coalesced_run_context_path = _coalesce_run_context_path(argv)
     if coalesced_run_context_path:
         args.run_context_path = coalesced_run_context_path
     elif unknown_args and str(args.run_context_path or "").strip():
@@ -356,8 +363,21 @@ def _ensure_expected_frontend_assets(current_dir):
     return html_path
 
 
-def main():
-    args = _parse_args()
+def main(argv=None):
+    args = _parse_args(argv)
+    worker_path = str(args.url_recovery_worker_path or "").strip()
+    if worker_path:
+        try:
+            from url_recovery_worker import run_url_recovery_job
+
+            return run_url_recovery_job(worker_path)
+        except Exception as exc:
+            print(
+                f"URL recovery worker failed: {type(exc).__name__}",
+                file=sys.stderr,
+            )
+            return 1
+
     run_context_path = str(args.run_context_path or "").strip()
     if run_context_path:
         resolved_run_context_path = Path(run_context_path).expanduser().resolve()
@@ -418,7 +438,9 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        exit_code = main()
+        if exit_code is not None:
+            sys.exit(exit_code)
     except Exception as exc:
         diagnostic_path = _write_startup_diagnostic(
             "startup_failed",

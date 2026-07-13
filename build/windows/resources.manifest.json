@@ -83,6 +83,7 @@
     }
   ],
   "hiddenImports": [
+    "audit_email_truth",
     "webview",
     "pythonnet",
     "clr_loader",

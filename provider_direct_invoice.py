@@ -153,6 +153,13 @@ def extract_direct_invoice_email_fields(body_text="", *, url="", subject=""):
             result["invoice_date"] = normalize_date(query[key])
             break
     if not result["invoice_date"]:
+        labeled_date = re.search(
+            r"开票日期\s*[:：]?\s*(20\d{2}[-/.年]\s*\d{1,2}[-/.月]\s*\d{1,2})",
+            body,
+        )
+        if labeled_date:
+            result["invoice_date"] = normalize_date(labeled_date.group(1))
+    if not result["invoice_date"]:
         for pattern in (
             r"(20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2})",
             r"(20\d{2}\d{2}\d{2})",
@@ -258,6 +265,7 @@ def parse_direct_invoice_xml_fields(xml_bytes):
         "purchaser": "",
         "amount": "",
         "invoice_date": "",
+        "item_name": "",
     }
 
     if root is not None:
@@ -278,6 +286,12 @@ def parse_direct_invoice_xml_fields(xml_bytes):
         )
         result["invoice_date"] = normalize_date(
             _xml_first_text(root, {"kprq", "invoice_date", "issuedate", "issue_date", "issuetime", "requesttime"})
+        )
+        result["item_name"] = normalize_token(
+            _xml_first_text(
+                root,
+                {"spmc", "xmmc", "itemname", "item_name", "goodsname", "goods_name"},
+            )
         )
 
     if not result["invoice_number"]:

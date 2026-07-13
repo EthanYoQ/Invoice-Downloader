@@ -395,15 +395,29 @@ def _payload_parts(outcome: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     return payload, {**metadata, **info}
 
 
-def _path_values(value: Any, key: str = "") -> list[Path]:
+_SOURCE_PATH_KEYS = frozenset(
+    {
+        "filepath",
+        "pdf_path",
+        "source_path",
+        "original_path",
+        "staged_path",
+        "downloaded_path",
+        "converted_path",
+        "converted_pdf_path",
+    }
+)
+
+
+def _source_path_values(value: Any, key: str = "") -> list[Path]:
     found: list[Path] = []
     if isinstance(value, Mapping):
         for child_key, child in value.items():
-            found.extend(_path_values(child, str(child_key)))
+            found.extend(_source_path_values(child, str(child_key)))
     elif isinstance(value, (list, tuple)):
         for child in value:
-            found.extend(_path_values(child, key))
-    elif isinstance(value, str) and "path" in key.lower():
+            found.extend(_source_path_values(child, key))
+    elif isinstance(value, str) and key.lower() in _SOURCE_PATH_KEYS:
         path = Path(value)
         if path.is_file():
             found.append(path)
@@ -476,23 +490,31 @@ class RunEvidenceWriter:
                 raise ValueError("lineage_output_escape") from exc
             output_hash, output_size = _sha256_file(output_real)
             payload, combined = _payload_parts(outcome)
+            metadata = _mapping(getattr(candidate, "to_legacy", lambda: {})())
             source_paths = [Path(str(getattr(candidate, "source_path", "") or ""))]
-            source_paths.extend(_path_values(payload))
+            source_paths.extend(_source_path_values(payload))
+            source_paths.extend(_source_path_values(metadata))
             source_hashes: list[str] = []
             for source_path in source_paths:
                 if source_path.is_file():
-                    digest, _size = _sha256_file(source_path)
+                    source_real = source_path.resolve(strict=True)
+                    try:
+                        source_real.relative_to(output_base)
+                    except ValueError:
+                        pass
+                    else:
+                        continue
+                    digest, _size = _sha256_file(source_real)
                     if digest not in source_hashes:
                         source_hashes.append(digest)
             if not source_hashes:
                 raise ValueError("lineage_source_chain_missing")
             source_hashes.sort()
-            metadata = _mapping(getattr(candidate, "to_legacy", lambda: {})())
             transformation = str(
-                metadata.get("transformation_type")
+                getattr(identity, "source_kind", "")
+                or metadata.get("transformation_type")
                 or metadata.get("download_mode")
                 or combined.get("transformation_type")
-                or getattr(identity, "source_kind", "")
                 or "unknown"
             )
             provider = str(

@@ -1,0 +1,1 @@
+"""Repository automation entry points."""

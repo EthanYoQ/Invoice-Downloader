@@ -669,7 +669,7 @@ Run:
 ~~~powershell
 git status --short
 git diff --check
-git grep -n -I -E "(qiyong0919|Authorization: Bearer|auth_code[ ]*=|api_key[ ]*=)"
+git grep -n -I -E "(personal_mailbox_identifier|Authorization: Bearer|auth_code[ ]*=|api_key[ ]*=)"
 ~~~
 
 Expected: only intended tracked changes; no credential/personal mailbox disclosure.

@@ -46,6 +46,84 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+STAGING_PATH_BUDGET = 240
+STAGING_COLLISION_ATTEMPTS = 100
+
+
+def _utf16_units(value):
+    return len(str(value).encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def _truncate_utf16(value, max_units):
+    result = []
+    used = 0
+    for character in str(value):
+        units = 2 if ord(character) > 0xFFFF else 1
+        if used + units > max(0, int(max_units)):
+            break
+        result.append(character)
+        used += units
+    return "".join(result)
+
+
+def _compact_email_staging_path(staging_dir, email_id):
+    safe_uid = re.sub(r"[^A-Za-z0-9._-]+", "_", str(email_id or "")).strip(" ._")
+    if not safe_uid:
+        safe_uid = hashlib.sha256(str(email_id or "").encode("utf-8")).hexdigest()[:12]
+    return os.path.join(staging_dir, f"m_{safe_uid[:24]}")
+
+
+def _bounded_staging_filename(base_dir, filename, collision_index=0):
+    original = os.path.basename(str(filename or "")) or "attachment"
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", original).strip(" .")
+    safe_name = safe_name or "attachment"
+    stem, ext = os.path.splitext(safe_name)
+    if collision_index:
+        safe_name = f"{stem}_{collision_index}{ext}"
+        stem, ext = os.path.splitext(safe_name)
+
+    available = STAGING_PATH_BUDGET - _utf16_units(os.path.abspath(base_dir)) - 1
+    minimum = _utf16_units(ext) + 14
+    if available < minimum:
+        raise OSError("staging_root_path_too_long")
+    if _utf16_units(safe_name) <= available:
+        return safe_name
+
+    digest = hashlib.sha256(
+        f"{original}\0{collision_index}".encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    suffix = f"_{digest}{ext}"
+    prefix_units = max(1, available - _utf16_units(suffix))
+    prefix = _truncate_utf16(stem, prefix_units) or "x"
+    return f"{prefix}{suffix}"
+
+
+def _stage_candidate_file(
+    base_dir, filename, payload, *, max_attempts=STAGING_COLLISION_ATTEMPTS
+):
+    os.makedirs(base_dir, exist_ok=True)
+    attempts = max(1, int(max_attempts))
+    for collision_index in range(attempts):
+        physical_name = _bounded_staging_filename(
+            base_dir, filename, collision_index=collision_index
+        )
+        filepath = os.path.join(base_dir, physical_name)
+        try:
+            handle = open(filepath, "xb")
+        except FileExistsError:
+            continue
+        try:
+            with handle:
+                handle.write(payload)
+            return filepath
+        except BaseException:
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            raise
+    raise FileExistsError("staging_collision_limit_exceeded")
+
 
 def _safe_exception_identity(exc):
     exception_type = type(exc).__name__
@@ -1712,17 +1790,7 @@ class EmailFetcher:
         unresolved_email_ids = []
 
         def stage_candidate_file(base_dir, filename, payload):
-            os.makedirs(base_dir, exist_ok=True)
-            filepath = os.path.join(base_dir, filename)
-            counter = 1
-            while os.path.exists(filepath):
-                name, ext = os.path.splitext(filename)
-                filepath = os.path.join(base_dir, f"{name}_{counter}{ext}")
-                counter += 1
-
-            with open(filepath, "wb") as f:
-                f.write(payload)
-            return filepath
+            return _stage_candidate_file(base_dir, filename, payload)
 
         def record_staging_result(email_diag, attachment_indices, filename, content_type, content_disposition, payload_size, staged, error_message=""):
             matched = False
@@ -1856,10 +1924,9 @@ class EmailFetcher:
                     _, sender_addr = email.utils.parseaddr(sender)
                     sender_domain_value = sender_addr.split("@")[-1].lower() if "@" in sender_addr else ""
 
-                    safe_subject = re.sub(r'[\\/:*?"<>|]', '_', subject).strip(" .")
-                    safe_subject = safe_subject[:50].strip(" .")
-                    email_folder_name = f"{email_id_str}_{safe_subject or 'email'}".strip(" .")
-                    email_staging_path = os.path.join(self.staging_dir, email_folder_name)
+                    email_staging_path = _compact_email_staging_path(
+                        self.staging_dir, email_id_str
+                    )
 
                     body_text = ""
                     attachments_found = []

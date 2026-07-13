@@ -1,6 +1,8 @@
 import json
+from io import BytesIO
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlparse
@@ -1571,6 +1573,40 @@ class ProviderUrlRecoveryTests(unittest.TestCase):
                     self.assertTrue(result["pdf_path"].endswith(".pdf"))
         finally:
             pdf_converter.requests = original_requests
+
+    def test_kpbyd_zip_with_xml_only_is_a_usable_direct_invoice_artifact(self):
+        payload = BytesIO()
+        with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("invoice.xml", BAIWANG_XML.encode("utf-8"))
+        url = (
+            "https://etd.kpbyd.com/hub/files/download?code=abc&"
+            "fileCode=shandong_0_26432000001239781576_20260601_fixture_pdf"
+        )
+        response = FakeResponse(
+            url,
+            payload.getvalue(),
+            {"Content-Type": "invoice/pdf"},
+        )
+        converter = PDFConverter(
+            staging_dir=tempfile.mkdtemp(), url_policy=public_test_policy()
+        )
+
+        artifacts, logs = converter._probe_direct_invoice_artifact(
+            RecordingSession([response]),
+            url,
+            str(Path(converter.staging_dir) / "kpbyd"),
+        )
+        selected, matched_on = converter._select_direct_invoice_recovery_result(
+            artifacts,
+            {"invoice_number": "26432000001239781576"},
+        )
+
+        self.assertEqual(logs, [])
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["kind"], "xml")
+        self.assertIsNotNone(selected)
+        self.assertTrue(selected["path"].endswith(".xml"))
+        self.assertEqual(matched_on, "invoice_number")
 
     def test_url_history_key_distinguishes_body_identified_provider_invoices(self):
         first = build_processing_history_key(

@@ -9,6 +9,7 @@ from email_body_receipts import (
     render_email_body_receipt_pdf_bytes,
 )
 from invoice_extractor import InvoiceExtractor
+from provider_direct_invoice import extract_direct_invoice_email_fields
 
 
 ICLOUD_BODY = """
@@ -53,6 +54,24 @@ FIFTY_ONE_FAPIAO_BODY = """
 您的数电发票已开具成功,请点击下列网址下载此发票。
 点击以下网址,下载此发票
 https://a.51fapiao.cn/v/c6fwq3g2r25x8
+"""
+
+
+FPYUN_BODY = """
+2026-12-10
+尊敬的客户：您好！您申请的数电发票已成功开具
+发票信息如下：
+开票日期：
+2026-06-10 21:23:34
+发票号码：
+26337000000517112500
+购方名称：
+辉瑞投资投资有限公司
+销方名称：
+杭州联郡餐饮管理有限公司
+金额合计：
+77.30
+发票云
 """
 
 
@@ -111,6 +130,39 @@ class EmailBodyReceiptTests(unittest.TestCase):
         self.assertEqual(fields["Seller"], "北京肯德基有限公司")
         self.assertEqual(fields["Amount"], "48.50")
         self.assertEqual(fields["Type"], "餐饮")
+
+    def test_parse_fpyun_body_prefers_labeled_invoice_date_and_complete_fields(self):
+        fields = parse_email_body_receipt_fields(
+            subject=(
+                "【发票云】尊敬的【辉瑞投资投资有限公司】客户,您收到1张来自"
+                "【杭州联郡餐饮管理有限公司】为您开具的电子发票"
+                "【发票号码:26337000000517112500】"
+            ),
+            sender="fpyun@fpyun.com.cn",
+            body_text=FPYUN_BODY,
+        )
+
+        self.assertEqual(fields["InvoiceNumber"], "26337000000517112500")
+        self.assertEqual(fields["Date"], "20260610")
+        self.assertEqual(fields["Seller"], "杭州联郡餐饮管理有限公司")
+        self.assertEqual(fields["Purchaser"], "辉瑞投资投资有限公司")
+        self.assertEqual(fields["Amount"], "77.30")
+        self.assertEqual(fields["Type"], "餐饮")
+
+    def test_direct_provider_fields_prefer_labeled_fpyun_invoice_date(self):
+        fields = extract_direct_invoice_email_fields(
+            body_text=FPYUN_BODY,
+            url=(
+                "https://sdapi.fpyun.com.cn/invoice/qd/download/getInvoiceFile"
+                "?fptqm=opaque&type=1"
+            ),
+            subject=(
+                "【发票云】您收到来自【杭州联郡餐饮管理有限公司】的电子发票"
+                "【发票号码:26337000000517112500】"
+            ),
+        )
+
+        self.assertEqual(fields["invoice_date"], "2026-06-10")
 
     def test_rendered_body_receipt_pdf_uses_local_extractor_fast_path(self):
         fields = parse_email_body_receipt_fields(

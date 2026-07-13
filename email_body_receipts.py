@@ -156,6 +156,66 @@ def _parse_baiwang_body(subject, sender, body_text):
     }
 
 
+def _parse_fpyun_body(subject, sender, body_text):
+    combined = f"{subject}\n{sender}\n{body_text}"
+    provider_signal = (
+        "fpyun" in combined.lower()
+        or "发票云" in combined
+        or "数电发票已成功开具" in combined
+    )
+    if not provider_signal:
+        return {}
+
+    number_match = re.search(
+        r"发票号码\s*[:：]?\s*([0-9]{8,20})",
+        combined,
+    )
+    date_match = re.search(
+        r"开票日期\s*[:：]?\s*(20\d{2}[-/.年]\s*\d{1,2}[-/.月]\s*\d{1,2})",
+        combined,
+    )
+    purchaser_match = re.search(
+        r"购方名称\s*[:：]?\s*(.+?)\s*(?:销方名称|销售方名称)",
+        combined,
+        flags=re.DOTALL,
+    )
+    seller_match = re.search(
+        r"(?:销方名称|销售方名称)\s*[:：]?\s*(.+?)\s*(?:金额合计|价税合计)",
+        combined,
+        flags=re.DOTALL,
+    )
+    amount_match = re.search(
+        r"(?:金额合计|价税合计)\s*[:：]?\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
+        combined,
+    )
+    if not all(
+        (number_match, date_match, purchaser_match, seller_match, amount_match)
+    ):
+        return {}
+
+    purchaser = _normalize_token(purchaser_match.group(1).splitlines()[-1])
+    seller = _normalize_token(seller_match.group(1).splitlines()[-1])
+    amount = _normalize_amount(amount_match.group(1))
+    date_value = _normalize_date(date_match.group(1))
+    if not purchaser or not seller or not amount or not date_value:
+        return {}
+    doc_type = _type_from_seller(seller)
+    return {
+        "is_invoice": True,
+        "Date": date_value,
+        "Purchaser": purchaser,
+        "Seller": seller,
+        "Amount": amount,
+        "InvoiceCode": "",
+        "InvoiceNumber": number_match.group(1),
+        "Type": doc_type,
+        "category": doc_type,
+        "Departure_Date": "",
+        "Departure_City": "",
+        "Destination_City": "",
+    }
+
+
 def _parse_51fapiao_body(subject, sender, body_text, email_date):
     combined = f"{subject}\n{sender}\n{body_text}"
     if "51fapiao" not in combined.lower() and "51发票" not in combined:
@@ -194,6 +254,7 @@ def parse_email_body_receipt_fields(subject="", sender="", body_text="", email_d
         return {}
     for parser in (
         lambda: _parse_baiwang_body(subject, sender, body),
+        lambda: _parse_fpyun_body(subject, sender, body),
         lambda: _parse_51fapiao_body(subject, sender, body, email_date),
         lambda: _parse_icloud_receipt(subject, sender, body),
     ):

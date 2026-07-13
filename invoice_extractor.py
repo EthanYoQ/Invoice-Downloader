@@ -10,11 +10,13 @@ import threading
 import datetime as dt
 import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import fitz  # PyMuPDF
 from document_types import MANUAL_REVIEW_FOLDER, get_document_type_names, normalize_document_type
 from email_body_receipts import CANONICAL_MARKER
 from glm_runtime import GlmRuntime
 from invoice_domain import DocumentIdentity, InvoiceRecord
+from provider_direct_invoice import parse_direct_invoice_xml_fields
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1232,6 +1234,54 @@ class InvoiceExtractor:
         if not pdf_path or not os.path.exists(pdf_path):
             return LocalExtractionProbe("invalid", reason_code="LOCAL_SOURCE_MISSING")
         abs_pdf_path = os.path.abspath(pdf_path)
+        if os.path.splitext(abs_pdf_path)[1].lower() == ".xml":
+            try:
+                with open(abs_pdf_path, "rb") as handle:
+                    fields = parse_direct_invoice_xml_fields(handle.read())
+            except OSError:
+                fields = {}
+            required = ("invoice_number", "seller", "amount", "invoice_date")
+            valid_fields = all(fields.get(key) for key in required)
+            valid_fields = bool(
+                valid_fields
+                and re.fullmatch(r"\d{8,20}", fields["invoice_number"])
+            )
+            try:
+                dt.datetime.strptime(fields.get("invoice_date", ""), "%Y-%m-%d")
+                valid_fields = valid_fields and Decimal(fields["amount"]) > 0
+            except (ValueError, InvalidOperation):
+                valid_fields = False
+            if valid_fields:
+                document_type = normalize_document_type(fields.get("item_name", ""))
+                if document_type == "其他":
+                    document_type = normalize_document_type(fields["seller"])
+                result = {
+                    "is_invoice": True,
+                    "Date": re.sub(r"\D", "", fields["invoice_date"])[:8],
+                    "Purchaser": fields.get("purchaser", ""),
+                    "Seller": fields["seller"],
+                    "Amount": fields["amount"],
+                    "InvoiceCode": fields.get("invoice_code", ""),
+                    "InvoiceNumber": fields["invoice_number"],
+                    "Type": document_type,
+                    "category": document_type,
+                    "Departure_Date": "",
+                    "Departure_City": "",
+                    "Destination_City": "",
+                }
+                return LocalExtractionProbe(
+                    "resolved",
+                    result=self._adapt_extraction_result(
+                        result,
+                        pdf_path=abs_pdf_path,
+                        document_context=document_context,
+                    ),
+                    reason_code="LOCAL_DIRECT_INVOICE_XML_FAST_PATH",
+                    engine="local_direct_invoice_xml",
+                )
+            return LocalExtractionProbe(
+                "invalid", reason_code="LOCAL_DIRECT_INVOICE_XML_INVALID"
+            )
         probes = (
             (
                 "local_email_body_receipt_pdf",

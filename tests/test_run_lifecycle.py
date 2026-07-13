@@ -1184,6 +1184,13 @@ def test_processing_loop_internal_exception_reaches_worker_failed_terminal_once(
     monkeypatch.setattr(api, "_load_output_run_state", lambda state_dir: {})
     monkeypatch.setattr(api, "_load_committed_history", lambda state_dir: set())
     monkeypatch.setattr(api, "_mark_output_run_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        api,
+        "_commit_output_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("https://secret.example/?token=INNER-SECRET")
+        ),
+    )
     monkeypatch.setattr(api, "_cleanup_temp_folders", lambda **kwargs: finalizers.append("cleanup"))
     original_processing_loop = api._run_processing_loop
     propagated = []

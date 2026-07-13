@@ -228,7 +228,7 @@ function Resolve-GitRevision {
     }
 
     try {
-        $revision = & $gitCommand.Source -C $RootPath rev-parse --short HEAD 2>$null
+        $revision = & $gitCommand.Source -C $RootPath rev-parse HEAD 2>$null
         if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($revision)) {
             return ($revision | Select-Object -First 1).Trim()
         }
@@ -573,6 +573,9 @@ if str(identity.get("non_target_company_folder", "")) != expected_non_target:
     raise SystemExit(f"Build identity non_target_company_folder mismatch: {identity.get('non_target_company_folder')}")
 if not str(identity.get("url_strategy_version", "")).strip():
     raise SystemExit("Build identity url_strategy_version is missing.")
+source_revision = str(identity.get("source_revision", "")).strip().lower()
+if len(source_revision) != 40 or any(char not in "0123456789abcdef" for char in source_revision):
+    raise SystemExit("Build identity source_revision must be a full 40-character Git revision.")
 
 template_text = template_path.read_text(encoding="utf-8-sig")
 for marker in required_markers:

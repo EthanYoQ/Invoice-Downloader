@@ -90,12 +90,19 @@ def norm_date(value) -> str:
     return text
 
 
+def filename_safe_text(value: str) -> str:
+    return re.sub(r'[\\/:*?"<>|\r\n]', '_', value)
+
+
 def contains_fuzzy(expected: str, actual: str) -> bool:
     expected = re.sub(r"\s+", "", normalize_ocr_compat_text(expected))
     actual = re.sub(r"\s+", "", normalize_ocr_compat_text(actual))
     if not expected or not actual:
         return False
-    return expected in actual or actual in expected
+    if expected in actual or actual in expected:
+        return True
+    safe_expected = filename_safe_text(expected)
+    return safe_expected != expected and safe_expected == actual
 
 
 def parse_final_archive_fields(path_value: str, fallback_year: str = "") -> dict:

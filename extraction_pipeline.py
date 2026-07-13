@@ -67,6 +67,52 @@ class ExtractionOutcome:
         )
 
 
+@dataclass(frozen=True)
+class RemoteExtractionRequest:
+    candidate: DocumentCandidate
+
+
+def normalize_url_terminal_outcome(
+    candidate: DocumentCandidate, outcome: ExtractionOutcome
+) -> ExtractionOutcome:
+    """Apply the provider-aware fail-closed policy at one URL terminal boundary."""
+    if candidate.identity.source_kind != "url":
+        return outcome
+    if outcome.status in {"resolved", "duplicate", "cancelled"}:
+        return outcome
+
+    provider_family = str(candidate.metadata.get("provider_family") or "").strip()
+    target_status = "unresolved" if provider_family else "retained"
+    reason_code = str(outcome.reason_code or "URL_DOWNSTREAM_FAILED")
+    artifact_path = str(outcome.artifact_path or candidate.source_path)
+    if outcome.status == target_status and outcome.artifact_path:
+        return outcome
+    return ExtractionOutcome(
+        candidate=candidate,
+        status=target_status,
+        payload=outcome.payload,
+        reason_code=reason_code,
+        message=str(outcome.message or reason_code),
+        artifact_path=artifact_path,
+        trace_context=outcome.trace_context,
+    )
+
+
+def _url_preflight_failure(
+    candidate: DocumentCandidate, exc: BaseException
+) -> ExtractionOutcome:
+    if candidate.identity.source_kind != "url":
+        return _safe_failure(candidate, exc)
+    return normalize_url_terminal_outcome(
+        candidate,
+        ExtractionOutcome.unresolved(
+            candidate,
+            "URL_PREFLIGHT_FAILED",
+            f"URL_PREFLIGHT_FAILED:{type(exc).__name__}",
+        ),
+    )
+
+
 def _safe_failure(candidate: DocumentCandidate, exc: BaseException) -> ExtractionOutcome:
     http_status = getattr(exc, "http_status", None)
     if http_status == 402:
@@ -124,11 +170,15 @@ class ExtractionPipeline:
     def _coerce_result(candidate: DocumentCandidate, result: Any) -> ExtractionOutcome:
         if isinstance(result, ExtractionOutcome):
             if result.candidate.identity != candidate.identity:
-                return ExtractionOutcome.unresolved(
-                    candidate, "OUTCOME_IDENTITY_MISMATCH", "OUTCOME_IDENTITY_MISMATCH"
+                result = ExtractionOutcome.unresolved(
+                    candidate,
+                    "OUTCOME_IDENTITY_MISMATCH",
+                    "OUTCOME_IDENTITY_MISMATCH",
                 )
-            return result
-        return ExtractionOutcome.resolved(candidate, result)
+            return normalize_url_terminal_outcome(result.candidate, result)
+        return normalize_url_terminal_outcome(
+            candidate, ExtractionOutcome.resolved(candidate, result)
+        )
 
     def _run_remote(self, candidate: DocumentCandidate) -> Any:
         if self._stop_requested():
@@ -139,6 +189,48 @@ class ExtractionPipeline:
                 message="STOP_REQUESTED",
             )
         return self._remote_extractor(candidate)
+
+    def resolve_one(self, candidate: DocumentCandidate) -> ExtractionOutcome:
+        """Run local preflight and its remote fallback without progress or archive side effects."""
+        if self._stop_requested():
+            return ExtractionOutcome(
+                candidate=candidate,
+                status="cancelled",
+                reason_code="STOP_REQUESTED",
+                message="STOP_REQUESTED",
+            )
+        try:
+            local_result = self._local_parser(candidate)
+        except Exception as exc:
+            return _url_preflight_failure(candidate, exc)
+
+        if isinstance(local_result, RemoteExtractionRequest):
+            effective_candidate = local_result.candidate
+            try:
+                outcome = self._coerce_result(
+                    effective_candidate, self._run_remote(effective_candidate)
+                )
+            except Exception as exc:
+                outcome = normalize_url_terminal_outcome(
+                    effective_candidate, _safe_failure(effective_candidate, exc)
+                )
+        elif isinstance(local_result, ExtractionOutcome) or local_result is not None:
+            outcome = self._coerce_result(candidate, local_result)
+        else:
+            try:
+                outcome = self._coerce_result(candidate, self._run_remote(candidate))
+            except Exception as exc:
+                outcome = normalize_url_terminal_outcome(
+                    candidate, _safe_failure(candidate, exc)
+                )
+
+        if outcome.status == "resolved":
+            register_success = getattr(
+                self._local_parser, "register_provider_group_success", None
+            )
+            if callable(register_success):
+                register_success(outcome.candidate)
+        return outcome
 
     def _emit_progress(self, completed: int, total: int) -> None:
         if self._progress_callback is None:
@@ -182,6 +274,7 @@ class ExtractionPipeline:
             nonlocal completed
             if ordinal in outcomes:
                 return
+            outcome = normalize_url_terminal_outcome(outcome.candidate, outcome)
             outcomes[ordinal] = outcome
             completed += 1
             if self._trace_sink is not None:
@@ -224,9 +317,11 @@ class ExtractionPipeline:
             try:
                 local_result = self._local_parser(candidate)
             except Exception as exc:
-                record(ordinal, _safe_failure(candidate, exc))
+                record(ordinal, _url_preflight_failure(candidate, exc))
                 continue
-            if isinstance(local_result, ExtractionOutcome) or local_result is not None:
+            if isinstance(local_result, RemoteExtractionRequest):
+                unresolved.append((ordinal, local_result.candidate))
+            elif isinstance(local_result, ExtractionOutcome) or local_result is not None:
                 record(ordinal, self._coerce_result(candidate, local_result))
             else:
                 unresolved.append((ordinal, candidate))
@@ -254,7 +349,9 @@ class ExtractionPipeline:
                             candidate, self._remote_extractor(candidate)
                         )
                     except Exception as exc:
-                        outcome = _safe_failure(candidate, exc)
+                        outcome = normalize_url_terminal_outcome(
+                            candidate, _safe_failure(candidate, exc)
+                        )
                 record(ordinal, outcome)
                 if outcome.status in {"quota_exhausted", "auth_failed"}:
                     breaker = outcome
@@ -297,7 +394,9 @@ class ExtractionPipeline:
                                 item_candidate, future.result()
                             )
                         except Exception as exc:
-                            outcome = _safe_failure(item_candidate, exc)
+                            outcome = normalize_url_terminal_outcome(
+                                item_candidate, _safe_failure(item_candidate, exc)
+                            )
                         record(item_ordinal, outcome)
                         if outcome.status in {"quota_exhausted", "auth_failed"}:
                             breaker = outcome
@@ -336,12 +435,14 @@ class ExtractionPipeline:
         release = getattr(self._local_parser, "release_current_run_candidate", None)
         if not callable(release):
             raise RuntimeError("local parser does not support explicit current-run retries")
+        outcomes = []
         for candidate in ordered:
             if not release(candidate):
                 raise RuntimeError(
                     "candidate was not registered by this pipeline in the current run"
                 )
-        return self.extract(ordered, _emit_progress_events=False)
+            outcomes.append(self.resolve_one(candidate))
+        return outcomes
 
 
 class SharedRuntimeRemoteExtractor:

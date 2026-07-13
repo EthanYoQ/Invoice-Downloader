@@ -35,6 +35,21 @@ def _candidate(sequence: int, name: str | None = None, **metadata) -> DocumentCa
     )[0]
 
 
+def _url_candidate(sequence: int, **metadata) -> DocumentCandidate:
+    return CandidatePipeline().collect(
+        [
+            {
+                "filepath": f"https://example.test/invoice/{sequence}",
+                "source_url": f"https://example.test/invoice/{sequence}",
+                "email_id": f"mail-{sequence}",
+                "is_url": True,
+                **metadata,
+            }
+        ],
+        sequence_offset=sequence,
+    )[0]
+
+
 def test_candidate_collection_is_frozen_stable_and_preserves_legacy_order():
     source = [
         {"filepath": "C:/staging/a.pdf", "message_uid": "11", "tier": 1},
@@ -988,8 +1003,7 @@ def test_processing_session_never_downloads_exact_archived_provider_url(tmp_path
     outcomes = session.extract()
     report = session.archive(outcomes)
 
-    assert len(pipeline.calls) == 2
-    assert pipeline.calls[1][0] == []
+    assert len(pipeline.calls) == 1
     assert report.can_complete is True
     assert archive_service.calls[1][0].reason_code == (
         "PROVIDER_URL_REDUNDANT_WITH_ARCHIVED_INVOICE"
@@ -1028,24 +1042,25 @@ def test_processing_session_reconciles_failure_only_after_sibling_url_archives(
         def extract(self, batch, **progress):
             batch = list(batch)
             self.calls.append((batch, progress))
-            if not batch:
-                return []
-            assert batch == candidates
-            return [
-                ExtractionOutcome.unresolved(
-                    candidates[0], "URL_DOWNLOAD_FAILED"
-                ),
-                ExtractionOutcome.resolved(
-                    candidates[1],
-                    {
-                        "info_json": {
-                            "InvoiceNumber": "26110000000000000001",
-                            "is_invoice": True,
-                            "Type": "餐饮",
-                        }
-                    },
-                ),
-            ]
+            assert batch == []
+            return []
+
+        def resolve_one(self, candidate):
+            self.calls.append(([candidate], {"resolve_one": True}))
+            if candidate == candidates[0]:
+                return ExtractionOutcome.unresolved(
+                    candidate, "URL_DOWNLOAD_FAILED"
+                )
+            return ExtractionOutcome.resolved(
+                candidate,
+                {
+                    "info_json": {
+                        "InvoiceNumber": "26110000000000000001",
+                        "is_invoice": True,
+                        "Type": "餐饮",
+                    }
+                },
+            )
 
     class TraceStore:
         def __init__(self):
@@ -1128,7 +1143,18 @@ def test_processing_session_reconciles_failure_only_after_sibling_url_archives(
     )
 
 
-def test_processing_session_retries_uncovered_strong_provider_failure(tmp_path):
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "URL_DOWNLOAD_FAILED",
+        "URL_PAGE_TIMEOUT",
+        "URL_RECOVERY_DEADLINE_EXCEEDED",
+        "URL_RECOVERY_WORKER_FAILED",
+    ],
+)
+def test_processing_session_retries_uncovered_strong_provider_failure(
+    tmp_path, reason_code
+):
     candidate = CandidatePipeline().collect(
         [
             {
@@ -1152,7 +1178,7 @@ def test_processing_session_retries_uncovered_strong_provider_failure(tmp_path):
             if not batch:
                 return []
             self.provider_attempts += 1
-            return [ExtractionOutcome.unresolved(candidate, "URL_DOWNLOAD_FAILED")]
+            return [ExtractionOutcome.unresolved(candidate, reason_code)]
 
         def retry_current_run_failures(self, batch):
             assert list(batch) == [candidate]
@@ -1208,6 +1234,20 @@ def test_processing_session_retries_uncovered_strong_provider_failure(tmp_path):
     assert pipeline.retry_attempts == 1
     assert report.archived_count == 1
     assert report.unresolved_count == 0
+
+
+def test_strong_provider_retry_does_not_require_preextracted_invoice_number():
+    candidate = CandidatePipeline().collect(
+        [
+            {
+                "filepath": "https://nnfp.jss.com.cn/invoice",
+                "email_id": "mail-1",
+                "provider_family": "nuonuo_scan_invoice",
+            }
+        ]
+    )[0]
+
+    assert _ProcessingPipelineSession._is_strong_provider_retry_candidate(candidate)
 
 
 def test_extraction_pipeline_retry_releases_only_current_run_failed_candidate(tmp_path):
@@ -1839,6 +1879,829 @@ def test_worker_local_extractor_close_does_not_close_shared_run_runtime(tmp_path
     extractor.close()
 
     assert closes == 0
+
+
+def test_controlled_and_interactive_generic_urls_use_identical_recovery_policy(tmp_path: Path):
+    calls = []
+
+    class ApiStub:
+        def __init__(self, controlled):
+            self.controlled = controlled
+
+        def _should_gate_controlled_run_url(self, _legacy):
+            return self.controlled
+
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "generic URL"
+
+    class ExtractorStub:
+        def probe_local_only(self, *_args, **_kwargs):
+            pytest.fail("failed recovery must not reach local extraction")
+
+    class ConverterStub:
+        def process_invoice_links(self, *_args, **_kwargs):
+            calls.append(_kwargs["candidate_info"]["email_id"])
+            return [
+                {
+                    "status": "failed",
+                    "reason_code": "URL_RECOVERY_DEADLINE_EXCEEDED",
+                }
+            ]
+
+    outcomes = []
+    for controlled in (True, False):
+        candidate = _url_candidate(int(controlled), email_id=f"controlled-{controlled}")
+        preflight = CandidatePreflight(
+            api=ApiStub(controlled),
+            extractor=ExtractorStub(),
+            working_history=set(),
+            sidecar={},
+            sidecar_lock=threading.Lock(),
+            converter_factory=ConverterStub,
+        )
+        outcomes.append(preflight(candidate))
+
+    assert calls == ["controlled-True", "controlled-False"]
+    assert [(item.status, item.reason_code) for item in outcomes] == [
+        ("retained", "URL_RECOVERY_DEADLINE_EXCEEDED"),
+        ("retained", "URL_RECOVERY_DEADLINE_EXCEEDED"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    ["URL_RECOVERY_DEADLINE_EXCEEDED", "URL_RECOVERY_WORKER_FAILED"],
+)
+def test_generic_url_failure_is_retained_but_provider_failure_is_unresolved(
+    reason_code,
+):
+    class ApiStub:
+        def _should_gate_controlled_run_url(self, _legacy):
+            return False
+
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "URL"
+
+    class ExtractorStub:
+        def probe_local_only(self, *_args, **_kwargs):
+            pytest.fail("failed recovery must not reach local extraction")
+
+    class ConverterStub:
+        def process_invoice_links(self, *_args, **_kwargs):
+            return [{"status": "failed", "reason_code": reason_code}]
+
+    results = []
+    for provider_family in ("", "nuonuo_scan_invoice"):
+        candidate = _url_candidate(
+            len(results),
+            provider_family=provider_family,
+            provider_group_key="provider-group" if provider_family else "",
+        )
+        preflight = CandidatePreflight(
+            api=ApiStub(),
+            extractor=ExtractorStub(),
+            working_history=set(),
+            sidecar={},
+            sidecar_lock=threading.Lock(),
+            converter_factory=ConverterStub,
+        )
+        results.append(preflight(candidate))
+
+    assert [(item.status, item.reason_code) for item in results] == [
+        ("retained", reason_code),
+        ("unresolved", reason_code),
+    ]
+
+
+@pytest.mark.parametrize("failure_stage", ["converter_factory", "log", "local_probe"])
+def test_generic_url_outer_preflight_exception_is_retained_with_stable_reason(
+    failure_stage, tmp_path: Path
+):
+    candidate = _url_candidate(0)
+    recovered = tmp_path / "recovered.pdf"
+    recovered.write_bytes(b"%PDF-1.4\n")
+
+    class ApiStub:
+        def _append_log(self, *_args):
+            if failure_stage == "log":
+                raise RuntimeError("log sink failed")
+
+        def _url_candidate_label(self, _legacy):
+            return "generic URL"
+
+    class ConverterStub:
+        def process_invoice_links(self, *_args, **_kwargs):
+            return [{"status": "success", "pdf_path": str(recovered)}]
+
+    def converter_factory():
+        if failure_stage == "converter_factory":
+            raise RuntimeError("converter construction failed")
+        return ConverterStub()
+
+    class ExtractorStub:
+        def probe_local_only(self, *_args, **_kwargs):
+            if failure_stage == "local_probe":
+                raise RuntimeError("local probe failed")
+            pytest.fail("outer failure must stop before local probe completion")
+
+    preflight = CandidatePreflight(
+        api=ApiStub(),
+        extractor=ExtractorStub(),
+        working_history=set(),
+        sidecar={},
+        sidecar_lock=threading.Lock(),
+        converter_factory=converter_factory,
+    )
+    pipeline = ExtractionPipeline(
+        local_parser=preflight,
+        remote_extractor=lambda _candidate: pytest.fail("remote must not run"),
+    )
+
+    outcome = pipeline.resolve_one(candidate)
+
+    assert outcome.status == "retained"
+    assert outcome.reason_code == "URL_PREFLIGHT_FAILED"
+    assert outcome.artifact_path == candidate.source_path
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_reason"),
+    [
+        ("local_terminal", "LOCAL_DOCUMENT_REJECTED"),
+        ("pdf_to_image", "PDF_TO_IMAGE_FAILED"),
+        ("remote_exception", "REMOTE_EXTRACTION_FAILED"),
+        ("remote_terminal", "EXTRACTOR_ALL_ENGINES_FAILED"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("provider_family", "expected_status"),
+    [("", "retained"), ("nuonuo_scan_invoice", "unresolved")],
+)
+def test_url_downstream_failure_is_provider_aware_at_one_terminal_boundary(
+    failure_stage,
+    expected_reason,
+    provider_family,
+    expected_status,
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    candidate = _url_candidate(0, provider_family=provider_family)
+    recovered = tmp_path / "recovered.pdf"
+    recovered.write_bytes(b"%PDF-1.4\n")
+
+    class ApiStub:
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "URL"
+
+    class ConverterStub:
+        def process_invoice_links(self, *_args, **_kwargs):
+            return [{"status": "success", "pdf_path": str(recovered)}]
+
+    class ExtractorStub:
+        def probe_local_only(self, *_args, **_kwargs):
+            if failure_stage == "local_terminal":
+                return SimpleNamespace(
+                    status="failed",
+                    result=None,
+                    reason_code="LOCAL_DOCUMENT_REJECTED",
+                    engine="local",
+                )
+            return SimpleNamespace(
+                status="needs_remote",
+                result=None,
+                reason_code="LOCAL_PROBE_UNRESOLVED",
+                engine="",
+            )
+
+        def pdf_to_base64_image(self, _path):
+            if failure_stage == "pdf_to_image":
+                return None
+            return ["image"]
+
+    def remote(candidate_for_remote):
+        if failure_stage == "remote_exception":
+            raise RuntimeError("remote failed")
+        if failure_stage == "remote_terminal":
+            return ExtractionOutcome(
+                candidate=candidate_for_remote,
+                status="manual_review",
+                reason_code="EXTRACTOR_ALL_ENGINES_FAILED",
+                message="EXTRACTOR_ALL_ENGINES_FAILED",
+                artifact_path=str(recovered),
+            )
+        pytest.fail("remote must not run for local/PDF terminal failures")
+
+    preflight = CandidatePreflight(
+        api=ApiStub(),
+        extractor=ExtractorStub(),
+        working_history=set(),
+        sidecar={},
+        sidecar_lock=threading.Lock(),
+        converter_factory=ConverterStub,
+    )
+    pipeline = ExtractionPipeline(local_parser=preflight, remote_extractor=remote)
+
+    outcome = pipeline.resolve_one(candidate)
+
+    assert outcome.status == expected_status
+    assert outcome.reason_code == expected_reason
+    assert outcome.artifact_path in {candidate.source_path, str(recovered)}
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_reason"),
+    [
+        ("local_terminal", "LOCAL_DOCUMENT_REJECTED"),
+        ("local_exception", "URL_PREFLIGHT_FAILED"),
+        ("pdf_to_image", "PDF_TO_IMAGE_FAILED"),
+        ("remote_exception", "REMOTE_EXTRACTION_FAILED"),
+        ("remote_terminal", "EXTRACTOR_ALL_ENGINES_FAILED"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("recovered_provider_family", "expected_status"),
+    [("nuonuo_scan_invoice", "unresolved"), ("", "retained")],
+)
+def test_recovered_provider_identity_controls_url_downstream_terminal_status(
+    failure_stage,
+    expected_reason,
+    recovered_provider_family,
+    expected_status,
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    candidate = _url_candidate(0)
+    assert candidate.metadata.get("provider_family") in {None, ""}
+    recovered = tmp_path / "recovered.pdf"
+    recovered.write_bytes(b"%PDF-1.4\n")
+
+    class ApiStub:
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "generic URL"
+
+    class ConverterStub:
+        def process_invoice_links(self, *_args, **_kwargs):
+            return [
+                {
+                    "status": "success",
+                    "pdf_path": str(recovered),
+                    "provider_family": recovered_provider_family,
+                }
+            ]
+
+    class ExtractorStub:
+        def probe_local_only(self, *_args, **_kwargs):
+            if failure_stage == "local_exception":
+                raise RuntimeError("local probe failed")
+            if failure_stage == "local_terminal":
+                return SimpleNamespace(
+                    status="failed",
+                    result=None,
+                    reason_code="LOCAL_DOCUMENT_REJECTED",
+                    engine="local",
+                )
+            return SimpleNamespace(
+                status="needs_remote",
+                result=None,
+                reason_code="LOCAL_PROBE_UNRESOLVED",
+                engine="",
+            )
+
+        def pdf_to_base64_image(self, _path):
+            if failure_stage == "pdf_to_image":
+                return None
+            return ["image"]
+
+    def remote(candidate_for_remote):
+        if failure_stage == "remote_exception":
+            raise RuntimeError("remote failed")
+        if failure_stage == "remote_terminal":
+            return ExtractionOutcome(
+                candidate=candidate_for_remote,
+                status="manual_review",
+                reason_code="EXTRACTOR_ALL_ENGINES_FAILED",
+                message="EXTRACTOR_ALL_ENGINES_FAILED",
+                artifact_path=str(recovered),
+            )
+        pytest.fail("remote must not run for local/PDF terminal failures")
+
+    preflight = CandidatePreflight(
+        api=ApiStub(),
+        extractor=ExtractorStub(),
+        working_history=set(),
+        sidecar={},
+        sidecar_lock=threading.Lock(),
+        converter_factory=ConverterStub,
+    )
+    pipeline = ExtractionPipeline(local_parser=preflight, remote_extractor=remote)
+
+    outcome = pipeline.resolve_one(candidate)
+
+    assert outcome.status == expected_status
+    assert outcome.reason_code == expected_reason
+    assert outcome.candidate.identity == candidate.identity
+    assert (
+        outcome.candidate.compatibility_history_key
+        == candidate.compatibility_history_key
+    )
+    assert outcome.candidate.metadata.get("provider_family", "") == recovered_provider_family
+
+
+def test_resolve_one_runs_preflight_then_remote_fallback_and_returns_outcome(tmp_path: Path):
+    candidate = _url_candidate(0)
+    recovered = tmp_path / "recovered.pdf"
+    recovered.write_bytes(b"%PDF-1.4\n")
+
+    class ApiStub:
+        def _should_gate_controlled_run_url(self, _legacy):
+            return False
+
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "URL"
+
+    class Probe:
+        status = "needs_remote"
+        result = None
+        reason_code = "LOCAL_PROBE_UNRESOLVED"
+        engine = ""
+
+    class ExtractorStub:
+        def probe_local_only(self, path, *, document_context):
+            assert path == str(recovered)
+            assert document_context["filepath"] == str(recovered)
+            return Probe()
+
+        def pdf_to_base64_image(self, path):
+            assert path == str(recovered)
+            return ["image"]
+
+    class ConverterStub:
+        def process_invoice_links(self, *_args, **_kwargs):
+            return [{"status": "success", "pdf_path": str(recovered)}]
+
+    sidecar = {}
+    preflight = CandidatePreflight(
+        api=ApiStub(),
+        extractor=ExtractorStub(),
+        working_history=set(),
+        sidecar=sidecar,
+        sidecar_lock=threading.Lock(),
+        converter_factory=ConverterStub,
+    )
+    pipeline = ExtractionPipeline(
+        local_parser=preflight,
+        remote_extractor=lambda item: ExtractionOutcome.resolved(
+            item, {"pdf_path": str(recovered), "info_json": {"is_invoice": True}}
+        ),
+    )
+
+    outcome = pipeline.resolve_one(candidate)
+
+    assert isinstance(outcome, ExtractionOutcome)
+    assert outcome.status == "resolved"
+    assert candidate.identity.document_id in sidecar
+
+
+def test_provider_group_registers_only_after_resolved_and_allows_failed_fallback(
+    tmp_path: Path,
+):
+    candidates = [
+        _url_candidate(
+            index,
+            email_id="same-mail",
+            provider_family="nuonuo_scan_invoice",
+            provider_group_key="same-provider-invoice",
+            provider_expected_fields={
+                "invoice_number": "26110000000000000001"
+            },
+        )
+        for index in range(3)
+    ]
+    assert len({item.compatibility_history_key for item in candidates}) == 3
+    recovered = tmp_path / "recovered.pdf"
+    recovered.write_bytes(b"%PDF-1.4\n")
+    converter_calls = []
+
+    class ApiStub:
+        def _should_gate_controlled_run_url(self, _legacy):
+            return False
+
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "provider URL"
+
+    class Probe:
+        status = "resolved"
+        result = {"is_invoice": True}
+        reason_code = "LOCAL_PARSE"
+        engine = "local"
+
+    class ExtractorStub:
+        def probe_local_only(self, *_args, **_kwargs):
+            return Probe()
+
+    class ConverterStub:
+        def process_invoice_links(self, text_content, *_args, **_kwargs):
+            converter_calls.append(text_content)
+            if len(converter_calls) == 1:
+                return [{"status": "failed", "reason_code": "URL_DOWNLOAD_FAILED"}]
+            return [{"status": "success", "pdf_path": str(recovered)}]
+
+    preflight = CandidatePreflight(
+        api=ApiStub(),
+        extractor=ExtractorStub(),
+        working_history=set(),
+        sidecar={},
+        sidecar_lock=threading.Lock(),
+        converter_factory=ConverterStub,
+    )
+    pipeline = ExtractionPipeline(
+        local_parser=preflight,
+        remote_extractor=lambda _candidate: pytest.fail("local parse resolves"),
+    )
+
+    outcomes = [pipeline.resolve_one(candidate) for candidate in candidates]
+
+    assert [(item.status, item.reason_code) for item in outcomes] == [
+        ("unresolved", "URL_DOWNLOAD_FAILED"),
+        ("resolved", ""),
+        ("duplicate", "PROVIDER_GROUP_ALREADY_PROCESSED"),
+    ]
+    assert len(converter_calls) == 2
+
+
+def test_preflight_serializes_dedupe_state_but_not_url_recovery_io(tmp_path: Path):
+    candidates = [_url_candidate(0), _url_candidate(1)]
+
+    class ConcurrentDetectingSet(set):
+        def __init__(self):
+            super().__init__()
+            self.guard = threading.Lock()
+            self.active = 0
+            self.peak = 0
+
+        def _tracked(self, operation, *args):
+            with self.guard:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            time.sleep(0.005)
+            try:
+                return operation(*args)
+            finally:
+                with self.guard:
+                    self.active -= 1
+
+        def __contains__(self, item):
+            return self._tracked(super().__contains__, item)
+
+        def add(self, item):
+            return self._tracked(super().add, item)
+
+    history = ConcurrentDetectingSet()
+    io_guard = threading.Lock()
+    io_active = 0
+    io_peak = 0
+
+    class ApiStub:
+        def _should_gate_controlled_run_url(self, _legacy):
+            return False
+
+        def _append_log(self, *_args):
+            return None
+
+        def _url_candidate_label(self, _legacy):
+            return "URL"
+
+    class ExtractorStub:
+        def probe_local_only(self, *_args, **_kwargs):
+            pytest.fail("failed recovery must stop")
+
+    class ConverterStub:
+        def process_invoice_links(self, *_args, **_kwargs):
+            nonlocal io_active, io_peak
+            with io_guard:
+                io_active += 1
+                io_peak = max(io_peak, io_active)
+            time.sleep(0.04)
+            with io_guard:
+                io_active -= 1
+            return [{"status": "failed", "reason_code": "URL_DOWNLOAD_FAILED"}]
+
+    preflight = CandidatePreflight(
+        api=ApiStub(),
+        extractor=ExtractorStub(),
+        working_history=history,
+        sidecar={},
+        sidecar_lock=threading.Lock(),
+        converter_factory=ConverterStub,
+    )
+    start = threading.Barrier(2)
+
+    def run(candidate):
+        start.wait(timeout=1)
+        return preflight(candidate)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(run, candidates))
+
+    assert [item.status for item in outcomes] == ["retained", "retained"]
+    assert history.peak == 1
+    assert io_peak == 2
+
+
+def test_deferred_recovery_never_archives_from_worker_thread(tmp_path: Path):
+    from deferred_url_recovery import DeferredUrlRecoveryScheduler
+
+    owner_thread = threading.get_ident()
+    candidates = [_url_candidate(0), _url_candidate(1)]
+    recovery_threads = set()
+    archive_threads = set()
+
+    class PipelineStub:
+        def extract(self, batch, **_kwargs):
+            assert list(batch) == []
+            return []
+
+        def resolve_one(self, candidate):
+            recovery_threads.add(threading.get_ident())
+            return ExtractionOutcome.resolved(candidate, {"sequence": candidate.sequence})
+
+    class TraceStore:
+        def set_fields(self, *_args, **_kwargs):
+            return None
+
+        def get_record(self, _document_id):
+            return {}
+
+    class ApiStub:
+        _stop_requested = False
+
+        def _safe_emit_stage_event(self, *_args):
+            return None
+
+        def _commit_output_state(self, *_args):
+            return None
+
+    def writer(outcome, _root):
+        archive_threads.add(threading.get_ident())
+        return str(tmp_path / f"{outcome.candidate.sequence}.pdf")
+
+    session = _ProcessingPipelineSession(
+        api=ApiStub(),
+        candidates=candidates,
+        pipeline=PipelineStub(),
+        archive_service=ArchiveService(writer=writer),
+        save_path=str(tmp_path),
+        output_state_dir=str(tmp_path / "state"),
+        working_history=set(),
+        business_records={},
+        sidecar={},
+        trace_store=TraceStore(),
+        url_recovery_scheduler=DeferredUrlRecoveryScheduler(max_workers=2),
+    )
+
+    report = session.archive(session.extract())
+
+    assert report.archived_count == 2
+    assert recovery_threads and owner_thread not in recovery_threads
+    assert archive_threads == {owner_thread}
+
+
+def test_production_processing_session_uses_bounded_url_recovery_client():
+    import inspect
+
+    from app_api import InvoiceAppAPI
+
+    source = inspect.getsource(InvoiceAppAPI._create_processing_pipeline_session)
+    assert "BoundedUrlRecoveryClient" in source
+    assert "converter_factory=lambda: PDFConverter" not in source
+
+
+def test_generic_browser_deadline_cannot_block_provider_archive_or_pair_finalizer(
+    tmp_path: Path,
+):
+    from app_api import _FallbackDocumentTraceStore
+    from archive_pairing_service import reconcile_archive_pairs
+    from deferred_url_recovery import DeferredUrlRecoveryScheduler
+
+    source = tmp_path / "source-invoice.pdf"
+    source.write_bytes(b"invoice")
+    candidates = CandidatePipeline().collect(
+        [
+            {"filepath": str(source), "email_id": "hotel-mail"},
+            {
+                "filepath": "https://provider.test/hotel-folio",
+                "source_url": "https://provider.test/hotel-folio",
+                "email_id": "hotel-mail",
+                "is_url": True,
+                "provider_family": "hotel_provider",
+                "provider_group_key": "hotel-pair",
+            },
+            {
+                "filepath": "https://generic.test/slow-page",
+                "source_url": "https://generic.test/slow-page",
+                "email_id": "generic-mail",
+                "is_url": True,
+            },
+        ]
+    )
+
+    class PipelineStub:
+        def extract(self, batch, **_progress):
+            assert list(batch) == [candidates[0]]
+            return [
+                ExtractionOutcome.resolved(candidates[0], {"kind": "hotel_invoice"})
+            ]
+
+        def resolve_one(self, candidate):
+            if candidate == candidates[1]:
+                return ExtractionOutcome.resolved(candidate, {"kind": "hotel_folio"})
+            return ExtractionOutcome(
+                candidate=candidate,
+                status="retained",
+                reason_code="URL_RECOVERY_DEADLINE_EXCEEDED",
+                message="URL_RECOVERY_DEADLINE_EXCEEDED",
+                artifact_path=candidate.source_path,
+            )
+
+    trace_store = _FallbackDocumentTraceStore(tmp_path / "debug_trace.jsonl")
+    for candidate in candidates:
+        trace_store.start_document(
+            source_filename=candidate.source_filename,
+            source_path=candidate.source_path,
+            document_id=candidate.identity.document_id,
+            persistence_is_url=candidate.identity.source_kind == "url",
+        )
+
+    hotel_dir = tmp_path / "output" / "住宿发票"
+    artifact_metadata = {}
+    order = []
+
+    def writer(outcome, _root):
+        hotel_dir.mkdir(parents=True, exist_ok=True)
+        if outcome.candidate == candidates[0]:
+            path = hotel_dir / "20260610_住宿发票_424.15_酒店.pdf"
+            role = "hotel_invoice"
+        else:
+            path = hotel_dir / "20260610_住宿水单_424.15_酒店.pdf"
+            role = "hotel_folio"
+        path.write_bytes(b"pdf")
+        document_id = outcome.candidate.identity.document_id
+        artifact_metadata[str(path)] = {
+            "document_id": document_id,
+            "source_message_uid": "hotel-mail",
+            "artifact_role": role,
+            "pairing_required": True,
+            "date": "20260610",
+            "amount": "424.15",
+        }
+        trace_store.set_fields(
+            document_id,
+            normalized_fields={"Date": "20260610", "Amount": "424.15"},
+            archive_target=str(path),
+        )
+        order.append(f"write:{role}")
+        return str(path)
+
+    finalizer_calls = 0
+
+    def finalizer(_report, root):
+        nonlocal finalizer_calls
+        finalizer_calls += 1
+        order.append("finalize")
+        reconcile_archive_pairs(
+            root,
+            trace_store=trace_store,
+            artifact_metadata=artifact_metadata,
+        )
+        return {
+            str(record["document_id"]): str(record.get("archive_target") or "")
+            for record in trace_store.iter_records()
+        }
+
+    class ApiStub:
+        _stop_requested = False
+
+        def _safe_emit_stage_event(self, *_args):
+            return None
+
+        def _commit_output_state(self, *_args):
+            order.append("commit")
+
+        def _mark_output_run_state(self, *_args, **_kwargs):
+            pytest.fail("complete terminal report must not be marked failed")
+
+    session = _ProcessingPipelineSession(
+        api=ApiStub(),
+        candidates=candidates,
+        pipeline=PipelineStub(),
+        archive_service=ArchiveService(writer=writer, finalizer=finalizer),
+        save_path=str(tmp_path / "output"),
+        output_state_dir=str(tmp_path / "state"),
+        working_history=set(),
+        business_records={},
+        sidecar={},
+        trace_store=trace_store,
+        url_recovery_scheduler=DeferredUrlRecoveryScheduler(max_workers=2),
+    )
+
+    report = session.archive(session.extract())
+
+    expected_names = [
+        "20260610-住宿-01-发票_424.15元.pdf",
+        "20260610-住宿-01-水单_424.15元.pdf",
+    ]
+    assert report.can_complete is True
+    assert report.archived_count == 2
+    assert report.retained_count == 1
+    assert finalizer_calls == 1
+    assert sorted(path.name for path in hotel_dir.iterdir()) == expected_names
+    paired_paths = [
+        Path(record["archive_target"])
+        for record in trace_store.iter_records()
+        if (record.get("combine_result") or {}).get("status") == "matched"
+    ]
+    assert sorted(path.name for path in paired_paths) == expected_names
+    assert all(path.exists() for path in paired_paths)
+    assert order[-2:] == ["finalize", "commit"]
+
+
+def test_run_dependencies_do_not_repeat_terminal_cancellation_matching(
+    monkeypatch, tmp_path: Path
+):
+    from types import SimpleNamespace
+
+    from app_api import InvoiceAppAPI
+    from run_coordinator import RunRequest
+
+    api = InvoiceAppAPI()
+    calls = []
+    api._cwt_cancellation_matching = lambda root: calls.append(str(root))
+
+    class ExtractorStub:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("invoice_extractor.InvoiceExtractor", ExtractorStub)
+
+    report = SimpleNamespace(can_complete=True, archived_count=0)
+
+    class PipelineStub:
+        def extract(self):
+            return []
+
+        def archive(self, _outcomes):
+            api._cwt_cancellation_matching(str(tmp_path / "output"))
+            return report
+
+        def close(self):
+            return None
+
+    api._create_processing_pipeline_session = lambda *_args, **_kwargs: PipelineStub()
+    request = RunRequest(
+        run_id="task-3",
+        date_from="2026-06-01",
+        date_to="2026-06-13",
+        save_path=str(tmp_path / "output"),
+        rules_text="",
+        account_id="account",
+        channel_id="qq",
+    )
+    dependencies = api._build_run_dependencies(
+        request,
+        email_address="test@example.com",
+        auth_code="auth",
+        api_key="key",
+    )
+
+    outcomes = dependencies.extract([], request)
+    assert dependencies.archive(outcomes, request) is report
+
+    assert calls == [str(tmp_path / "output")]
 
 
 def test_invoice_extractor_local_probe_resolves_without_glm(monkeypatch, tmp_path: Path):

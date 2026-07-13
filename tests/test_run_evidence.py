@@ -6,6 +6,7 @@ import json
 import shutil
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -293,6 +294,87 @@ def test_evidence_capture_rejects_archived_document_without_source_uid(tmp_path:
         raise AssertionError("archived lineage without source UID must fail")
 
 
+def test_evidence_lineage_uses_recovered_url_path_from_candidate_metadata(tmp_path: Path):
+    source_url = "https://provider.example/invoice"
+    downloaded = tmp_path / "staging" / "downloaded.pdf"
+    downloaded.parent.mkdir()
+    downloaded.write_bytes(b"downloaded-provider-invoice")
+    candidate = CandidatePipeline().collect(
+        [
+            {
+                "filepath": source_url,
+                "source_url": source_url,
+                "email_id": "100",
+                "provider_family": "chinatax_direct_invoice",
+                "download_mode": "direct_request",
+            }
+        ]
+    )[0]
+    recovered_metadata = candidate.to_legacy()
+    recovered_metadata["filepath"] = str(downloaded)
+    recovered = replace(candidate, metadata=recovered_metadata)
+    outcome = ExtractionOutcome.resolved(
+        recovered,
+        {"info_json": {"InvoiceNumber": "12345678"}},
+    )
+
+    def archive_file(_outcome, root):
+        target = root / "invoice.pdf"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(downloaded.read_bytes())
+        return str(target)
+
+    output = tmp_path / "output"
+    archive = ArchiveService(writer=archive_file).archive([outcome], output)
+
+    writer = RunEvidenceWriter(revision_resolver=lambda: REVISION)
+    writer.capture_for_test(
+        run_id="run-1",
+        run_root=tmp_path,
+        output_root=output,
+        archive_report=archive,
+    )
+    lineage = writer._lineage("run-1", output, archive)
+
+    assert lineage[0]["transformation_type"] == "url"
+    assert lineage[0]["provider_type"] == "chinatax_direct_invoice"
+
+
+@pytest.mark.parametrize("metadata_key", ["archive_path", "unrelated_path"])
+def test_evidence_lineage_rejects_non_source_metadata_paths(
+    tmp_path: Path, metadata_key: str
+):
+    source_url = "https://provider.example/invoice"
+    unrelated = tmp_path / "unrelated.pdf"
+    unrelated.write_bytes(b"not-the-downloaded-source")
+    candidate = CandidatePipeline().collect(
+        [{"filepath": source_url, "source_url": source_url, "email_id": "100"}]
+    )[0]
+    metadata = candidate.to_legacy()
+    metadata[metadata_key] = str(unrelated)
+    candidate = replace(candidate, metadata=metadata)
+    outcome = ExtractionOutcome.resolved(
+        candidate, {"info_json": {"InvoiceNumber": "12345678"}}
+    )
+
+    def archive_file(_outcome, root):
+        target = root / "invoice.pdf"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"archived-output")
+        return str(target)
+
+    output = tmp_path / "output"
+    archive = ArchiveService(writer=archive_file).archive([outcome], output)
+
+    with pytest.raises(ValueError, match="lineage_source_chain_missing"):
+        RunEvidenceWriter(revision_resolver=lambda: REVISION).capture_for_test(
+            run_id="run-1",
+            run_root=tmp_path,
+            output_root=output,
+            archive_report=archive,
+        )
+
+
 def test_evidence_lineage_excludes_retention_and_manual_review_outputs(tmp_path: Path):
     output = tmp_path / "output"
     output.mkdir()
@@ -489,6 +571,32 @@ def test_windows_package_manifest_includes_generated_build_identity():
         "target": "build_meta",
         "optional": False,
     } in payload["datas"]
+
+
+def test_windows_package_manifest_includes_dynamic_truth_audit_module():
+    manifest_path = (
+        Path(__file__).resolve().parents[1]
+        / "build"
+        / "windows"
+        / "resources.manifest.json"
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert "audit_email_truth" in payload["hiddenImports"]
+
+
+def test_windows_release_builder_uses_full_git_revision():
+    build_script_path = (
+        Path(__file__).resolve().parents[1]
+        / "build"
+        / "windows"
+        / "build_release.ps1"
+    )
+    build_script = build_script_path.read_text(encoding="utf-8")
+
+    assert "rev-parse HEAD" in build_script
+    assert "rev-parse --short HEAD" not in build_script
+    assert "source_revision must be a full 40-character Git revision" in build_script
 
 
 def _zero_lineage_run(tmp_path: Path, *, scan, included_count: int):

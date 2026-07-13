@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import os
+import threading
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
@@ -205,11 +206,14 @@ class CandidatePipeline:
                 or source_url
                 or source_scheme in {"http", "https"}
             )
-            filename = (
+            declared_filename = os.path.basename(
+                str(metadata.get("original_filename") or metadata.get("filename") or "")
+            )
+            filename = declared_filename or (
                 os.path.basename(urlsplit(source_url or source_path).path)
                 if is_url
                 else os.path.basename(source_path)
-            ) or str(metadata.get("filename") or "")
+            )
             message_uid = str(
                 metadata.get("message_uid")
                 or metadata.get("source_message_uid")
@@ -325,6 +329,7 @@ class CandidatePreflight:
         self.seen_identities: set[str] = set()
         self.seen_history_keys: set[str] = set()
         self.seen_provider_groups: set[str] = set()
+        self._state_lock = threading.RLock()
 
     @staticmethod
     def terminal(candidate, reason_code, *, status="retained"):
@@ -340,12 +345,11 @@ class CandidatePreflight:
 
     def _recover_url(self, candidate, legacy):
         provider_group = str(legacy.get("provider_group_key") or "")
-        if provider_group and provider_group in self.seen_provider_groups:
-            return self.terminal(
-                candidate, "PROVIDER_GROUP_ALREADY_PROCESSED", status="duplicate"
-            )
-        if self.api._should_gate_controlled_run_url(legacy):
-            return self.terminal(candidate, "CONTROLLED_RUN_NON_PROVIDER_URL_SKIPPED")
+        with self._state_lock:
+            if provider_group and provider_group in self.seen_provider_groups:
+                return self.terminal(
+                    candidate, "PROVIDER_GROUP_ALREADY_PROCESSED", status="duplicate"
+                )
         converter = self.converter_factory()
         self.api._append_log(
             "抓取:",
@@ -361,21 +365,19 @@ class CandidatePreflight:
                 candidate_info=legacy,
             )
         except Exception:
-            return self.terminal(candidate, "URL_DOWNLOAD_FAILED", status="unresolved")
+            return self._url_failure(candidate, legacy, "URL_DOWNLOAD_FAILED")
         if not results:
-            return self.terminal(candidate, "URL_DOWNLOAD_FAILED", status="unresolved")
+            return self._url_failure(candidate, legacy, "URL_DOWNLOAD_FAILED")
         result = dict(results[0] or {})
         if str(result.get("status") or "").lower() in {"failed", "skipped"}:
-            return self.terminal(
+            return self._url_failure(
                 candidate,
+                legacy,
                 str(result.get("reason_code") or "URL_DOWNLOAD_FAILED"),
-                status="unresolved",
             )
         pdf_path = str(result.get("pdf_path") or "")
         if not pdf_path:
-            return self.terminal(candidate, "URL_DOWNLOAD_FAILED", status="unresolved")
-        if provider_group:
-            self.seen_provider_groups.add(provider_group)
+            return self._url_failure(candidate, legacy, "URL_DOWNLOAD_FAILED")
         legacy.update(
             {
                 "filepath": pdf_path,
@@ -389,40 +391,67 @@ class CandidatePreflight:
         )
         return pdf_path
 
+    def _url_failure(self, candidate, legacy, reason_code):
+        from extraction_pipeline import normalize_url_terminal_outcome
+
+        del legacy
+        return normalize_url_terminal_outcome(
+            candidate,
+            self.terminal(candidate, reason_code, status="unresolved"),
+        )
+
+    def register_provider_group_success(self, candidate) -> None:
+        if candidate.identity.source_kind != "url":
+            return
+        provider_group = str(candidate.identity.provider_group_key or "").strip()
+        if not provider_group:
+            return
+        with self._state_lock:
+            self.seen_provider_groups.add(provider_group)
+
     def release_current_run_candidate(self, candidate) -> bool:
         """Release dedupe state created by this preflight for an explicit retry."""
         canonical_id = candidate.identity.document_id
         compatibility_key = candidate.compatibility_history_key
-        if (
-            canonical_id not in self.seen_identities
-            or compatibility_key not in self.seen_history_keys
-        ):
-            return False
-        self.seen_identities.discard(canonical_id)
-        self.seen_history_keys.discard(compatibility_key)
-        self.working_history.discard(canonical_id)
-        self.working_history.discard(compatibility_key)
+        with self._state_lock:
+            if (
+                canonical_id not in self.seen_identities
+                or compatibility_key not in self.seen_history_keys
+            ):
+                return False
+            self.seen_identities.discard(canonical_id)
+            self.seen_history_keys.discard(compatibility_key)
+            self.working_history.discard(canonical_id)
+            self.working_history.discard(compatibility_key)
         with self.sidecar_lock:
             self.sidecar.pop(canonical_id, None)
         return True
 
     def __call__(self, candidate):
-        from extraction_pipeline import ExtractionOutcome
+        from extraction_pipeline import ExtractionOutcome, RemoteExtractionRequest
 
         legacy = candidate.to_legacy()
         canonical_id = candidate.identity.document_id
         compatibility_key = candidate.compatibility_history_key
-        if (
-            canonical_id in self.seen_identities
-            or compatibility_key in self.seen_history_keys
-        ):
-            return self.terminal(candidate, "CURRENT_RUN_DUPLICATE_SKIP", status="duplicate")
-        if canonical_id in self.working_history or compatibility_key in self.working_history:
-            return self.terminal(candidate, "HISTORY_DUPLICATE_SKIP", status="duplicate")
-        self.seen_identities.add(canonical_id)
-        self.seen_history_keys.add(compatibility_key)
-        self.working_history.add(canonical_id)
-        self.working_history.add(compatibility_key)
+        with self._state_lock:
+            if (
+                canonical_id in self.seen_identities
+                or compatibility_key in self.seen_history_keys
+            ):
+                return self.terminal(
+                    candidate, "CURRENT_RUN_DUPLICATE_SKIP", status="duplicate"
+                )
+            if (
+                canonical_id in self.working_history
+                or compatibility_key in self.working_history
+            ):
+                return self.terminal(
+                    candidate, "HISTORY_DUPLICATE_SKIP", status="duplicate"
+                )
+            self.seen_identities.add(canonical_id)
+            self.seen_history_keys.add(compatibility_key)
+            self.working_history.add(canonical_id)
+            self.working_history.add(compatibility_key)
 
         action = str(legacy.get("candidate_action") or "")
         if action == "retain_only":
@@ -439,16 +468,27 @@ class CandidatePreflight:
             return self.terminal(candidate, "PREFILTER_SKIP", status="duplicate")
 
         pdf_path = candidate.source_path
+        effective_candidate = candidate
         if candidate.identity.source_kind == "url":
             recovery = self._recover_url(candidate, legacy)
             if isinstance(recovery, ExtractionOutcome):
                 return recovery
             pdf_path = recovery
+            effective_candidate = replace(candidate, metadata=legacy)
 
-        probe = self.extractor.probe_local_only(pdf_path, document_context=legacy)
+        try:
+            probe = self.extractor.probe_local_only(
+                pdf_path, document_context=legacy
+            )
+        except Exception:
+            if candidate.identity.source_kind == "url":
+                return self._url_failure(
+                    effective_candidate, legacy, "URL_PREFLIGHT_FAILED"
+                )
+            raise
         if probe.status == "resolved":
             return ExtractionOutcome.resolved(
-                candidate,
+                effective_candidate,
                 {
                     "pdf_path": pdf_path,
                     "metadata": legacy,
@@ -462,17 +502,26 @@ class CandidatePreflight:
             )
         if probe.status != "needs_remote":
             return self.terminal(
-                candidate, probe.reason_code or "LOCAL_PREFLIGHT_FAILED"
+                effective_candidate, probe.reason_code or "LOCAL_PREFLIGHT_FAILED"
             )
-        base64_img = self.extractor.pdf_to_base64_image(pdf_path)
+        try:
+            base64_img = self.extractor.pdf_to_base64_image(pdf_path)
+        except Exception:
+            if candidate.identity.source_kind == "url":
+                return self._url_failure(
+                    effective_candidate, legacy, "URL_PREFLIGHT_FAILED"
+                )
+            raise
         if not base64_img:
-            return self.terminal(candidate, "PDF_TO_IMAGE_FAILED")
+            return self.terminal(effective_candidate, "PDF_TO_IMAGE_FAILED")
         with self.sidecar_lock:
             self.sidecar[canonical_id] = {
                 "pdf_path": pdf_path,
                 "metadata": legacy,
                 "base64_img": base64_img,
             }
+        if effective_candidate is not candidate:
+            return RemoteExtractionRequest(effective_candidate)
         return None
 
 

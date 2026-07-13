@@ -33,6 +33,36 @@ Download: [latest Windows portable release](https://github.com/EthanYoQ/Invoice-
 
 ---
 
+## v2026.07.13.1 · Reliability and Background Experience Update
+
+This release rebuilds the critical path around one requirement: every expected invoice must be captured, archived correctly, and paired with its supporting document. It was accepted through a full Windows frontend batch run against a finalized truth set.
+
+### Measured improvements
+
+| Acceptance item | Result in this release |
+|-----------------|------------------------|
+| Truth-set scope | QQ `INBOX`, local mail dates from `2025-11-25` through `2026-06-14`, covering `215` expected documents |
+| P0 · Missing document | `0`; `215 / 215` uniquely matched |
+| P1 · Classification, field, or archive error | `0` |
+| P2 · Invoice/supporting-document pairing error | `0` |
+| Pairing validation | `10 / 10` hotel invoice/folio pairs and `16 / 16` ride invoice/itinerary pairs |
+| Windows background windows | Real Playwright Node and Chromium launches verified with `0` visible console windows |
+| Automated regression | `818` pytest cases and `109` subtests passed |
+
+> These figures describe the acceptance baseline for the specified mailbox, date window, and finalized truth set. They are not an unconditional accuracy claim for arbitrary mailbox contents.
+
+### How it works
+
+- **Killable URL-recovery worker pool**: Playwright recovery now runs in workers with bounded concurrency, hard timeouts, and process-tree cleanup, so one stalled page cannot block the full batch.
+- **Direct recovery before browser fallback**: provider download paths and local field validation run first; browser recovery is used only when required, and every path records an explicit terminal outcome.
+- **Evidence binding and fail-closed handling**: archived files remain bound to source email, provider identity, and final-file evidence. Partial writes, collisions, abnormal exits, and incomplete results are never reported as success.
+- **Deterministic pairing and adjacent naming**: hotel invoices/folios and ride invoices/itineraries are paired by business keys and receive adjacent names with the same date, sequence, and amount.
+- **Three-layer no-window launch on Windows**: the URL worker, Playwright Node driver, and Chromium child process each use a Windows hidden-launch strategy, preventing repeated black console windows during recovery.
+
+Full release and portable package: [v2026.07.13.1 Release](https://github.com/EthanYoQ/Invoice-Downloader/releases/tag/v2026.07.13.1)
+
+---
+
 ## 🎬 Video Introduction
 
 https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
@@ -61,6 +91,8 @@ https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
 | 🤖 | **Dual-engine AI recognition** | Track A (OCR precision flow) + Track B (vision fallback flow), automatic switching with no manual operation needed |
 | 🔍 | **Four-layer smart funnel** | Whitelist domains → Subject keywords → Body detection → QR code scanning, precisely filtering non-invoice emails |
 | 📄 | **Link-based invoice auto-recovery** | Playwright automatically opens Baiwang Cloud and tax platform links, downloading official PDF archives |
+| 🧾 | **Automatic invoice/document pairing** | Hotel invoice/folio and ride invoice/itinerary pairs are archived with adjacent names |
+| 🪟 | **Quiet background processing** | URL workers, Node, and Chromium run without repeatedly opening console windows |
 | 🗂️ | **Natural language classification rules** | Supports custom rules like "Didi rides over 100 yuan go into the high-amount category" |
 | 📊 | **One-click Excel report** | Automatically generates `summary_report.xlsx`, covering invoice lists and amount summaries |
 
@@ -252,12 +284,15 @@ Invoice Organizer/
 │   └── 20260315-Beijing-Shanghai-Train-Ticket.pdf
 ├── Flight Tickets/
 │   └── 20260301_Flight_1280.00_Air-China.pdf
-├── Accommodation/
-│   └── 20260310_Accommodation_888.00_Beijing-Hilton.pdf
+├── Hotel Invoices/
+│   ├── 20260310-Hotel-01-Invoice_888.00.pdf
+│   └── 20260310-Hotel-01-Folio_888.00.pdf
 ├── Taxi/
-│   └── 20260312_Taxi_45.50_DiDi.pdf
+│   ├── 0312-DiDi-01-Invoice_45.50.pdf
+│   └── 0312-DiDi-01-Itinerary_45.50.pdf
 ├── Dining/
-├── Manual_Check/      ← Cannot be recognized by AI, requires manual processing
+├── Manual Review/     ← Materials that cannot be confirmed reliably
+├── Non-target Company Invoices/
 └── summary_report.xlsx
 ```
 

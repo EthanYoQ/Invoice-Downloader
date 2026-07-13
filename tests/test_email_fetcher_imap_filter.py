@@ -19,6 +19,15 @@ def build_attachment_message(*, sender, subject, body, filename, payload=b"%PDF-
     return msg.as_bytes()
 
 
+def build_body_only_message(*, sender, subject, body):
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = "invoice-user@example.com"
+    msg["Subject"] = subject
+    msg.set_content(body)
+    return msg.as_bytes()
+
+
 class FakeUidMail:
     def __init__(self, messages):
         self.messages = dict(messages)
@@ -143,6 +152,39 @@ class EmailFetcherImapFilterTests(unittest.TestCase):
         self.assertEqual(result[0]["tier"], 2)
         self.assertEqual(result[0]["candidate_action"], "main_chain")
         self.assertEqual(result[0]["prefilter_reason_code"], "B_ATTACHMENT_MAIN_CHAIN")
+
+    def test_fpyun_complete_body_generates_canonical_main_chain_pdf(self):
+        raw_message = build_body_only_message(
+            sender="fpyun@fpyun.com.cn",
+            subject=(
+                "【发票云】尊敬的【辉瑞投资投资有限公司】客户,您收到1张来自"
+                "【杭州联郡餐饮管理有限公司】为您开具的电子发票"
+                "【发票号码:26337000000517112500】"
+            ),
+            body="""
+2026-12-10
+尊敬的客户：您好！您申请的数电发票已成功开具
+发票信息如下：
+开票日期：2026-06-10 21:23:34
+发票号码：26337000000517112500
+购方名称：辉瑞投资投资有限公司
+销方名称：杭州联郡餐饮管理有限公司
+金额合计：77.30
+发票云
+""",
+        )
+        fetcher = self._fetcher(FakeUidMail({b"7159": raw_message}))
+
+        result = fetcher.extract_attachments([b"7159"])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["email_id"], "7159")
+        self.assertEqual(result[0]["source_kind"], "email_body_receipt")
+        self.assertEqual(
+            result[0]["prefilter_reason_code"],
+            "B_EMAIL_BODY_RECEIPT_MAIN_CHAIN",
+        )
+        self.assertTrue(Path(result[0]["filepath"]).is_file())
 
     def test_extract_attachments_batches_205_messages_and_processes_each_uid_once(self):
         messages = {
@@ -475,6 +517,121 @@ def test_invalid_zip_exception_retains_original_container_as_candidate(tmp_path)
     assert len(result) == 1
     assert result[0]["original_filename"] == "invoice-container.zip"
     assert Path(result[0]["filepath"]).read_bytes() == b"not-a-valid-zip-but-original-evidence"
+
+
+def test_deep_staging_path_is_bounded_without_losing_original_filename(tmp_path):
+    from candidate_pipeline import CandidatePipeline
+
+    original_filename = f"invoice_🧾_{'very-long-seller-name-' * 6}20260614.pdf"
+    raw = build_attachment_message(
+        sender="billing@example.com",
+        subject=f"Invoice {'long-subject-' * 8}",
+        body="Attached invoice",
+        filename=original_filename,
+    )
+    staging_root = tmp_path / f"staging_{'deep-' * 8}"
+    fetcher = EmailFetcher(
+        "invoice-user@example.com", "auth-code", staging_dir=str(staging_root)
+    )
+    fetcher.mail = FakeUidMail({b"1": raw})
+
+    result = fetcher.extract_attachments([b"1"])
+
+    assert len(result) == 1
+    staged_path = Path(result[0]["filepath"])
+    assert staged_path.is_file()
+    assert len(str(staged_path.resolve())) <= 240
+    assert len(str(staged_path.resolve()).encode("utf-16-le")) // 2 <= 240
+    assert staged_path.suffix == ".pdf"
+    assert result[0]["original_filename"] == original_filename
+    candidate = CandidatePipeline().collect(result)[0]
+    assert candidate.source_filename == original_filename
+
+
+def test_staging_collision_is_exclusive_and_attempts_are_bounded(tmp_path, monkeypatch):
+    base = tmp_path / "staging"
+    first = Path(
+        email_fetcher_module._stage_candidate_file(
+            base, "invoice.pdf", b"first", max_attempts=3
+        )
+    )
+    second = Path(
+        email_fetcher_module._stage_candidate_file(
+            base, "invoice.pdf", b"second", max_attempts=3
+        )
+    )
+
+    assert first != second
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+
+    occupied = base / "always.pdf"
+    occupied.write_bytes(b"preserve")
+    monkeypatch.setattr(
+        email_fetcher_module,
+        "_bounded_staging_filename",
+        lambda *_args, **_kwargs: occupied.name,
+    )
+    with pytest.raises(FileExistsError, match="staging_collision_limit_exceeded"):
+        email_fetcher_module._stage_candidate_file(
+            base, "ignored.pdf", b"replacement", max_attempts=2
+        )
+    assert occupied.read_bytes() == b"preserve"
+
+
+def test_staging_permission_error_never_deletes_preexisting_file(tmp_path, monkeypatch):
+    import builtins
+
+    base = tmp_path / "staging"
+    base.mkdir()
+    occupied = base / "invoice.pdf"
+    occupied.write_bytes(b"preserve")
+    real_open = builtins.open
+
+    def denied_open(path, mode="r", *args, **kwargs):
+        if Path(path) == occupied and mode == "xb":
+            raise PermissionError("denied")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", denied_open)
+    with pytest.raises(PermissionError, match="denied"):
+        email_fetcher_module._stage_candidate_file(
+            base, occupied.name, b"replacement", max_attempts=1
+        )
+    assert occupied.read_bytes() == b"preserve"
+
+
+def test_staging_write_file_exists_error_removes_partial_file(tmp_path, monkeypatch):
+    import builtins
+
+    base = tmp_path / "staging"
+    real_open = builtins.open
+
+    class PartialWriter:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.handle.close()
+
+        def write(self, _payload):
+            self.handle.write(b"partial")
+            self.handle.flush()
+            raise FileExistsError("write failed")
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        return PartialWriter(handle) if mode == "xb" else handle
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+    with pytest.raises(FileExistsError, match="write failed"):
+        email_fetcher_module._stage_candidate_file(
+            base, "invoice.pdf", b"replacement", max_attempts=2
+        )
+    assert list(base.glob("*")) == []
 
 
 if __name__ == "__main__":

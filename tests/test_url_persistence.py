@@ -154,6 +154,41 @@ def test_appapi_diag_retention_and_manual_url_evidence_are_privacy_safe(tmp_path
     assert Path(manual_path).name.startswith(f"P0_LinkReview_{url_hash[:16]}_")
 
 
+def test_pipeline_retained_urls_share_one_append_only_audit_ledger(tmp_path):
+    api = InvoiceAppAPI()
+    output_dir = tmp_path / "output"
+    first_url = "https://example.test/invoice-candidate-1?token=one"
+    second_url = "https://example.test/invoice-candidate-2?token=two"
+    metadata = {
+        "source_kind": "url",
+        "candidate_action": "retain_only",
+        "prefilter_reason_code": "B_NON_PROVIDER_LOW_CONFIDENCE_URL_RETAINED",
+    }
+
+    first_path = api._retain_artifact(
+        str(output_dir), first_url, "pipeline_retained", "retained", metadata
+    )
+    second_path = api._retain_artifact(
+        str(output_dir), second_url, "pipeline_retained", "retained", metadata
+    )
+
+    ledger = Path(first_path)
+    assert second_path == first_path
+    assert ledger.name == "url_retention_index.jsonl"
+    records = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 2
+    assert {record["source_hash"] for record in records} == {
+        hashlib.sha256(first_url.encode("utf-8")).hexdigest(),
+        hashlib.sha256(second_url.encode("utf-8")).hexdigest(),
+    }
+    assert not list(ledger.parent.glob("*.url.txt"))
+    assert not list(ledger.parent.glob("*.url.txt.json"))
+    assert api.audit_counts["retention"] == 2
+
+
 def test_email_fetcher_shortlink_warning_redacts_url_and_exception(caplog):
     caplog.set_level(logging.WARNING)
     policy = PublicUrlPolicy(
@@ -372,7 +407,10 @@ def test_live_progress_poll_before_url_finally_never_exposes_candidate_identity(
     }
     with (
         patch("invoice_extractor.InvoiceExtractor", FakeExtractor),
-        patch("pdf_converter.PDFConverter.process_invoice_links", pause_after_pre_browser_log),
+        patch(
+            "bounded_url_recovery.BoundedUrlRecoveryClient.process_invoice_links",
+            pause_after_pre_browser_log,
+        ),
         patch("app_api.time.sleep", return_value=None),
     ):
         with pytest.raises(ProcessingLoopFailure, match="PROCESSING_PIPELINE_INCOMPLETE"):
@@ -575,7 +613,10 @@ def test_live_purchaser_mismatch_log_redacts_url_candidate_but_preserves_attachm
 
         with (
             patch("invoice_extractor.InvoiceExtractor", FakeExtractor),
-            patch("pdf_converter.PDFConverter.process_invoice_links", recovered_result),
+            patch(
+                "bounded_url_recovery.BoundedUrlRecoveryClient.process_invoice_links",
+                recovered_result,
+            ),
             patch("company_rules.classify_purchaser_relation", return_value="non_target"),
             patch("document_types.is_exempt_type", return_value=False),
             patch("app_api.time.sleep", return_value=None),

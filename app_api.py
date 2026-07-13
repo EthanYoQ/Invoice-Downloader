@@ -45,6 +45,14 @@ from user_settings import (
 
 
 DEFAULT_TRUTH_AUDIT_FINALIZE_TIMEOUT_SECONDS = 120.0
+PROVIDER_URL_RETRY_REASON_CODES = frozenset(
+    {
+        "URL_DOWNLOAD_FAILED",
+        "URL_PAGE_TIMEOUT",
+        "URL_RECOVERY_DEADLINE_EXCEEDED",
+        "URL_RECOVERY_WORKER_FAILED",
+    }
+)
 
 
 class TruthAuditTimeout(RuntimeError):
@@ -145,6 +153,7 @@ class _ProcessingPipelineSession:
         trace_store,
         owned_extractor=None,
         provider_retry_delay_seconds=0.0,
+        url_recovery_scheduler=None,
     ):
         self._api = api
         self.candidates = candidates
@@ -160,6 +169,19 @@ class _ProcessingPipelineSession:
         self._provider_retry_delay_seconds = max(
             0.0, float(provider_retry_delay_seconds)
         )
+        if url_recovery_scheduler is None:
+            from deferred_url_recovery import (
+                DEFAULT_URL_RECOVERY_MAX_WORKERS,
+                DeferredUrlRecoveryScheduler,
+            )
+
+            url_recovery_scheduler = DeferredUrlRecoveryScheduler(
+                max_workers=DEFAULT_URL_RECOVERY_MAX_WORKERS,
+                stop_requested=lambda: bool(
+                    getattr(self._api, "_stop_requested", False)
+                ),
+            )
+        self._url_recovery_scheduler = url_recovery_scheduler
         self._provider_url_candidates = []
         self._candidate_total = len(candidates)
         self._closed = False
@@ -193,6 +215,21 @@ class _ProcessingPipelineSession:
                 "extraction_pipeline", "trace", dict(event)
             )
 
+    def _recover_deferred_candidate(self, candidate):
+        resolver = getattr(self._pipeline, "resolve_one", None)
+        if callable(resolver):
+            return resolver(candidate)
+        outcomes = self._pipeline.extract([candidate], _emit_progress_events=False)
+        if len(outcomes) != 1:
+            raise RuntimeError("deferred recovery did not return exactly one outcome")
+        return outcomes[0]
+
+    def _retry_deferred_candidate(self, candidate):
+        outcomes = self._pipeline.retry_current_run_failures([candidate])
+        if len(outcomes) != 1:
+            raise RuntimeError("deferred retry did not return exactly one outcome")
+        return outcomes[0]
+
     def _canonical_info_by_document_id(self, archived_outcomes):
         document_ids = {
             archived.outcome.candidate.identity.document_id
@@ -222,18 +259,9 @@ class _ProcessingPipelineSession:
     @staticmethod
     def _is_strong_provider_retry_candidate(candidate):
         legacy = candidate.to_legacy()
-        expected = legacy.get("provider_expected_fields") or {}
-        invoice_number = "".join(
-            character
-            for character in str(
-                expected.get("invoice_number") or expected.get("InvoiceNumber") or ""
-            )
-            if character.isdigit()
-        )
         return bool(
             candidate.identity.source_kind == "url"
             and legacy.get("provider_family")
-            and len(invoice_number) == 20
         )
 
     def _wait_for_provider_retry(self) -> bool:
@@ -280,18 +308,34 @@ class _ProcessingPipelineSession:
                 primary_report.outcomes
             ),
         )
-        self._record_deferred_outcomes(skipped)
-        offset = len(primary_outcomes) + len(skipped)
-        provider_outcomes = self._pipeline.extract(
-            pending,
-            progress_offset=offset,
+        skipped_by_document_id = {
+            outcome.candidate.identity.document_id: outcome for outcome in skipped
+        }
+        deferred_candidates = sorted(
+            [
+                *(outcome.candidate for outcome in skipped),
+                *pending,
+            ],
+            key=lambda candidate: candidate.sequence,
+        )
+
+        def recover_one(candidate):
+            skipped_outcome = skipped_by_document_id.get(candidate.identity.document_id)
+            if skipped_outcome is not None:
+                return skipped_outcome
+            return self._recover_deferred_candidate(candidate)
+
+        provider_outcomes = self._url_recovery_scheduler.recover(
+            deferred_candidates,
+            recover_one,
+            progress_offset=len(primary_outcomes),
             progress_total=self._candidate_total,
         )
+        self._record_deferred_outcomes(provider_outcomes)
         failed_provider_outcomes = [
             outcome
             for outcome in provider_outcomes
             if outcome.status == "unresolved"
-            and outcome.reason_code == "URL_DOWNLOAD_FAILED"
         ]
         failed_document_ids = {
             outcome.candidate.identity.document_id
@@ -299,7 +343,6 @@ class _ProcessingPipelineSession:
         }
         archiveable_outcomes = sorted(
             [
-                *skipped,
                 *(
                     outcome
                     for outcome in provider_outcomes
@@ -341,7 +384,8 @@ class _ProcessingPipelineSession:
         retryable_failures = [
             outcome
             for outcome in remaining_failures
-            if self._is_strong_provider_retry_candidate(outcome.candidate)
+            if outcome.reason_code in PROVIDER_URL_RETRY_REASON_CODES
+            and self._is_strong_provider_retry_candidate(outcome.candidate)
         ]
         retryable_ids = {
             outcome.candidate.identity.document_id for outcome in retryable_failures
@@ -354,14 +398,15 @@ class _ProcessingPipelineSession:
         retried_failures = []
         recovered_retry_failures = []
         if retryable_failures and self._wait_for_provider_retry():
-            retry_outcomes = self._pipeline.retry_current_run_failures(
-                [outcome.candidate for outcome in retryable_failures]
+            retry_outcomes = self._url_recovery_scheduler.recover(
+                [outcome.candidate for outcome in retryable_failures],
+                self._retry_deferred_candidate,
+                emit_progress=False,
             )
             retried_failures = [
                 outcome
                 for outcome in retry_outcomes
                 if outcome.status == "unresolved"
-                and outcome.reason_code == "URL_DOWNLOAD_FAILED"
             ]
             retried_failure_ids = {
                 outcome.candidate.identity.document_id
@@ -700,6 +745,7 @@ class InvoiceAppAPI:
             revision_resolver = default_revision
         self._revision_resolver = revision_resolver
         self._diag_lock = threading.Lock()
+        self._url_retention_ledger_lock = threading.Lock()
         self._packaged_diag_enabled = bool(getattr(sys, "frozen", False))
         self._packaged_diag_poll_count = 0
         self._packaged_diag_last_progress_signature = None
@@ -1254,15 +1300,6 @@ class InvoiceAppAPI:
             return True
 
         return bool(self._run_context.get("monitoring_dir"))
-
-    def _should_gate_controlled_run_url(self, info):
-        if not self._is_controlled_truth_run():
-            return False
-        if not info.get("is_url", False):
-            return False
-
-        provider_family = str(info.get("provider_family") or "").strip().lower()
-        return not provider_family
 
     def _build_email_level_url_evidence_key(self, info):
         if not info or not info.get("is_url", False):
@@ -2470,7 +2507,6 @@ class InvoiceAppAPI:
                 raise
             if self.quota_exhausted:
                 raise QuotaExhaustedError(self.quota_message or "QUOTA_EXHAUSTED")
-            self._cwt_cancellation_matching(request.save_path)
             self._sync_run_state_store_from_legacy()
             return report
 
@@ -2600,6 +2636,10 @@ class InvoiceAppAPI:
         try:
             outcomes = session.extract()
             return session.archive(outcomes)
+        except (ProcessingLoopFailure, QuotaExceededError, RemoteAuthError):
+            raise
+        except Exception as exc:
+            raise ProcessingLoopFailure("PROCESSING_PIPELINE_EXCEPTION") from exc
         finally:
             session.close()
 
@@ -2620,10 +2660,14 @@ class InvoiceAppAPI:
     ):
         from app_archive_adapter import AppArchiveAdapter
         from archive_service import ArchiveService
+        from bounded_url_recovery import BoundedUrlRecoveryClient
         from candidate_pipeline import CandidatePipeline, CandidatePreflight
+        from deferred_url_recovery import (
+            DEFAULT_URL_RECOVERY_MAX_WORKERS,
+            DeferredUrlRecoveryScheduler,
+        )
         from extraction_pipeline import ExtractionPipeline, SharedRuntimeRemoteExtractor
         from invoice_extractor import InvoiceExtractor
-        from pdf_converter import PDFConverter
 
         candidates = CandidatePipeline().collect(attachments_info)
         output_state_dir = self._output_state_dir(save_path)
@@ -2660,7 +2704,7 @@ class InvoiceAppAPI:
             working_history=working_history,
             sidecar=sidecar,
             sidecar_lock=sidecar_lock,
-            converter_factory=lambda: PDFConverter(
+            converter_factory=lambda: BoundedUrlRecoveryClient(
                 staging_dir=self._active_staging_path(), timeout_ms=30000
             ),
         )
@@ -2716,6 +2760,11 @@ class InvoiceAppAPI:
             progress_callback=_progress,
             trace_sink=_trace,
         )
+        url_recovery_scheduler = DeferredUrlRecoveryScheduler(
+            max_workers=DEFAULT_URL_RECOVERY_MAX_WORKERS,
+            stop_requested=lambda: bool(getattr(self, "_stop_requested", False)),
+            progress_callback=_progress,
+        )
         return _ProcessingPipelineSession(
             api=self,
             candidates=candidates,
@@ -2729,6 +2778,7 @@ class InvoiceAppAPI:
             trace_store=trace_store,
             owned_extractor=_owned_extractor,
             provider_retry_delay_seconds=20.0,
+            url_recovery_scheduler=url_recovery_scheduler,
         )
 
     def _retain_artifact(self, save_path, source_path, bucket, reason, metadata=None):
@@ -2750,22 +2800,31 @@ class InvoiceAppAPI:
             )
             and (not source_path or not os.path.exists(source_path))
         )
+        batched_url_retention = bool(
+            is_url_placeholder
+            and bucket == "pipeline_retained"
+            and str(runtime_metadata.get("candidate_action") or "") == "retain_only"
+            and not str(runtime_metadata.get("provider_family") or "").strip()
+        )
 
         if is_url_placeholder:
             url_evidence = build_url_evidence(source_path, bucket)
-            candidate_index = int(runtime_metadata.get("candidate_index", 1) or 1)
-            original_name = (
-                f"LinkRetention_{url_evidence['source_hash'][:16]}_"
-                f"{candidate_index}.url.txt"
-            )
-            target_name = original_name
-            target_path = os.path.join(retention_dir, target_name)
-            while os.path.exists(target_path):
-                stem, ext = os.path.splitext(original_name)
-                target_name = f"{stem}_{uuid.uuid4().hex[:6]}{ext}"
+            if batched_url_retention:
+                target_path = os.path.join(retention_dir, "url_retention_index.jsonl")
+            else:
+                candidate_index = int(runtime_metadata.get("candidate_index", 1) or 1)
+                original_name = (
+                    f"LinkRetention_{url_evidence['source_hash'][:16]}_"
+                    f"{candidate_index}.url.txt"
+                )
+                target_name = original_name
                 target_path = os.path.join(retention_dir, target_name)
-            with open(target_path, "w", encoding="utf-8") as fh:
-                json.dump(url_evidence, fh, ensure_ascii=False, indent=2)
+                while os.path.exists(target_path):
+                    stem, ext = os.path.splitext(original_name)
+                    target_name = f"{stem}_{uuid.uuid4().hex[:6]}{ext}"
+                    target_path = os.path.join(retention_dir, target_name)
+                with open(target_path, "w", encoding="utf-8") as fh:
+                    json.dump(url_evidence, fh, ensure_ascii=False, indent=2)
         else:
             if not source_path or not os.path.exists(source_path):
                 return source_path
@@ -2780,7 +2839,6 @@ class InvoiceAppAPI:
 
             shutil.copy2(source_path, target_path)
 
-        sidecar = f"{target_path}.json"
         payload = {
             "kind": "retention",
             "status": "retained",
@@ -2797,11 +2855,18 @@ class InvoiceAppAPI:
         if safe_metadata:
             payload["metadata"] = safe_metadata
 
-        try:
-            with open(sidecar, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False, indent=2)
-        except Exception as exc:
-            print(f"Failed to write retention sidecar {sidecar}: {exc}")
+        if batched_url_retention:
+            with self._url_retention_ledger_lock:
+                with open(target_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+                    fh.write("\n")
+        else:
+            sidecar = f"{target_path}.json"
+            try:
+                with open(sidecar, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                print(f"Failed to write retention sidecar {sidecar}: {exc}")
 
         self.audit_counts["retention"] = int(self.audit_counts.get("retention", 0) or 0) + 1
         self._safe_emit_artifact_event(

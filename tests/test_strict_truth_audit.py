@@ -15,6 +15,12 @@ from run_evidence import (
 )
 
 
+def test_seller_match_treats_windows_filename_sanitization_as_equivalent():
+    assert audit.contains_fuzzy("03/25/26", "03_25_26")
+    assert not audit.contains_fuzzy("03/25/26", "04_25_26")
+    assert not audit.contains_fuzzy("Alpha/Beta Ltd", "Alpha:Beta Ltd")
+
+
 def _complete_summary():
     return {
         "dataset": "fixture",

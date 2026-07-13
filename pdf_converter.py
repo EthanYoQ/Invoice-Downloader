@@ -1,9 +1,11 @@
 import json
 import ipaddress
+from io import BytesIO
 import logging
 import os
 import re
 import shutil
+import zipfile
 from urllib.parse import parse_qs, parse_qsl, quote, urljoin, urlparse
 
 import fitz  # PyMuPDF
@@ -63,6 +65,9 @@ class PDFConverter:
     BROWSER_PASSIVE_RESOURCE_TYPES = frozenset(
         {"script", "stylesheet", "image", "media", "font"}
     )
+    DIRECT_ARCHIVE_MAX_MEMBERS = 16
+    DIRECT_ARCHIVE_MAX_MEMBER_BYTES = 16 * 1024 * 1024
+    DIRECT_ARCHIVE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
     BAIWANG_CLICK_TARGETS = {
         "pdf": [
             "a:has-text('下载PDF')",
@@ -1151,6 +1156,80 @@ class PDFConverter:
             }
         return artifact
 
+    def _direct_invoice_artifacts_from_payload(
+        self,
+        payload,
+        inferred_kind,
+        artifact_prefix,
+        source_url,
+        resolved_url,
+        mode,
+    ):
+        if not payload.startswith(b"PK\x03\x04"):
+            if inferred_kind == "pdf" and not self._pdf_bytes_look_valid(payload):
+                return []
+            artifact_path = f"{artifact_prefix}.{inferred_kind}"
+            self._safe_write_bytes(artifact_path, payload)
+            fields = (
+                parse_direct_invoice_xml_fields(payload)
+                if inferred_kind == "xml"
+                else {}
+            )
+            return [
+                self._describe_direct_invoice_artifact(
+                    artifact_path,
+                    inferred_kind,
+                    source_url,
+                    resolved_url,
+                    mode,
+                    fields,
+                )
+            ]
+
+        artifacts = []
+        try:
+            with zipfile.ZipFile(BytesIO(payload)) as archive:
+                members = [item for item in archive.infolist() if not item.is_dir()]
+                if len(members) > self.DIRECT_ARCHIVE_MAX_MEMBERS:
+                    return []
+                total_size = sum(item.file_size for item in members)
+                if total_size > self.DIRECT_ARCHIVE_MAX_TOTAL_BYTES:
+                    return []
+                for index, member in enumerate(members, start=1):
+                    kind = os.path.splitext(member.filename)[1].lower().lstrip(".")
+                    if kind not in {"pdf", "xml", "ofd"}:
+                        continue
+                    if member.file_size > self.DIRECT_ARCHIVE_MAX_MEMBER_BYTES:
+                        return []
+                    with archive.open(member) as member_stream:
+                        member_payload = member_stream.read(
+                            self.DIRECT_ARCHIVE_MAX_MEMBER_BYTES + 1
+                        )
+                    if len(member_payload) != member.file_size:
+                        return []
+                    if kind == "pdf" and not self._pdf_bytes_look_valid(member_payload):
+                        continue
+                    artifact_path = f"{artifact_prefix}_archive_{index}.{kind}"
+                    self._safe_write_bytes(artifact_path, member_payload)
+                    fields = (
+                        parse_direct_invoice_xml_fields(member_payload)
+                        if kind == "xml"
+                        else {}
+                    )
+                    artifacts.append(
+                        self._describe_direct_invoice_artifact(
+                            artifact_path,
+                            kind,
+                            source_url,
+                            resolved_url,
+                            f"{mode}_archive",
+                            fields,
+                        )
+                    )
+        except (OSError, ValueError, zipfile.BadZipFile, RuntimeError):
+            return []
+        return artifacts
+
     def _probe_direct_invoice_artifact(self, session, url, artifact_prefix):
         headers = {
             "User-Agent": (
@@ -1184,37 +1263,27 @@ class PDFConverter:
                 content_type=content_type,
                 content_disposition=content_disposition,
             )
+            if not kind and content.startswith(b"PK\x03\x04"):
+                kind = "archive"
             if not kind:
                 return [], []
 
-            artifact_path = f"{artifact_prefix}_direct.{kind}"
-            if kind == "pdf":
-                if not self._pdf_bytes_look_valid(content):
-                    return [], [{"kind": "direct_probe_invalid_pdf", "url": response.url}]
-                self._safe_write_bytes(artifact_path, content)
-                return [
-                    self._describe_direct_invoice_artifact(
-                        artifact_path,
-                        "pdf",
-                        url,
-                        response.url,
-                        "direct_request",
-                        {},
-                    )
-                ], []
-
-            self._safe_write_bytes(artifact_path, content)
-            fields = parse_direct_invoice_xml_fields(content) if kind == "xml" else {}
-            return [
-                self._describe_direct_invoice_artifact(
-                    artifact_path,
-                    kind,
-                    url,
-                    response.url,
-                    "direct_request",
-                    fields,
-                )
-            ], []
+            artifacts = self._direct_invoice_artifacts_from_payload(
+                content,
+                kind,
+                f"{artifact_prefix}_direct",
+                url,
+                response.url,
+                "direct_request",
+            )
+            if artifacts:
+                return artifacts, []
+            failure_kind = (
+                "direct_probe_invalid_archive"
+                if content.startswith(b"PK\x03\x04")
+                else "direct_probe_invalid_pdf"
+            )
+            return [], [{"kind": failure_kind, "url": response.url}]
         finally:
             response.close()
 
@@ -1409,6 +1478,8 @@ class PDFConverter:
                 pdf_artifacts.append(artifact)
 
         best_xml_fields = {}
+        matched_xml_artifact = None
+        matched_xml_on = ""
         for artifact in xml_artifacts:
             xml_fields = artifact.get("fields", {}) or {}
             if not best_xml_fields:
@@ -1419,6 +1490,8 @@ class PDFConverter:
             )
             if matched:
                 best_xml_fields = dict(xml_fields)
+                matched_xml_artifact = artifact
+                matched_xml_on = matched_on
                 break
             hard_mismatch = hard_mismatch or mismatch
 
@@ -1437,6 +1510,16 @@ class PDFConverter:
             artifact["expected_match"] = True
             artifact["matched_on"] = "single_pdf_without_conflict"
             return artifact, "single_pdf_without_conflict"
+
+        if not pdf_artifacts and matched_xml_artifact is not None:
+            matched_xml_artifact["expected_match"] = True
+            matched_xml_artifact["matched_on"] = matched_xml_on
+            return matched_xml_artifact, matched_xml_on
+        if not pdf_artifacts and len(xml_artifacts) == 1 and not hard_mismatch:
+            artifact = xml_artifacts[0]
+            artifact["expected_match"] = True
+            artifact["matched_on"] = "single_xml_without_conflict"
+            return artifact, "single_xml_without_conflict"
 
         if hard_mismatch:
             return None, "pdf_entity_mismatch"

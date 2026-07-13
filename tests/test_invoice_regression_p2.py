@@ -54,6 +54,68 @@ class InvoiceP2RegressionTests(unittest.TestCase):
         app_api.record_business_success(records, code, number, fields, file_name)
         return True
 
+    def test_direct_invoice_xml_uses_local_fields_without_pdf_rendering(self):
+        xml_path = self.root / "invoice.xml"
+        xml_path.write_text(
+            """<?xml version="1.0" encoding="utf-8"?>
+<EInvoice>
+  <SellerName>济南历下小螺号海鲜店</SellerName>
+  <BuyerName>辉瑞投资有限公司</BuyerName>
+  <TotalTax-includedAmount>482.00</TotalTax-includedAmount>
+  <InvoiceNumber>26372000002439975871</InvoiceNumber>
+  <IssueTime>2026-05-25</IssueTime>
+  <ItemName>*餐饮服务*餐费</ItemName>
+</EInvoice>""",
+            encoding="utf-8",
+        )
+
+        probe = self.extractor.probe_local_only(
+            str(xml_path), document_context={"email_id": "7038"}
+        )
+
+        self.assertEqual(probe.status, "resolved")
+        self.assertEqual(probe.engine, "local_direct_invoice_xml")
+        self.assertEqual(probe.result["InvoiceNumber"], "26372000002439975871")
+        self.assertEqual(probe.result["Seller"], "济南历下小螺号海鲜店")
+        self.assertEqual(probe.result["Purchaser"], "辉瑞投资有限公司")
+        self.assertEqual(probe.result["Amount"], "482.00")
+        self.assertEqual(probe.result["Date"], "20260525")
+        self.assertEqual(probe.result["Type"], "餐饮")
+
+    def test_direct_invoice_xml_rejects_invalid_number_and_calendar_date(self):
+        xml_path = self.root / "invalid.xml"
+        xml_path.write_text(
+            """<EInvoice>
+  <SellerName>测试销售方</SellerName><BuyerName>辉瑞投资有限公司</BuyerName>
+  <TotalTax-includedAmount>100.00</TotalTax-includedAmount>
+  <InvoiceNumber>abc</InvoiceNumber><IssueTime>2026-99-99</IssueTime>
+  <ItemName>*餐饮服务*餐费</ItemName>
+</EInvoice>""",
+            encoding="utf-8",
+        )
+
+        probe = self.extractor.probe_local_only(str(xml_path))
+
+        self.assertEqual(probe.status, "invalid")
+        self.assertEqual(probe.reason_code, "LOCAL_DIRECT_INVOICE_XML_INVALID")
+
+    def test_direct_invoice_xml_explicit_item_type_precedes_seller_name(self):
+        xml_path = self.root / "hotel-company-restaurant.xml"
+        xml_path.write_text(
+            """<EInvoice>
+  <SellerName>上海某酒店有限公司</SellerName><BuyerName>辉瑞投资有限公司</BuyerName>
+  <TotalTax-includedAmount>100.00</TotalTax-includedAmount>
+  <InvoiceNumber>26372000002439975871</InvoiceNumber><IssueTime>2026-05-25</IssueTime>
+  <ItemName>*餐饮服务*餐费</ItemName>
+</EInvoice>""",
+            encoding="utf-8",
+        )
+
+        probe = self.extractor.probe_local_only(str(xml_path))
+
+        self.assertEqual(probe.status, "resolved")
+        self.assertEqual(probe.result["Type"], "餐饮")
+
     def test_train_ticket_embedded_departure_date_overrides_model_drift(self):
         pdf = self.root / "train-ticket.pdf"
         write_text_pdf(
