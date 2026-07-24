@@ -17,6 +17,10 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
+</p>
+<h2 align="center">如果有帮到你，麻烦动动小手点亮STAR ✨✨</h2>
+</p>
+
 **个人职场报销用的 Windows 发票助手 / 发票管家：连接 QQ 邮箱 / 163 邮箱 → 自动下载 PDF/OFD/XML 电子发票和百望云发票链接 → AI OCR 识别 → 本地分类归档 → 生成 Excel 报销汇总**
 
 适合这些搜索和需求：**发票助手**、**发票管家**、**报销助手**、**电子发票归档**、**发票报销**、**QQ邮箱发票自动下载**、**163邮箱电子发票归档**、**OFD发票下载**、**百望云发票下载**、**Windows发票管理**。
