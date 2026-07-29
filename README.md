@@ -23,16 +23,16 @@
 
 **个人职场报销用的桌面发票助手 / 发票管家：连接 QQ 邮箱 / 163 邮箱 → 自动下载 PDF/OFD/XML 电子发票和百望云发票链接 → AI OCR 识别 → 本地分类归档 → 生成 Excel 报销汇总**
 
-适合这些搜索和需求：**发票助手**、**发票管家**、**报销助手**、**电子发票归档**、**发票报销**、**QQ邮箱发票自动下载**、**163邮箱电子发票归档**、**OFD发票下载**、**百望云发票下载**、**Windows发票管理**。
+适合这些搜索和需求：**发票助手**、**发票管家**、**报销助手**、**电子发票归档**、**发票报销**、**QQ邮箱发票自动下载**、**163邮箱电子发票归档**、**OFD发票下载**、**百望云发票下载**、**Windows 与 macOS 发票管理**。
 
-下载：[最新版 Windows 免安装包与 macOS（Apple Silicon）DMG](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
+下载：[最新 Windows（安装版 / 免安装版）与 macOS（Apple Silicon）安装包](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
 
 *邮件和发票文件在本地处理。启用 GLM OCR / 视觉识别时，发票图片会发送到你配置的模型服务商用于提取。*
 
 </div>
 
 <p align="center">
-  <img src="./docs/images/invoiceflowai-hero-zh.png" alt="InvoiceFlowAI Windows 发票助手真实启动配置、处理中心与安全提示界面" />
+  <img src="./docs/images/invoiceflowai-hero-zh.png" alt="InvoiceFlowAI 发票助手的启动配置、处理中心与安全提示界面" />
 </p>
 
 ---
@@ -233,20 +233,17 @@ flowchart TD
 
 ## 🚀 快速开始
 
-```
-Step 1  解压软件包到普通文件夹（避免云盘同步目录）
-        保持 _internal 文件夹与 InvoiceFlowAI.exe 同级
-        ↓
-Step 2  双击运行 InvoiceFlowAI.exe
-        首次启动自动弹出设置界面
-        ↓
-Step 3  填入配置并保存：
-        · 邮箱地址 + 授权码（QQ 或 163）
-        · GLM API Key
-        ↓
-        点击「开始扫描」→ 等待完成
-        发票自动归档到桌面「发票整理」文件夹 ✅
-```
+### Windows（安装版 / 免安装版）
+
+1. 安装版：运行 `InvoiceFlowAI-*-windows-x64-setup.exe`；免安装版：解压 `InvoiceFlowAI-*-windows-x64-portable.zip` 到普通文件夹（避免云盘同步目录），并保持 `_internal` 文件夹与 `InvoiceFlowAI.exe` 同级。
+2. 双击 `InvoiceFlowAI.exe`；首次启动会自动弹出设置界面。
+3. 填入邮箱地址与授权码（QQ 或 163）、GLM API Key，保存后点击「开始扫描」。发票会自动归档到桌面「发票整理」文件夹。
+
+### macOS（Apple Silicon）
+
+1. 打开 `InvoiceFlowAI-*-macos-arm64.dmg`，将 `InvoiceFlowAI` 拖入“应用程序”文件夹。
+2. 首次启动会自动弹出设置界面。此版本未签名、未公证；若 macOS 阻止打开，请在“系统设置 → 隐私与安全性”中确认仍要打开。
+3. 填入邮箱地址与授权码（QQ 或 163）、GLM API Key，保存后点击「开始扫描」。
 
 ---
 
@@ -318,7 +315,7 @@ Step 3  填入配置并保存：
 ## 🛡️ 隐私与安全
 
 - 所有邮件、发票文件均在**本地处理**，不上传任何服务器
-- 邮箱凭据通过 **Windows DPAPI** 加密存储，只有当前 Windows 账户可解密
+- 邮箱凭据在 Windows 通过 **DPAPI** 加密存储，在 macOS 通过 **Keychain** 存储
 - GLM API 仅接收**发票图片**（Base64）用于文字识别，不发送邮件原文内容
 
 ---
