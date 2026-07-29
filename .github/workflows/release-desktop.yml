@@ -295,7 +295,6 @@ jobs:
               raise SystemExit(f'uploaded release verification failed: {uploaded}')
           PY
           mkdir verification-download
-          gh release download "$RELEASE_TAG" --pattern "InvoiceFlowAI-$RELEASE_TAG-SHA256SUMS.txt" --dir verification-download
           gh release download "$RELEASE_TAG" --pattern "InvoiceFlowAI-$RELEASE_TAG-*" --dir verification-download
           (cd verification-download && sha256sum --check "InvoiceFlowAI-$RELEASE_TAG-SHA256SUMS.txt")
           gh release edit "$RELEASE_TAG" --draft=false

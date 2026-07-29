@@ -19,16 +19,16 @@
 
 **A desktop invoice assistant for personal work reimbursement: connect QQ Mail / 163 Mail → download PDF/OFD/XML e-invoices and Baiwang invoice links → AI OCR recognition → local archive → Excel reimbursement summary**
 
-Chinese search intent: **发票助手**, **发票管家**, **报销助手**, **电子发票归档**, **发票报销**, **QQ邮箱发票自动下载**, **163邮箱电子发票归档**, **OFD发票下载**, **百望云发票下载**, **Windows发票管理**.
+Chinese search intent: **发票助手**, **发票管家**, **报销助手**, **电子发票归档**, **发票报销**, **QQ邮箱发票自动下载**, **163邮箱电子发票归档**, **OFD发票下载**, **百望云发票下载**, **Windows 与 macOS 发票管理**.
 
-Download: [latest Windows portable release and macOS (Apple Silicon) DMG](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
+Download: [latest Windows installer / portable package and macOS (Apple Silicon) installer](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
 
 *Email and invoice files are processed locally. If you enable GLM OCR / vision recognition, invoice images are sent to your configured model provider for extraction.*
 
 </div>
 
 <p align="center">
-  <img src="./docs/images/invoiceflowai-hero-en.png" alt="InvoiceFlowAI Windows invoice assistant with real setup, processing, and safety screens" />
+  <img src="./docs/images/invoiceflowai-hero-en.png" alt="InvoiceFlowAI desktop invoice assistant with real setup, processing, and safety screens" />
 </p>
 
 ---
@@ -229,20 +229,17 @@ The system uses **GLM-4.5V** (multimodal vision) and **GLM-OCR** to recognize in
 
 ## 🚀 Quick Start
 
-```
-Step 1  Extract the software package to a regular folder (avoid cloud sync directories)
-        Keep the _internal folder in the same directory as InvoiceFlowAI.exe
-        ↓
-Step 2  Double-click to run InvoiceFlowAI.exe
-        The settings interface automatically appears on first launch
-        ↓
-Step 3  Fill in the configuration and save:
-        · Email address + authorization code (QQ or 163)
-        · GLM API Key
-        ↓
-        Click "Start Scanning" → Wait for completion
-        Invoices are automatically archived to the "Invoice Organizer" folder on your desktop ✅
-```
+### Windows (installer / portable)
+
+1. Installer: run `InvoiceFlowAI-*-windows-x64-setup.exe`. Portable: extract `InvoiceFlowAI-*-windows-x64-portable.zip` to a regular folder (avoid cloud-sync directories) and keep `_internal` beside `InvoiceFlowAI.exe`.
+2. Double-click `InvoiceFlowAI.exe`; the settings interface appears on first launch.
+3. Enter your email address and authorization code (QQ or 163) and GLM API Key, then click "Start Scanning". Invoices are archived to the "Invoice Organizer" folder on your desktop.
+
+### macOS (Apple Silicon)
+
+1. Open `InvoiceFlowAI-*-macos-arm64.dmg` and drag `InvoiceFlowAI` to Applications.
+2. The settings interface appears on first launch. This build is unsigned and not notarized; if macOS blocks it, confirm opening it in **System Settings → Privacy & Security**.
+3. Enter your email address and authorization code (QQ or 163) and GLM API Key, then click "Start Scanning".
 
 ---
 
@@ -314,7 +311,7 @@ This is normal. When AI recognition confidence is insufficient, the system autom
 ## 🛡️ Privacy & Security
 
 - All emails and invoice files are processed **locally** and are never uploaded to any server
-- Mailbox credentials are encrypted and stored via **Windows DPAPI**, decryptable only by the current Windows account
+- Mailbox credentials are encrypted with **DPAPI** on Windows and stored in **Keychain** on macOS
 - The GLM API only receives **invoice images** (Base64) for text recognition and does not send the original email content
 
 ---
