@@ -3,6 +3,7 @@ import ctypes
 import hashlib
 import json
 import os
+import sys
 from ctypes import wintypes
 
 
@@ -20,6 +21,10 @@ DEFAULT_GLM_MODEL_CANDIDATES = {
 }
 
 
+def _is_macos():
+    return sys.platform == "darwin"
+
+
 class DATA_BLOB(ctypes.Structure):
     _fields_ = [
         ("cbData", wintypes.DWORD),
@@ -28,10 +33,14 @@ class DATA_BLOB(ctypes.Structure):
 
 
 def _appdata_root():
+    if _is_macos():
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support")
     return os.getenv("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
 
 
 def _localappdata_root():
+    if _is_macos():
+        return os.path.join(os.path.expanduser("~"), "Library", "Caches")
     return os.getenv("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
 
 
@@ -167,6 +176,44 @@ def _unprotect_text(value):
     return _unprotect_bytes(raw_bytes).decode("utf-8")
 
 
+def _macos_keychain_service(settings_path, key):
+    path_digest = hashlib.sha256(
+        os.path.abspath(str(settings_path)).encode("utf-8")
+    ).hexdigest()
+    return f"{APP_DIR_NAME}/{path_digest}/{key}"
+
+
+def _macos_keyring():
+    try:
+        import keyring
+    except ImportError as exc:
+        raise RuntimeError("macOS Keychain support is unavailable") from exc
+    return keyring
+
+
+def _store_macos_keychain_secret(settings_path, key, value):
+    service = _macos_keychain_service(settings_path, key)
+    _macos_keyring().set_password(service, APP_DIR_NAME, str(value or ""))
+    return f"keychain:{service}"
+
+
+def _load_macos_keychain_secret(marker):
+    service = str(marker or "").removeprefix("keychain:")
+    if not service:
+        return ""
+    return str(_macos_keyring().get_password(service, APP_DIR_NAME) or "")
+
+
+def _delete_macos_keychain_secret(marker):
+    service = str(marker or "").removeprefix("keychain:")
+    if not service:
+        return
+    try:
+        _macos_keyring().delete_password(service, APP_DIR_NAME)
+    except Exception:
+        return
+
+
 class UserSettingsStore:
     def __init__(self, settings_path=None):
         self.settings_path = settings_path or get_settings_path()
@@ -187,7 +234,10 @@ class UserSettingsStore:
             protected = dict(payload.get("protected") or {})
             for key, encoded in protected.items():
                 try:
-                    values[key] = _unprotect_text(encoded)
+                    if _is_macos() and str(encoded).startswith("keychain:"):
+                        values[key] = _load_macos_keychain_secret(encoded)
+                    else:
+                        values[key] = _unprotect_text(encoded)
                 except Exception:
                     values[key] = ""
             return values
@@ -200,7 +250,12 @@ class UserSettingsStore:
         for key, value in dict(settings or {}).items():
             clean_value = value if value is not None else ""
             if key in SENSITIVE_KEYS:
-                payload["protected"][key] = _protect_text(clean_value)
+                if _is_macos():
+                    payload["protected"][key] = _store_macos_keychain_secret(
+                        self.settings_path, key, clean_value
+                    )
+                else:
+                    payload["protected"][key] = _protect_text(clean_value)
             else:
                 payload["values"][key] = clean_value
 
@@ -211,5 +266,14 @@ class UserSettingsStore:
         return self.settings_path
 
     def clear(self):
+        if _is_macos() and os.path.exists(self.settings_path):
+            try:
+                with open(self.settings_path, "r", encoding="utf-8") as handle:
+                    protected = dict((json.load(handle).get("protected") or {}))
+            except Exception:
+                protected = {}
+            for marker in protected.values():
+                if str(marker).startswith("keychain:"):
+                    _delete_macos_keychain_secret(marker)
         if os.path.exists(self.settings_path):
             os.remove(self.settings_path)
