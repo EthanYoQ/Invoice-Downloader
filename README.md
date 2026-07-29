@@ -14,18 +14,18 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue)
 ![AI](https://img.shields.io/badge/AI-GLM--4.5V%20%7C%20GLM--OCR-purple)
-![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
+![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%20macOS-lightblue)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
 </p>
 <h2 align="center">如果有帮到你，麻烦动动小手点亮STAR ✨✨</h2>
 </p>
 
-**个人职场报销用的 Windows 发票助手 / 发票管家：连接 QQ 邮箱 / 163 邮箱 → 自动下载 PDF/OFD/XML 电子发票和百望云发票链接 → AI OCR 识别 → 本地分类归档 → 生成 Excel 报销汇总**
+**个人职场报销用的桌面发票助手 / 发票管家：连接 QQ 邮箱 / 163 邮箱 → 自动下载 PDF/OFD/XML 电子发票和百望云发票链接 → AI OCR 识别 → 本地分类归档 → 生成 Excel 报销汇总**
 
 适合这些搜索和需求：**发票助手**、**发票管家**、**报销助手**、**电子发票归档**、**发票报销**、**QQ邮箱发票自动下载**、**163邮箱电子发票归档**、**OFD发票下载**、**百望云发票下载**、**Windows发票管理**。
 
-下载：[最新版 Windows 免安装包](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
+下载：[最新版 Windows 免安装包与 macOS（Apple Silicon）DMG](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
 
 *邮件和发票文件在本地处理。启用 GLM OCR / 视觉识别时，发票图片会发送到你配置的模型服务商用于提取。*
 

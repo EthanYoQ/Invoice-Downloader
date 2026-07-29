@@ -14,14 +14,14 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue)
 ![AI](https://img.shields.io/badge/AI-GLM--4.5V%20%7C%20GLM--OCR-purple)
-![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightblue?logo=windows)
+![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%20macOS-lightblue)
 ![Status](https://img.shields.io/badge/Status-Stable-brightgreen)
 
-**A Windows invoice assistant for personal work reimbursement: connect QQ Mail / 163 Mail → download PDF/OFD/XML e-invoices and Baiwang invoice links → AI OCR recognition → local archive → Excel reimbursement summary**
+**A desktop invoice assistant for personal work reimbursement: connect QQ Mail / 163 Mail → download PDF/OFD/XML e-invoices and Baiwang invoice links → AI OCR recognition → local archive → Excel reimbursement summary**
 
 Chinese search intent: **发票助手**, **发票管家**, **报销助手**, **电子发票归档**, **发票报销**, **QQ邮箱发票自动下载**, **163邮箱电子发票归档**, **OFD发票下载**, **百望云发票下载**, **Windows发票管理**.
 
-Download: [latest Windows portable release](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
+Download: [latest Windows portable release and macOS (Apple Silicon) DMG](https://github.com/EthanYoQ/Invoice-Downloader/releases/latest)
 
 *Email and invoice files are processed locally. If you enable GLM OCR / vision recognition, invoice images are sent to your configured model provider for extraction.*
 
