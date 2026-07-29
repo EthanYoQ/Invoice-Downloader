@@ -92,13 +92,14 @@ Assert-File -PathValue $CompilerPath -Label "Inno Setup compiler"
 
 Push-Location $RepoRoot
 try {
+    $PythonExe = (Get-Command python -CommandType Application -ErrorAction Stop).Source
     python -m pip install --upgrade pip
     python -m pip install -r requirements.release.txt pyinstaller
-    & .\build\windows\prepare_runtime.ps1 -PythonExe python
+    & .\build\windows\prepare_runtime.ps1 -PythonExe $PythonExe
     & .\build\windows\build_release.ps1 `
         -Version $Version `
-        -PythonExe python `
-        -BuildPythonExe python `
+        -PythonExe $PythonExe `
+        -BuildPythonExe $PythonExe `
         -InstallerCompilerPath $CompilerPath `
         -RunPyInstaller `
         -RunPortableZip `
