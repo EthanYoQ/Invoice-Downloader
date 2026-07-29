@@ -15,3 +15,17 @@ def _resolve_browser_path():
 browser_path = _resolve_browser_path()
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_path)
 os.environ.setdefault("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "1")
+
+
+def _run_packaging_smoke_test():
+    if os.environ.get("INVOICEFLOWAI_PLAYWRIGHT_RUNTIME_SMOKE") != "1":
+        return
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        browser.close()
+
+
+_run_packaging_smoke_test()

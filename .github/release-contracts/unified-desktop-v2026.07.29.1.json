@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "tag": "v2026.07.29.1",
+  "release_title": "InvoiceFlowAI v2026.07.29.1",
+  "source": {
+    "ref": "workflow-dispatch-head",
+    "provenance": "Both platform installers must be qualified from the exact workflow commit."
+  },
+  "assets": [
+    "InvoiceFlowAI-v2026.07.29.1-macos-arm64.dmg",
+    "InvoiceFlowAI-v2026.07.29.1-windows-x64-setup.exe",
+    "InvoiceFlowAI-v2026.07.29.1-windows-x64-portable.zip",
+    "InvoiceFlowAI-v2026.07.29.1-SHA256SUMS.txt",
+    "InvoiceFlowAI-v2026.07.29.1-release-manifest.json"
+  ],
+  "distribution": {
+    "macos": {
+      "architecture": "arm64",
+      "format": "dmg",
+      "signed": false,
+      "notarized": false,
+      "chromium_delivery": "post-copy"
+    },
+    "windows": {
+      "architecture": "x64",
+      "formats": ["installer", "portable-zip"],
+      "signed": false
+    }
+  },
+  "promotion_rule": "Publish only the immutable installer bytes from both successful qualification jobs; the promotion job may add only the combined manifest and SHA-256 manifest."
+}
