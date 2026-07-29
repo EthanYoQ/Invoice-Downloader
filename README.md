@@ -1,4 +1,4 @@
-# InvoiceFlowAI / 发票助手 / Invoice Downloader — 邮箱电子发票自动下载、OCR 识别与 Excel 报销汇总
+# InvoiceFlowAI / AI发票助手 / Invoice Downloader — 邮箱电子发票自动下载、OCR 识别与 Excel 报销汇总
 
 <div align="center">
 
