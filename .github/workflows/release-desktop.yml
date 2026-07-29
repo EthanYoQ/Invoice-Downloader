@@ -259,24 +259,24 @@ jobs:
               raise SystemExit(f'missing release bundle assets: {missing}')
           Path('release-notes.md').write_text(f'''## 中文
 
-本次发布将 macOS 与 Windows 安装包集中在同一个下载列表中：
+          本次发布将 macOS 与 Windows 安装包集中在同一个下载列表中：
 
-- macOS Apple Silicon（ARM64）DMG
-- Windows x64 安装程序与免安装 ZIP
-- SHA-256 校验清单与构建来源清单
+          - macOS Apple Silicon（ARM64）DMG
+          - Windows x64 安装程序与免安装 ZIP
+          - SHA-256 校验清单与构建来源清单
 
-两套安装包均由同一次 GitHub Actions 构建并完成运行时验证。当前版本未签名；macOS 未公证，首次打开可能需要在系统安全设置中手动允许，Windows 可能显示 SmartScreen 提示。
+          两套安装包均由同一次 GitHub Actions 构建并完成运行时验证。当前版本未签名；macOS 未公证，首次打开可能需要在系统安全设置中手动允许，Windows 可能显示 SmartScreen 提示。
 
-## English
+          ## English
 
-This release keeps both desktop platforms in one download list:
+          This release keeps both desktop platforms in one download list:
 
-- macOS Apple Silicon (ARM64) DMG
-- Windows x64 installer and portable ZIP
-- SHA-256 checksums and a build-provenance manifest
+          - macOS Apple Silicon (ARM64) DMG
+          - Windows x64 installer and portable ZIP
+          - SHA-256 checksums and a build-provenance manifest
 
-Both installers were built by the same GitHub Actions release run and passed runtime qualification. This version is unsigned; macOS is not notarized and may require a manual first-open override, while Windows may display a SmartScreen warning.
-''', encoding='utf-8')
+          Both installers were built by the same GitHub Actions release run and passed runtime qualification. This version is unsigned; macOS is not notarized and may require a manual first-open override, while Windows may display a SmartScreen warning.
+          ''', encoding='utf-8')
           PY
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Refusing to overwrite an existing release: $RELEASE_TAG" >&2
