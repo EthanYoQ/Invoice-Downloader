@@ -7,17 +7,15 @@ from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
 
 ROOT = Path(SPECPATH).resolve().parents[1]
-RUNTIME_SOURCE = Path(os.environ["INVOICEFLOW_RUNTIME_SOURCE"]).resolve()
 IDENTITY_PATH = ROOT / "build" / "macos" / "build-identity.generated.json"
 ICON_PATH = Path(os.environ["INVOICEFLOW_ICON_PATH"]).resolve()
 
-for required_path in (RUNTIME_SOURCE, IDENTITY_PATH, ICON_PATH):
+for required_path in (IDENTITY_PATH, ICON_PATH):
     if not required_path.exists():
         raise SystemExit(f"Required macOS packaging input not found: {required_path}")
 
 datas = [
     (str(ROOT / "templates"), "templates"),
-    (str(RUNTIME_SOURCE), "runtime/ms-playwright"),
     (str(IDENTITY_PATH), "build_meta"),
 ]
 

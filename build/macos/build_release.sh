@@ -66,7 +66,6 @@ for size in 16 32 128 256 512; do
 done
 iconutil --convert icns "$iconset_path" --output "$icon_path"
 
-INVOICEFLOW_RUNTIME_SOURCE="$runtime_root" \
 INVOICEFLOW_ICON_PATH="$icon_path" \
 python -m PyInstaller \
   --noconfirm \
@@ -77,10 +76,18 @@ python -m PyInstaller \
 
 app_path="$dist_root/$app_name.app"
 app_executable="$app_path/Contents/MacOS/$app_name"
+runtime_target="$app_path/Contents/Frameworks/runtime/ms-playwright"
 test -d "$app_path"
 test -x "$app_executable"
-test -d "$app_path/Contents/Frameworks/runtime/ms-playwright"
-"$app_executable" --help | grep --quiet -- '--run-context'
+
+# Chromium contains a nested .app bundle. Copying it only after PyInstaller has
+# completed prevents PyInstaller from trying to ad-hoc-sign that nested bundle.
+mkdir -p "$(dirname "$runtime_target")"
+ditto "$runtime_root" "$runtime_target"
+test -d "$runtime_target"
+chromium_executable="$(find "$runtime_target" -type f -path '*Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing' -perm -111 -print -quit)"
+test -n "$chromium_executable"
+INVOICEFLOWAI_PLAYWRIGHT_RUNTIME_SMOKE=1 "$app_executable" --help | grep --quiet -- '--run-context'
 
 dmg_path="$dist_root/$app_name-v$version-macos-$arch.dmg"
 sha_path="$dist_root/$app_name-v$version-macos-$arch.SHA256"
