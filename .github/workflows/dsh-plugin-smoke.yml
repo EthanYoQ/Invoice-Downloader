@@ -1,0 +1,87 @@
+name: DSH plugin macOS smoke
+
+on:
+  pull_request:
+    paths:
+      - 'plugins/dsh-invoice-downloader/**'
+      - '.github/workflows/dsh-plugin-smoke.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/dsh-invoice-downloader/**'
+      - '.github/workflows/dsh-plugin-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-and-runtime:
+    name: Package, runtime, and DSH load
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: master
+          path: dsh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the publishable tarball
+        working-directory: plugins/dsh-invoice-downloader
+        run: |
+          npm ci
+          mkdir -p "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact"
+          npm test
+          npm pack --pack-destination "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact"
+
+      - name: Install the tarball into an isolated DSH Web profile
+        working-directory: dsh
+        env:
+          DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          package_tgz="$(find "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact" -maxdepth 1 -name '*.tgz' -print -quit)"
+          test -n "$package_tgz"
+          pnpm dsh plugin --profile web add "file:$package_tgz"
+          pnpm dsh --profile web --dump-config | grep --fixed-strings '@ethanyoq/dsh-invoice-downloader'
+
+      - name: Install and check the package-owned runtime
+        working-directory: dsh
+        env:
+          DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
+        run: |
+          plugin_dir="$(cd "$DSH_HOME/profiles/web" && node -p \"require('node:path').dirname(require.resolve('@ethanyoq/dsh-invoice-downloader/package.json'))\")"
+          python3 "$plugin_dir/runtime/install.py" \
+            --venv "$plugin_dir/runtime/.venv" \
+            --requirements "$plugin_dir/runtime/requirements-headless.txt" \
+            --engine-root "$plugin_dir/runtime/engine" \
+            --health-check "$plugin_dir/runtime/health_check.py"
+          "$plugin_dir/runtime/.venv/bin/python" "$plugin_dir/runtime/health_check.py" --engine-root "$plugin_dir/runtime/engine"
+
+      - name: Serve and load the package client bundle
+        working-directory: dsh
+        env:
+          DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
+        run: |
+          pnpm dsh --profile web --port 3192 > "$RUNNER_TEMP/dsh-web.log" 2>&1 &
+          dsh_pid=$!
+          trap 'kill "$dsh_pid" 2>/dev/null || true; wait "$dsh_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error 'http://127.0.0.1:3192/plugins/@ethanyoq/dsh-invoice-downloader/client.js' > "$RUNNER_TEMP/invoice-client.js"; then
+              break
+            fi
+            sleep 1
+          done
+          test -s "$RUNNER_TEMP/invoice-client.js"
