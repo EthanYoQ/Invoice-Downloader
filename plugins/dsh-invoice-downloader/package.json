@@ -1,0 +1,96 @@
+{
+  "name": "@ethanyoq/dsh-invoice-downloader",
+  "version": "0.1.0",
+  "description": "Local IMAP invoice download, OCR, archive, and Excel summary bundle for DeepSeek Harness",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EthanYoQ/Invoice-Downloader.git",
+    "directory": "plugins/dsh-invoice-downloader"
+  },
+  "bugs": {
+    "url": "https://github.com/EthanYoQ/Invoice-Downloader/issues"
+  },
+  "homepage": "https://github.com/EthanYoQ/Invoice-Downloader#deepseek-harness-plugin",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "invoice",
+    "imap",
+    "ocr",
+    "excel"
+  ],
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "src/client-sidebar.js",
+    "engine-adapter/**",
+    "runtime/install.py",
+    "runtime/health_check.py",
+    "runtime/requirements-headless.txt",
+    "runtime/engine/**",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": "./src/client-sidebar.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "cordis": {
+    "plugin": "./lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1",
+    "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.5",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.5",
+    "@deepseek-ai/dsh-session": ">=0.1.0-rc.5",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.0-rc.5"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node scripts/clean.mjs",
+    "prepare-engine": "node scripts/prepare-engine.mjs",
+    "pretest": "npm run build",
+    "test": "node --test tests/*.test.mjs",
+    "pretest:package": "npm run prepare-engine",
+    "test:package": "node scripts/verify-package.mjs",
+    "prepack": "npm run build && npm run test:package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24",
+    "npm": ">=10"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

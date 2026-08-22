@@ -37,6 +37,21 @@
 
 ---
 
+## DeepSeek Harness 插件
+
+`@ethanyoq/dsh-invoice-downloader` 将本地 IMAP 发票下载、OCR、归档和 Excel 汇总带到 DeepSeek Harness 的右侧边栏。适用于希望把重复整理工作交给本地自动化、同时保留人工复核的报销场景。
+
+![DeepSeek Harness 中的 Invoice Downloader：从右侧入口打开面板、选择保存位置、检查本地引擎并完成脱敏扫描](https://github.com/EthanYoQ/Invoice-Downloader/blob/dsh-invoice-downloader-assets/invoice-downloader-dsh-demo-v1.gif?raw=true)
+
+```powershell
+dsh plugin --profile web add @ethanyoq/dsh-invoice-downloader
+dsh web --profile web
+```
+
+打开右侧的“发票下载”入口，选择保存位置，安装一次本地引擎后填写 QQ 或 163 邮箱的 IMAP 授权码。发票文件在本地 OCR；OCR 文本发送给当前选择的 DeepSeek 模型提取字段。插件支持 Windows x64 和 macOS Apple Silicon，授权码由 DSH 凭据服务保存，不写入插件设置或扫描日志。
+
+---
+
 ## 🎬 视频介绍
 
 https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5

@@ -1,0 +1,7 @@
+export { apply, inject, name } from './activate.js'
+export type { PluginConfig, PluginContext } from './activate.js'
+export { createInvoiceRpcHandler } from './rpc-handler.js'
+export { InvoiceScanner } from './invoice-scanner.js'
+export { EngineIpcClient } from './ipc-client.js'
+export { ArtifactRegistry } from './file-security.js'
+export { resolveRuntimeLayout, getRuntimeStatus } from './runtime.js'

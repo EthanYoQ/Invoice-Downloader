@@ -1,0 +1,14 @@
+- insert:
+    - id: invoice-downloader
+      name: '@ethanyoq/dsh-invoice-downloader'
+      inject: ['subprocess', 'connection', 'sessions', 'llm', 'agentDefaultModel', 'credentials']
+      config:
+        savePath: ''
+        runtimeRoot: ''
+        pythonPath: ''
+        engineRoot: ''
+        bootstrapPython: ''
+        deadlineMs: 600000
+        graceMs: 2000
+        imapFetchTimeoutSeconds: 15
+        profileDir: ''
