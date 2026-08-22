@@ -62,7 +62,7 @@ jobs:
         env:
           DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
         run: |
-          plugin_dir="$(cd "$DSH_HOME/profiles/web" && node -p \"require('node:path').dirname(require.resolve('@ethanyoq/dsh-invoice-downloader/package.json'))\")"
+          plugin_dir="$(cd "$DSH_HOME/profiles/web" && node -p "require('node:path').dirname(require.resolve('@ethanyoq/dsh-invoice-downloader/package.json'))")"
           runtime_root="$DSH_HOME/invoice-downloader/runtime"
           python3 "$plugin_dir/runtime/install.py" \
             --venv "$runtime_root/.venv" \
