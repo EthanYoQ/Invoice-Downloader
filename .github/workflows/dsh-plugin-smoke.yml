@@ -79,7 +79,14 @@ jobs:
         run: |
           pnpm dsh --profile web --port 3192 > "$RUNNER_TEMP/dsh-web.log" 2>&1 &
           dsh_pid=$!
-          trap 'kill "$dsh_pid" 2>/dev/null || true; wait "$dsh_pid" 2>/dev/null || true' EXIT
+          cleanup() {
+            status=$?
+            kill "$dsh_pid" 2>/dev/null || true
+            wait "$dsh_pid" 2>/dev/null || true
+            if [ "$status" -ne 0 ]; then cat "$RUNNER_TEMP/dsh-web.log"; fi
+            exit "$status"
+          }
+          trap cleanup EXIT
           for attempt in {1..30}; do
             if curl --fail --silent --show-error 'http://127.0.0.1:3192/plugins/@ethanyoq/dsh-invoice-downloader/client.js' > "$RUNNER_TEMP/invoice-client.js"; then
               break
