@@ -1,5 +1,5 @@
-import { createUserMessage, type Message } from '@deepseek-ai/dsh-llm'
-import { SessionId, type Session, type SessionStore } from '@deepseek-ai/dsh-session'
+import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { Session, SessionStore } from '@deepseek-ai/dsh-session'
 
 export interface ModelVisibleEvent {
   inputText: string
@@ -23,6 +23,16 @@ export interface ScanSessionManagerContext {
   sessions: SessionStore
 }
 
+function createInvoiceUserMessage(inputText: string): UserMessage {
+  const content = Object.freeze([Object.freeze({ type: 'text', text: inputText })])
+  return Object.freeze({
+    id: crypto.randomUUID(),
+    role: 'user',
+    content,
+    source: { kind: 'plugin', plugin: 'invoice-downloader' },
+  }) as unknown as UserMessage
+}
+
 export const PRIVACY_DISCLOSURE = {
   defaultChain: '发票文件在本地 OCR；OCR 文本会发送到当前选择的模型以提取字段，并记录在 DSH 会话中。',
   glmChain: '启用 GLM 时，发票图像会发送到 GLM 服务。',
@@ -42,7 +52,7 @@ export class ScanSessionManager {
   createSession(jobId: string): { sessionId: string; jobId: string } {
     if (!this.context) throw new Error('DSH session service is unavailable')
     const sessionId = `invoice-scan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    const session = this.context.sessions.create(SessionId(sessionId))
+    const session = this.context.sessions.create(sessionId as Parameters<SessionStore['create']>[0])
     if (session.id !== sessionId) throw new Error('DSH session service returned a different session id')
     this.sessions.set(sessionId, session)
     this.projections.set(jobId, {
@@ -59,10 +69,7 @@ export class ScanSessionManager {
   }
 
   logModelVisible(sessionId: string, event: ModelVisibleEvent): Message {
-    const message = createUserMessage({
-      source: { kind: 'plugin', plugin: 'invoice-downloader' },
-      content: [{ type: 'text', text: event.inputText }],
-    })
+    const message = createInvoiceUserMessage(event.inputText)
     const session = this.sessions.get(sessionId)
     session?.append('user/message', message, { surfaceOp: 'append' })
     return message

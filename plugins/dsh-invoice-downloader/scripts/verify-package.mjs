@@ -40,6 +40,15 @@ function collectPythonFiles(root, prefix = '') {
   })
 }
 
+function collectJavaScriptFiles(root, prefix = '') {
+  return readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+    const path = join(root, entry.name)
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name
+    if (entry.isDirectory()) return collectJavaScriptFiles(path, relativePath)
+    return entry.isFile() && entry.name.endsWith('.js') ? [relativePath] : []
+  })
+}
+
 const bundledPythonFiles = collectPythonFiles(join(packageRoot, 'runtime', 'engine', 'src', 'invoice_engine'))
   .filter(file => file !== '__init__.py')
   .sort()
@@ -51,6 +60,10 @@ assert.ok(packageManifest.files.includes('lib/**/*.d.ts'))
 assert.ok(!packageManifest.files.includes('lib/**'), 'publish only runtime JavaScript and declarations')
 assert.equal(packageManifest.os, undefined)
 assert.equal(packageManifest.cpu, undefined)
+
+const directDshImports = collectJavaScriptFiles(join(packageRoot, 'lib'))
+  .filter(file => /(?:from|import\()\s*['"]@deepseek-ai\//.test(readFileSync(join(packageRoot, 'lib', file), 'utf8')))
+assert.deepEqual(directDshImports, [])
 
 const stagedPaths = [
   'runtime/.venv',

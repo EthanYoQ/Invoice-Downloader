@@ -1,8 +1,8 @@
-import {
-  BlockAssembler,
-  type LlmCallConfig,
-  type LlmRuntime,
-  type Message,
+import type {
+  LlmCallConfig,
+  LlmRuntime,
+  Message,
+  StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import {
@@ -53,6 +53,45 @@ export interface LlmContext {
   llm: Pick<LlmRuntime, 'prepareCall'>
   agentDefaultModel: {
     currentSelection(): { provider: string; model: string; reasoningEffort?: LlmCallConfig['reasoningEffort'] } | null
+  }
+}
+
+/** Collects the text-only stream result used by invoice field extraction. */
+class TextResponseAssembler {
+  private readonly textByIndex = new Map<number, string>()
+  private readonly closed = new Set<number>()
+  private finishKind: string | undefined
+
+  push(chunk: StreamChunk): void {
+    switch (chunk.type) {
+      case 'text-delta':
+        if (!this.closed.has(chunk.index)) {
+          this.textByIndex.set(chunk.index, `${this.textByIndex.get(chunk.index) || ''}${chunk.text}`)
+        }
+        return
+      case 'block-end':
+        if (!this.closed.has(chunk.index) && chunk.block.type === 'text') {
+          this.textByIndex.set(chunk.index, chunk.block.text)
+          this.closed.add(chunk.index)
+        }
+        return
+      case 'finish':
+        this.finishKind = chunk.reason.kind
+        return
+      default:
+        return
+    }
+  }
+
+  failed(): boolean {
+    return this.finishKind === 'error' || this.finishKind === 'aborted'
+  }
+
+  text(): string {
+    return [...this.textByIndex.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, text]) => text)
+      .join('\n')
   }
 }
 
@@ -153,10 +192,9 @@ export class InvoiceScanner {
           ocrText: request.ocrText,
         }),
       })
-      const assembler = new BlockAssembler()
+      const assembler = new TextResponseAssembler()
       for await (const chunk of prepared.stream({ ...prepared.config, messages: [message] })) assembler.push(chunk)
-      const finish = assembler.finish
-      if (finish.kind === 'error' || finish.kind === 'aborted') {
+      if (assembler.failed()) {
         return {
           requestId: request.requestId,
           errorCode: 'LLM_ERROR',
@@ -164,10 +202,7 @@ export class InvoiceScanner {
           retryable: false,
         }
       }
-      const responseText = assembler.blocks()
-        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-        .map(block => block.text)
-        .join('\n')
+      const responseText = assembler.text()
       if (!responseText) {
         return {
           requestId: request.requestId,
