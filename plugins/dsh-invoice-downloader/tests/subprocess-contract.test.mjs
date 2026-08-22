@@ -164,6 +164,19 @@ test('runtime state stays outside the package while engine assets remain package
   assert.doesNotMatch(layout.installerPath, /invoice-dsh-state/)
 })
 
+test('the default runtime state resolves under the active DSH profile home', () => {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = 'C:/dsh-profile-home'
+  try {
+    const layout = resolveRuntimeLayout({})
+    assert.match(layout.runtimeRoot, /dsh-profile-home[\\/]invoice-downloader[\\/]runtime$/)
+    assert.match(layout.venvRoot, /dsh-profile-home[\\/]invoice-downloader[\\/]runtime[\\/]\.venv$/)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
 test('runtime installation repairs a virtual environment that lacks pip', () => {
   const installer = readFileSync(join(import.meta.dirname, '..', 'runtime', 'install.py'), 'utf8')
   assert.match(installer, /if not pip\.is_file\(\):/)
@@ -207,6 +220,11 @@ test('settings persist a selected output directory without persisting the creden
   const settingsText = readFileSync(join(root, 'profile', 'settings.json'), 'utf8')
   assert.match(settingsText, /fixture@example\.test/)
   assert.doesNotMatch(settingsText, /fixture-only/)
+  const reloaded = await handler('getSettings', {}, new AbortController().signal)
+  assert.equal(reloaded.ok, true)
+  assert.equal(reloaded.value.savePath, output)
+  assert.equal(reloaded.value.hasAuthCode, true)
+  assert.equal(reloaded.value.authCode, undefined)
 })
 
 test('settings reject a relative output directory before writing anything', async () => {

@@ -90,14 +90,6 @@
     "node": "^22.19.0 || >=24",
     "npm": ">=10"
   },
-  "os": [
-    "win32",
-    "darwin"
-  ],
-  "cpu": [
-    "x64",
-    "arm64"
-  ],
   "publishConfig": {
     "access": "public"
   }

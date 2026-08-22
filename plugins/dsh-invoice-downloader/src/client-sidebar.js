@@ -151,6 +151,23 @@ window.__ModuleLoader__.load({
       return e('div', { style: { ...styles.status, ...color }, role: 'status' }, value.message)
     }
 
+    async function chooseOutputDirectory(workspaces, update, setPathStatus) {
+      setPathStatus({ kind: 'idle', message: '' })
+      if (!workspaces || typeof workspaces.pickDirectory !== 'function') {
+        setPathStatus({ kind: 'error', message: '当前 DSH Host 不支持目录选择。' })
+        return
+      }
+      try {
+        const selected = await workspaces.pickDirectory()
+        if (typeof selected === 'string' && selected) {
+          update('savePath', selected)
+          setPathStatus({ kind: 'success', message: '已选择保存位置；保存设置后会重新校验。' })
+        }
+      } catch {
+        setPathStatus({ kind: 'error', message: '无法打开目录选择器。' })
+      }
+    }
+
     function InvoicePanel({ call, workspaces, onClose }) {
       const [settings, setSettings] = React.useState({
         email: '',
@@ -247,20 +264,7 @@ window.__ModuleLoader__.load({
       }
 
       const chooseDirectory = async () => {
-        setPathStatus({ kind: 'idle', message: '' })
-        if (!workspaces || typeof workspaces.pickDirectory !== 'function') {
-          setPathStatus({ kind: 'error', message: '当前 DSH Host 不支持目录选择。' })
-          return
-        }
-        try {
-          const selected = await workspaces.pickDirectory()
-          if (typeof selected === 'string' && selected) {
-            update('savePath', selected)
-            setPathStatus({ kind: 'success', message: '已选择保存位置；保存设置后会重新校验。' })
-          }
-        } catch {
-          setPathStatus({ kind: 'error', message: '无法打开目录选择器。' })
-        }
+        await chooseOutputDirectory(workspaces, update, setPathStatus)
       }
 
       const save = async () => {
@@ -519,6 +523,7 @@ window.__ModuleLoader__.load({
     }
 
     exports.apply = apply
+    exports.chooseOutputDirectory = chooseOutputDirectory
     exports.inject = inject
     exports.name = name
     return module.exports

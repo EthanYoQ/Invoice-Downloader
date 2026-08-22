@@ -1,4 +1,4 @@
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -9,6 +9,57 @@ const runtimeRoot = resolve(packageRoot, 'runtime')
 const engineRoot = resolve(runtimeRoot, 'engine')
 const sourceRoot = projectRoot
 const extensionRoot = resolve(packageRoot, 'engine-adapter', 'engine-src')
+const engineSourceFiles = [
+  'app_api.py',
+  'app_archive_adapter.py',
+  'archive_pairing_service.py',
+  'archive_pairing.py',
+  'archive_service.py',
+  'artifact_verifier.py',
+  'audit_email_truth.py',
+  'batch_validation.py',
+  'bounded_url_recovery.py',
+  'build_identity.py',
+  'build_truth_dataset.py',
+  'candidate_pipeline.py',
+  'company_rules.py',
+  'deferred_url_recovery.py',
+  'document_acceptance.py',
+  'document_types.py',
+  'email_body_receipts.py',
+  'email_channel.py',
+  'email_fetcher.py',
+  'extraction_pipeline.py',
+  'frontend_run_context.py',
+  'glm_runtime.py',
+  'invoice_domain.py',
+  'invoice_extractor.py',
+  'mailbox_scanner.py',
+  'main.py',
+  'model_calibration.py',
+  'pairing_engine.py',
+  'pdf_converter.py',
+  'pinned_http.py',
+  'provider_baiwang.py',
+  'provider_direct_invoice.py',
+  'report_service.py',
+  'run_coordinator.py',
+  'run_evidence.py',
+  'run_lifecycle.py',
+  'run_state_store.py',
+  'strict_truth_audit.py',
+  'truth_contracts.py',
+  'url_recovery_worker.py',
+  'url_security.py',
+  'url_trace_sanitizer.py',
+  'user_settings.py',
+]
+const extensionSourceFiles = [
+  'deepseek_extractor.py',
+  'glm_fallback.py',
+  'local_ocr.py',
+  'recognition_chain.py',
+]
 
 function requireInside(parent, child) {
   const rel = relative(parent, child)
@@ -36,16 +87,12 @@ if (!existsSync(extensionRoot)) {
 rmSync(engineRoot, { recursive: true, force: true })
 mkdirSync(join(engineRoot, 'src', 'invoice_engine'), { recursive: true })
 
-for (const entry of readdirSync(sourceRoot, { withFileTypes: true })) {
-  if (entry.isFile() && entry.name.endsWith('.py')) {
-    copyFile(join(sourceRoot, entry.name), join(engineRoot, 'src', 'invoice_engine', entry.name))
-  }
+for (const file of engineSourceFiles) {
+  copyFile(join(sourceRoot, file), join(engineRoot, 'src', 'invoice_engine', file))
 }
 
-for (const entry of readdirSync(extensionRoot, { withFileTypes: true })) {
-  if (entry.isFile() && entry.name.endsWith('.py')) {
-    copyFile(join(extensionRoot, entry.name), join(engineRoot, 'src', 'invoice_engine', entry.name))
-  }
+for (const file of extensionSourceFiles) {
+  copyFile(join(extensionRoot, file), join(engineRoot, 'src', 'invoice_engine', file))
 }
 
 copyFile(
@@ -62,5 +109,6 @@ writeFileSync(
     sourceSha,
     generatedBy: '@ethanyoq/dsh-invoice-downloader',
     generatedAt: new Date().toISOString(),
+    sourceFiles: [...engineSourceFiles, ...extensionSourceFiles, 'ipc/protocol.py'].sort(),
   }, null, 2)}\n`,
 )

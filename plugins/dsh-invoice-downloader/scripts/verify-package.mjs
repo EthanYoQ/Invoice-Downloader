@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -29,11 +29,28 @@ const manifest = JSON.parse(readFileSync(join(packageRoot, 'runtime/engine/MANIF
 assert.equal(typeof manifest.sourceSha, 'string')
 assert.match(manifest.sourceSha, /^[0-9a-f]{40}$/)
 assert.equal(manifest.sourceRepository, 'https://github.com/EthanYoQ/Invoice-Downloader')
+assert.ok(Array.isArray(manifest.sourceFiles))
+
+function collectPythonFiles(root, prefix = '') {
+  return readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+    const path = join(root, entry.name)
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name
+    if (entry.isDirectory()) return collectPythonFiles(path, relativePath)
+    return entry.isFile() && entry.name.endsWith('.py') ? [relativePath] : []
+  })
+}
+
+const bundledPythonFiles = collectPythonFiles(join(packageRoot, 'runtime', 'engine', 'src', 'invoice_engine'))
+  .filter(file => file !== '__init__.py')
+  .sort()
+assert.deepEqual(bundledPythonFiles, manifest.sourceFiles)
 
 const packageManifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'))
 assert.ok(packageManifest.files.includes('lib/**/*.js'))
 assert.ok(packageManifest.files.includes('lib/**/*.d.ts'))
 assert.ok(!packageManifest.files.includes('lib/**'), 'publish only runtime JavaScript and declarations')
+assert.equal(packageManifest.os, undefined)
+assert.equal(packageManifest.cpu, undefined)
 
 const stagedPaths = [
   'runtime/.venv',

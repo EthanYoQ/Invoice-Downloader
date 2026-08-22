@@ -57,18 +57,20 @@ jobs:
           pnpm dsh plugin --profile web add "file:$package_tgz"
           pnpm dsh --profile web --dump-config | grep --fixed-strings '@ethanyoq/dsh-invoice-downloader'
 
-      - name: Install and check the package-owned runtime
+      - name: Install and check the DSH profile-state runtime
         working-directory: dsh
         env:
           DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
         run: |
           plugin_dir="$(cd "$DSH_HOME/profiles/web" && node -p \"require('node:path').dirname(require.resolve('@ethanyoq/dsh-invoice-downloader/package.json'))\")"
+          runtime_root="$DSH_HOME/invoice-downloader/runtime"
           python3 "$plugin_dir/runtime/install.py" \
-            --venv "$plugin_dir/runtime/.venv" \
+            --venv "$runtime_root/.venv" \
             --requirements "$plugin_dir/runtime/requirements-headless.txt" \
             --engine-root "$plugin_dir/runtime/engine" \
             --health-check "$plugin_dir/runtime/health_check.py"
-          "$plugin_dir/runtime/.venv/bin/python" "$plugin_dir/runtime/health_check.py" --engine-root "$plugin_dir/runtime/engine"
+          "$runtime_root/.venv/bin/python" "$plugin_dir/runtime/health_check.py" --engine-root "$plugin_dir/runtime/engine"
+          test ! -e "$plugin_dir/runtime/.venv"
 
       - name: Serve and load the package client bundle
         working-directory: dsh
