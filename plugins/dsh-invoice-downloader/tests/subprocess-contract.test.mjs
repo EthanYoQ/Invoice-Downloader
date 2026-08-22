@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { PassThrough, Readable } from 'node:stream'
@@ -122,7 +122,7 @@ test('health checks use the same explicit subprocess contract', async () => {
   })
 })
 
-test('runtime installation selects the newest supported Windows Python Launcher entry', async () => {
+test('runtime installation selects the newest supported Windows Python Launcher entry', { skip: process.platform !== 'win32' }, async () => {
   const { root, runtime } = temporaryRuntime()
   const calls = []
   const replies = [
@@ -149,10 +149,8 @@ test('runtime installation selects the newest supported Windows Python Launcher 
 
   const result = await handler('installRuntime', {}, new AbortController().signal)
   assert.equal(result.ok, true)
-  if (process.platform === 'win32') {
-    assert.deepEqual(calls[0].argv, ['py', '-0p'])
-    assert.deepEqual(calls[1].argv.slice(0, 2), ['py', '-3.13'])
-  }
+  assert.deepEqual(calls[0].argv, ['py', '-0p'])
+  assert.deepEqual(calls[1].argv.slice(0, 2), ['py', '-3.13'])
 })
 
 test('runtime state stays outside the package while engine assets remain package-owned', () => {
@@ -222,7 +220,7 @@ test('settings persist a selected output directory without persisting the creden
   assert.doesNotMatch(settingsText, /fixture-only/)
   const reloaded = await handler('getSettings', {}, new AbortController().signal)
   assert.equal(reloaded.ok, true)
-  assert.equal(reloaded.value.savePath, output)
+  assert.equal(reloaded.value.savePath, realpathSync(output))
   assert.equal(reloaded.value.hasAuthCode, true)
   assert.equal(reloaded.value.authCode, undefined)
 })
