@@ -76,9 +76,11 @@
     "build": "tsc -p tsconfig.json",
     "clean": "node scripts/clean.mjs",
     "prepare-engine": "node scripts/prepare-engine.mjs",
+    "pretest": "npm run build",
     "test": "node --test tests/*.test.mjs",
+    "pretest:package": "npm run prepare-engine",
     "test:package": "node scripts/verify-package.mjs",
-    "prepack": "npm run build && npm run prepare-engine && npm run test:package"
+    "prepack": "npm run build && npm run test:package"
   },
   "devDependencies": {
     "@types/node": "^22.20.0",
