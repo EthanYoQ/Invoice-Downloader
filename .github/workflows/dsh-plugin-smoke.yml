@@ -52,6 +52,7 @@ jobs:
         run: |
           corepack enable
           pnpm install --frozen-lockfile
+          pnpm run build
           package_tgz="$(find "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact" -maxdepth 1 -name '*.tgz' -print -quit)"
           test -n "$package_tgz"
           pnpm dsh plugin --profile web add "file:$package_tgz"
