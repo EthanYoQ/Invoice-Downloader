@@ -81,6 +81,13 @@ class WindowControlContractTests(unittest.TestCase):
         self.assertIn('callApi("close_window")', source)
         self.assertIn("window-traffic-button--maximize", source)
 
+    def test_frontend_uses_current_repository_link_without_stale_version_copy(self):
+        source = (ROOT / "templates" / "index_app.js").read_text(encoding="utf-8")
+        self.assertIn('githubUrl: "https://github.com/EthanYoQ/Invoice-Downloader"', source)
+        self.assertIn('footerVersion: "InvoiceFlowAI"', source)
+        self.assertNotIn("github.com/Ethan-YoungQ/Invoice-Downloader", source)
+        self.assertNotIn('footerVersion: "InvoiceFlowAI v', source)
+
 
 class ProviderWrapperContractTests(unittest.TestCase):
     def test_baiwang_email_field_wrapper_delegates_to_provider_parser(self):
