@@ -8,5 +8,6 @@ python-dotenv==1.2.2
 pyzbar==0.1.9
 requests==2.32.5
 tenacity==9.1.4
+# The RapidOCR wheel includes the default PP-OCRv3 ONNX model files.
 rapidocr-onnxruntime==1.2.3
 tzdata>=2024.1

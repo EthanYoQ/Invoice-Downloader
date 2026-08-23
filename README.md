@@ -31,44 +31,16 @@
 
 </div>
 
-<p align="center">
-  <img src="./docs/images/invoiceflowai-hero-zh.png" alt="InvoiceFlowAI 发票助手的启动配置、处理中心与安全提示界面" />
-</p>
-
----
-
 ## DeepSeek Harness 插件
 
 `@ethanyoq/dsh-invoice-downloader` 将本地 IMAP 发票下载、OCR、归档和 Excel 汇总带到 DeepSeek Harness 的右侧边栏。适用于希望把重复整理工作交给本地自动化、同时保留人工复核的报销场景。
-
-![DeepSeek Harness 中的 Invoice Downloader：从右侧入口打开面板、选择保存位置、检查本地引擎并完成脱敏扫描](https://github.com/EthanYoQ/Invoice-Downloader/blob/dsh-invoice-downloader-assets/invoice-downloader-dsh-demo-v1.gif?raw=true)
 
 ```powershell
 dsh plugin --profile web add @ethanyoq/dsh-invoice-downloader
 dsh web --profile web
 ```
 
-打开右侧的“发票下载”入口，选择保存位置，安装一次本地引擎后填写 QQ 或 163 邮箱的 IMAP 授权码。发票文件在本地 OCR；OCR 文本发送给当前选择的 DeepSeek 模型提取字段。插件支持 Windows x64 和 macOS Apple Silicon，授权码由 DSH 凭据服务保存，不写入插件设置或扫描日志。
-
----
-
-## 🎬 视频介绍
-
-https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
-
-## 🖥️ 软件界面预览
-
-### 启动配置：邮箱、识别引擎、日期范围与本地输出
-
-![InvoiceFlowAI 启动配置界面，使用示例邮箱、遮罩凭据、日期范围和本地归档配置](docs/images/invoiceflowai-setup-zh.png)
-
-### 处理中心：进度、计数与实时日志
-
-![InvoiceFlowAI 处理中心，展示任务进度、已扫描邮件、已识别发票、异常处理和实时日志](docs/images/invoiceflowai-processing-zh.png)
-
-### 安全提示：使用结果前进行人工复核
-
-![InvoiceFlowAI 免责声明，说明邮箱授权、API 使用、数据安全和人工复核要求](docs/images/invoiceflowai-disclaimer-zh.png)
+打开右侧的“发票下载”入口，选择保存位置，安装一次本地引擎后填写 QQ 或 163 邮箱的 IMAP 授权码。首次安装需要联网下载 Python 依赖和 Chromium；`rapidocr-onnxruntime` 的 pip wheel 自带默认 PP-OCRv3 模型，无需额外手动下载模型。发票文件在本地 OCR；OCR 文本发送给当前选择的 DeepSeek 模型提取字段。插件支持 Windows x64 和 macOS Apple Silicon，授权码由 DSH 凭据服务保存，不写入插件设置或扫描日志。
 
 ---
 
