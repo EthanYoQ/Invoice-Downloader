@@ -49,7 +49,7 @@ def main() -> int:
     if not pip.is_file():
         print('Bootstrapping pip in the local Python environment...')
         run([str(python), '-m', 'ensurepip', '--upgrade'])
-    print('Installing local invoice runtime dependencies...')
+    print('Installing local invoice runtime dependencies, including RapidOCR and bundled PP-OCRv3 models...')
     run([str(pip), 'install', '--disable-pip-version-check', '-r', str(requirements)])
     print('Installing Chromium for invoice-link recovery...')
     run([str(python), '-m', 'playwright', 'install', 'chromium'])

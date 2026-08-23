@@ -54,6 +54,19 @@ const bundledPythonFiles = collectPythonFiles(join(packageRoot, 'runtime', 'engi
   .sort()
 assert.deepEqual(bundledPythonFiles, manifest.sourceFiles)
 
+const privateVerificationFiles = [
+  'artifact_verifier.py',
+  'audit_email_truth.py',
+  'batch_validation.py',
+  'build_truth_dataset.py',
+  'model_calibration.py',
+  'strict_truth_audit.py',
+  'truth_contracts.py',
+]
+for (const file of privateVerificationFiles) {
+  assert.ok(!bundledPythonFiles.includes(file), `private verification file must not be published: ${file}`)
+}
+
 const packageManifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'))
 assert.ok(packageManifest.files.includes('lib/**/*.js'))
 assert.ok(packageManifest.files.includes('lib/**/*.d.ts'))

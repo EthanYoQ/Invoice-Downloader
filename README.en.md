@@ -27,44 +27,16 @@ Download: [latest Windows installer / portable package and macOS (Apple Silicon)
 
 </div>
 
-<p align="center">
-  <img src="./docs/images/invoiceflowai-hero-en.png" alt="InvoiceFlowAI desktop invoice assistant with real setup, processing, and safety screens" />
-</p>
-
----
-
 ## DeepSeek Harness Plugin
 
 `@ethanyoq/dsh-invoice-downloader` brings local IMAP invoice download, OCR, archiving, and Excel summaries to a right-side DeepSeek Harness panel. It is intended for reimbursement workflows that automate repetitive organizing while keeping a human review step.
-
-![Invoice Downloader in DeepSeek Harness: open the right-side panel, choose an output directory, check the local engine, and complete a redacted scan](https://github.com/EthanYoQ/Invoice-Downloader/blob/dsh-invoice-downloader-assets/invoice-downloader-dsh-demo-v1.gif?raw=true)
 
 ```sh
 dsh plugin --profile web add @ethanyoq/dsh-invoice-downloader
 dsh web --profile web
 ```
 
-Open **Invoice Downloader** from the right-side entry, choose an output directory, install the local engine once, and enter a QQ Mail or 163 Mail IMAP authorization code. Invoice files are OCRed locally; OCR text is sent to the currently selected DeepSeek model for field extraction. The plugin supports Windows x64 and macOS Apple Silicon. The DSH credential service stores authorization codes, never plugin settings or scan logs.
-
----
-
-## 🎬 Video Introduction
-
-https://github.com/user-attachments/assets/ae945367-35d3-4412-9fa0-c3bde80e2de5
-
-## 🖥️ Interface Preview
-
-### Setup: Mailbox, Recognition, Date Range, and Local Output
-
-![InvoiceFlowAI setup screen with sanitized example mailbox, masked credentials, date range, and local archive configuration](docs/images/invoiceflowai-setup-zh.png)
-
-### Processing Center: Progress, Counters, and Live Logs
-
-![InvoiceFlowAI processing center showing progress, scanned email count, recognized invoice count, exceptions, and execution logs](docs/images/invoiceflowai-processing-zh.png)
-
-### Safety Notice: Review Before Using Results
-
-![InvoiceFlowAI disclaimer explaining mailbox authorization, API usage, data security, and manual review requirements](docs/images/invoiceflowai-disclaimer-zh.png)
+Open **Invoice Downloader** from the right-side entry, choose an output directory, install the local engine once, and enter a QQ Mail or 163 Mail IMAP authorization code. First-time setup needs network access to download Python dependencies and Chromium; the `rapidocr-onnxruntime` pip wheel includes the default PP-OCRv3 models, so no separate manual model download is required. Invoice files are OCRed locally; OCR text is sent to the currently selected DeepSeek model for field extraction. The plugin supports Windows x64 and macOS Apple Silicon. The DSH credential service stores authorization codes, never plugin settings or scan logs.
 
 ---
 

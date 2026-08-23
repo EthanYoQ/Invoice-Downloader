@@ -1,6 +1,6 @@
 {
   "name": "@ethanyoq/dsh-invoice-downloader",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local IMAP invoice download, OCR, archive, and Excel summary bundle for DeepSeek Harness",
   "license": "Apache-2.0",
   "type": "module",
