@@ -58,10 +58,10 @@ const APP_BRAND = {
 
 const APP_VISIBLE_COPY = {
     topSubtitle: "AI发票管家",
-    footerVersion: "InvoiceFlowAI v2026.03.31",
+    footerVersion: "InvoiceFlowAI",
     footerStamp: "P-H-Dx",
     githubLabel: "产品官网",
-    githubUrl: "https://github.com/Ethan-YoungQ/Invoice-Downloader",
+    githubUrl: "https://github.com/EthanYoQ/Invoice-Downloader",
 };
 
 const ZHIPU_PLATFORM_URL = "https://bigmodel.cn/pricing";
