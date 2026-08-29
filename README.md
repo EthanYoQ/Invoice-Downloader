@@ -27,6 +27,10 @@
 
 </div>
 
+<p align="center">
+  <img src="./docs/images/invoiceflowai-hero-zh.png" alt="InvoiceFlowAI 发票助手的启动配置、处理中心、结果分析与安全提示界面" />
+</p>
+
 ## DeepSeek Harness 插件
 
 `@ethanyoq/dsh-invoice-downloader` 将本地 IMAP 发票下载、OCR、归档和 Excel 汇总带到 DeepSeek Harness 的右侧边栏。适用于希望把重复整理工作交给本地自动化、同时保留人工复核的报销场景。

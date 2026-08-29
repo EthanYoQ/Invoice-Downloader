@@ -27,6 +27,10 @@ Download: [latest Windows installer / portable package and macOS (Apple Silicon)
 
 </div>
 
+<p align="center">
+  <img src="./docs/images/invoiceflowai-hero-en.png" alt="InvoiceFlowAI desktop invoice assistant with setup, processing, analysis, and safety screens" />
+</p>
+
 ## DeepSeek Harness Plugin
 
 `@ethanyoq/dsh-invoice-downloader` brings local IMAP invoice download, OCR, archiving, and Excel summaries to a right-side DeepSeek Harness panel. It is intended for reimbursement workflows that automate repetitive organizing while keeping a human review step.

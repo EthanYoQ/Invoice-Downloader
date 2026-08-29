@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "profile": "product-proof-split-v1",
+  "composition_source": "docs/readme-visuals/product-proof-split-v1.html",
+  "data_source": "docs/readme-visuals/hero-data.js",
+  "capture_context": "Four distinct screens were rendered from the repository's desktop frontend with a sanitized in-memory desktop bridge; no customer or account data was used.",
+  "heroes": {
+    "zh": {
+      "readme": "README.md",
+      "output": "docs/images/invoiceflowai-hero-zh.png",
+      "ui_locale": "zh-CN",
+      "screenshots": [
+        {
+          "path": "docs/images/screens/invoiceflowai-overview-zh.png",
+          "role": "primary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        },
+        {
+          "path": "docs/images/screens/invoiceflowai-processing-zh.png",
+          "role": "secondary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        },
+        {
+          "path": "docs/images/screens/invoiceflowai-analysis-zh.png",
+          "role": "secondary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        },
+        {
+          "path": "docs/images/screens/invoiceflowai-disclaimer-zh.png",
+          "role": "secondary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        }
+      ]
+    },
+    "en": {
+      "readme": "README.en.md",
+      "output": "docs/images/invoiceflowai-hero-en.png",
+      "ui_locale": "zh-CN",
+      "ui_locale_note": "The desktop UI currently ships in Chinese only; the English README hero therefore retains the same Chinese product captures while localizing only the surrounding hero copy.",
+      "screenshots": [
+        {
+          "path": "docs/images/screens/invoiceflowai-overview-zh.png",
+          "role": "primary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        },
+        {
+          "path": "docs/images/screens/invoiceflowai-processing-zh.png",
+          "role": "secondary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        },
+        {
+          "path": "docs/images/screens/invoiceflowai-analysis-zh.png",
+          "role": "secondary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        },
+        {
+          "path": "docs/images/screens/invoiceflowai-disclaimer-zh.png",
+          "role": "secondary",
+          "capture_provenance": "project-authored-screenshot",
+          "complete_window": true,
+          "ui_locale": "zh-CN"
+        }
+      ]
+    }
+  }
+}
