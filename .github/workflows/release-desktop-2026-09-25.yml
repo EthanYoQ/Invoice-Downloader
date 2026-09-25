@@ -11,7 +11,7 @@ on:
 permissions: {}
 concurrency:
   group: desktop-release-v2026.09.25.1
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   RELEASE_TAG: v2026.09.25.1
@@ -168,9 +168,35 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install required Windows timezone data
+        run: |
+          python -m pip install tzdata==2026.4
+          python -c "from zoneinfo import ZoneInfo; assert ZoneInfo('Asia/Shanghai').key == 'Asia/Shanghai'"
       - name: Build, install, upgrade, launch and uninstall qualification
         shell: pwsh
         run: .\.github\scripts\qualify-windows-release.ps1 -Tag $env:RELEASE_TAG
+      - name: Verify bundled timezone data and record qualification
+        run: |
+          python - <<'PYTZ'
+          import json
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          import zipfile
+          path = Path('dist/InvoiceFlowAI/_internal/tzdata/zoneinfo/Asia/Shanghai')
+          with path.open('rb') as stream:
+              zone = ZoneInfo.from_file(stream, key='Asia/Shanghai')
+          if datetime(2026, 9, 25, tzinfo=zone).utcoffset() != timedelta(hours=8):
+              raise SystemExit('Bundled Shanghai timezone is invalid')
+          archive = Path('release-assets/windows/InvoiceFlowAI-v2026.09.25.1-windows-x64-portable.zip')
+          with zipfile.ZipFile(archive) as bundle:
+              if bundle.read('InvoiceFlowAI/_internal/tzdata/zoneinfo/Asia/Shanghai') != path.read_bytes():
+                  raise SystemExit('Portable timezone payload differs from packaged app')
+          evidence = Path('release-assets/windows/windows-x64-qualification.json')
+          payload = json.loads(evidence.read_text(encoding='utf-8-sig'))
+          payload['acceptance']['bundled_shanghai_timezone'] = True
+          evidence.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+          PYTZ
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-qualified
@@ -208,7 +234,7 @@ jobs:
           tag, revision = os.environ['RELEASE_TAG'], os.environ['GITHUB_SHA']
           gates = {
               'macos': ('macos-arm64', ['native_arm64_runner', 'post_copy_chromium_structure', 'dmg_mount_copy_playwright_smoke']),
-              'windows': ('windows-x64', ['packaged_playwright_smoke', 'installer_upgrade_preserves_user_settings', 'installed_application_launches', 'portable_playwright_smoke', 'uninstall'])
+              'windows': ('windows-x64', ['packaged_playwright_smoke', 'installer_upgrade_preserves_user_settings', 'installed_application_launches', 'portable_playwright_smoke', 'uninstall', 'bundled_shanghai_timezone'])
           }
           for folder, (platform, required) in gates.items():
               evidence = json.loads(Path(f'qualified/{folder}/{platform}-qualification.json').read_text(encoding='utf-8-sig'))
@@ -298,6 +324,11 @@ jobs:
           PY
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Refusing to overwrite existing release: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          current_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/release/v2026.09.25.1" --jq .object.sha)"
+          if [[ "$current_head" != "$GITHUB_SHA" ]]; then
+            echo "Refusing to publish a superseded release build" >&2
             exit 1
           fi
           gh release create "$RELEASE_TAG" release-bundle/* --target "$GITHUB_SHA" --draft --title "InvoiceFlowAI $RELEASE_TAG" --notes-file release-notes.md
