@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "tag": "v2026.09.25.1",
+  "release_title": "InvoiceFlowAI v2026.09.25.1",
+  "reviewed_source_revision": "8fe3a1147c619268b41f1480e73c4fa38d97db69",
+  "source": {
+    "ref": "release/v2026.09.25.1",
+    "provenance": "Both platforms must use the exact workflow commit. Only this contract and its version-specific workflow may differ from the reviewed source revision."
+  },
+  "assets": [
+    "InvoiceFlowAI-v2026.09.25.1-macos-arm64.dmg",
+    "InvoiceFlowAI-v2026.09.25.1-windows-x64-setup.exe",
+    "InvoiceFlowAI-v2026.09.25.1-windows-x64-portable.zip",
+    "InvoiceFlowAI-v2026.09.25.1-SHA256SUMS.txt",
+    "InvoiceFlowAI-v2026.09.25.1-release-manifest.json"
+  ],
+  "distribution": {
+    "macos": {"architecture": "arm64", "format": "dmg", "signed": false, "notarized": false, "chromium_delivery": "post-copy"},
+    "windows": {"architecture": "x64", "formats": ["installer", "portable-zip"], "signed": false}
+  },
+  "promotion_rule": "Publish only immutable bytes from both successful platform tests and installer qualification jobs. Verify uploaded bytes before making the draft public. Never overwrite an existing release."
+}
