@@ -1,0 +1,317 @@
+name: Release desktop v2026.09.25.1
+
+on:
+  push:
+    branches: ['release/v2026.09.25.1']
+    paths:
+      - '.github/workflows/release-desktop-2026-09-25.yml'
+      - '.github/release-contracts/unified-desktop-v2026.09.25.1.json'
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: desktop-release-v2026.09.25.1
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: v2026.09.25.1
+  CONTRACT_PATH: .github/release-contracts/unified-desktop-v2026.09.25.1.json
+  PYTHONUTF8: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  contract:
+    name: Verify frozen source and release contract
+    if: github.repository == 'EthanYoQ/Invoice-Downloader' && github.ref == 'refs/heads/release/v2026.09.25.1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Require the reviewed application tree
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          c = json.loads(Path(os.environ['CONTRACT_PATH']).read_text(encoding='utf-8'))
+          if c['tag'] != os.environ['RELEASE_TAG']:
+              raise SystemExit('release tag differs from contract')
+          baseline = '8fe3a1147c619268b41f1480e73c4fa38d97db69'
+          if c['reviewed_source_revision'] != baseline:
+              raise SystemExit('reviewed source differs from frozen revision')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', baseline, 'HEAD'], check=True)
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only', baseline, 'HEAD'], text=True).splitlines())
+          allowed = {os.environ['CONTRACT_PATH'], '.github/workflows/release-desktop-2026-09-25.yml'}
+          if changed - allowed:
+              raise SystemExit(f'unreviewed application or build changes: {sorted(changed - allowed)}')
+          expected = {f'InvoiceFlowAI-{c["tag"]}-{s}' for s in ('macos-arm64.dmg', 'windows-x64-setup.exe', 'windows-x64-portable.zip', 'SHA256SUMS.txt', 'release-manifest.json')}
+          if set(c['assets']) != expected or len(c['assets']) != 5:
+              raise SystemExit('unexpected public asset contract')
+          print('Reviewed application tree and five-asset contract verified.')
+          PY
+
+  core_tests:
+    name: Core regression / ${{ matrix.os }}
+    needs: contract
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install native macOS test dependency
+        if: runner.os == 'macOS'
+        run: brew install zbar
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.test.txt
+      - name: Run Windows core suite
+        if: runner.os == 'Windows'
+        # Same reviewed hosted-runner exclusion as core-tests.yml; no new exclusions.
+        run: python -m pytest -q --deselect=tests/test_batch_validation.py::test_pinned_baseline_contract_uses_current_stable_hardware_fingerprint
+      - name: Run reviewed portable macOS suite
+        if: runner.os == 'macOS'
+        run: >-
+          python -m pytest -q
+          tests/test_core_review_fixes.py tests/test_invoice_regression_p2.py
+          tests/test_mailbox_scanner.py tests/test_pairing_engine.py
+          tests/test_run_coordinator.py tests/test_run_lifecycle.py
+          tests/test_task8_review_remediation.py
+
+  qualify_macos_arm64:
+    name: Qualify macOS ARM64 DMG
+    needs: core_tests
+    runs-on: macos-14
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require native Apple Silicon
+        run: test "$(uname -m)" = arm64
+      - name: Install packaging dependencies
+        run: |
+          brew install librsvg zbar
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.release.txt pyinstaller pyobjc
+      - name: Build and verify mounted installer runtime
+        run: |
+          bash build/macos/build_release.sh "$RELEASE_TAG"
+          dmg="dist/macos/arm64/InvoiceFlowAI-${RELEASE_TAG}-macos-arm64.dmg"
+          test -s "$dmg"
+          mount_copy="$(mktemp -d)"
+          device=""
+          cleanup() {
+            if [[ -n "$device" ]]; then hdiutil detach "$device" -quiet || true; fi
+            rm -rf "$mount_copy"
+          }
+          trap cleanup EXIT
+          attach_output="$(hdiutil attach -nobrowse -readonly "$dmg")"
+          device="$(printf '%s\n' "$attach_output" | awk 'NR == 1 { print $1 }')"
+          mount_point="$(printf '%s\n' "$attach_output" | awk -F '\t' '/\/Volumes\// { print $NF; exit }')"
+          test -n "$device"
+          test -d "$mount_point/InvoiceFlowAI.app"
+          ditto "$mount_point/InvoiceFlowAI.app" "$mount_copy/InvoiceFlowAI.app"
+          INVOICEFLOWAI_PLAYWRIGHT_RUNTIME_SMOKE=1 "$mount_copy/InvoiceFlowAI.app/Contents/MacOS/InvoiceFlowAI" --help | grep --quiet -- '--run-context'
+          mkdir -p release-assets/macos
+          cp "$dmg" "release-assets/macos/$(basename "$dmg")"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('release-assets/macos/macos-arm64-qualification.json').write_text(json.dumps({
+              'platform': 'macos-arm64', 'tag': os.environ['RELEASE_TAG'],
+              'source_revision': os.environ['GITHUB_SHA'],
+              'assets': [f"InvoiceFlowAI-{os.environ['RELEASE_TAG']}-macos-arm64.dmg"],
+              'acceptance': {'native_arm64_runner': True, 'post_copy_chromium_structure': True, 'dmg_mount_copy_playwright_smoke': True},
+              'signing': {'status': 'unsigned', 'notarized': False}
+          }, indent=2) + '\n', encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-qualified
+          path: release-assets/macos/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  qualify_windows_x64:
+    name: Qualify Windows x64 installer and portable ZIP
+    needs: core_tests
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build, install, upgrade, launch and uninstall qualification
+        shell: pwsh
+        run: .\.github\scripts\qualify-windows-release.ps1 -Tag $env:RELEASE_TAG
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-qualified
+          path: release-assets/windows/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  promote:
+    name: Verify both platforms and freeze release bytes
+    needs: [qualify_macos_arm64, qualify_windows_x64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64-qualified
+          path: qualified/macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-qualified
+          path: qualified/windows
+      - name: Verify qualification and write checksums
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          c = json.loads(Path(os.environ['CONTRACT_PATH']).read_text(encoding='utf-8'))
+          tag, revision = os.environ['RELEASE_TAG'], os.environ['GITHUB_SHA']
+          gates = {
+              'macos': ('macos-arm64', ['native_arm64_runner', 'post_copy_chromium_structure', 'dmg_mount_copy_playwright_smoke']),
+              'windows': ('windows-x64', ['packaged_playwright_smoke', 'installer_upgrade_preserves_user_settings', 'installed_application_launches', 'portable_playwright_smoke', 'uninstall'])
+          }
+          for folder, (platform, required) in gates.items():
+              evidence = json.loads(Path(f'qualified/{folder}/{platform}-qualification.json').read_text(encoding='utf-8-sig'))
+              if evidence.get('platform') != platform or evidence.get('tag') != tag or evidence.get('source_revision') != revision:
+                  raise SystemExit(f'{platform}: provenance mismatch')
+              if any(evidence.get('acceptance', {}).get(gate) is not True for gate in required):
+                  raise SystemExit(f'{platform}: qualification incomplete')
+          bundle = Path('release-bundle')
+          bundle.mkdir()
+          assets = []
+          def digest(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          for folder, suffix, platform in [('macos','macos-arm64.dmg','macos-arm64'), ('windows','windows-x64-setup.exe','windows-x64'), ('windows','windows-x64-portable.zip','windows-x64')]:
+              name = f'InvoiceFlowAI-{tag}-{suffix}'
+              source = Path('qualified') / folder / name
+              if not source.is_file() or source.stat().st_size == 0:
+                  raise SystemExit(f'missing qualified binary: {name}')
+              target = bundle / name
+              shutil.copy2(source, target)
+              assets.append({'name': name, 'platform': platform, 'bytes': target.stat().st_size, 'sha256': digest(target)})
+          manifest = bundle / f'InvoiceFlowAI-{tag}-release-manifest.json'
+          manifest.write_text(json.dumps({
+              'schema_version': 1, 'tag': tag, 'source_revision': revision,
+              'reviewed_source_revision': c['reviewed_source_revision'],
+              'workflow_run_id': os.environ['GITHUB_RUN_ID'],
+              'promotion': 'verified immutable qualification bytes',
+              'signing': {'macos': 'unsigned-not-notarized', 'windows': 'unsigned'},
+              'assets': assets
+          }, indent=2) + '\n', encoding='utf-8')
+          checksums = [bundle / asset['name'] for asset in assets] + [manifest]
+          (bundle / f'InvoiceFlowAI-{tag}-SHA256SUMS.txt').write_text(''.join(f'{digest(p)}  {p.name}\n' for p in checksums), encoding='utf-8')
+          if {p.name for p in bundle.iterdir()} != set(c['assets']):
+              raise SystemExit('public asset set differs from frozen contract')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release-bundle
+          path: release-bundle/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Upload, verify, and publish combined release
+    needs: promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-release-bundle
+          path: release-bundle
+      - name: Publish only verified new release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd release-bundle && sha256sum --check "InvoiceFlowAI-$RELEASE_TAG-SHA256SUMS.txt")
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          c = json.loads(Path(os.environ['CONTRACT_PATH']).read_text(encoding='utf-8'))
+          if {p.name for p in Path('release-bundle').iterdir()} != set(c['assets']):
+              raise SystemExit('release bundle mismatch')
+          Path('release-notes.md').write_text('''## 中文
+
+          本版包含 PR #184 的核心桌面修复：保留人工复核原件、恢复跨次去重历史、同步配对后文件路径、修复 Excel 外部文本导出、验证邮箱服务器身份，并改进超时与主动停止处理。中国发票身份和邮件日期筛选语义不变；DSH 不在本次发布范围。
+
+          下载：macOS Apple Silicon ARM64 DMG；Windows x64 安装程序与免安装 ZIP。附 SHA-256 校验清单和构建来源清单。
+
+          两个平台均通过本次运行的核心回归测试和现有安装包运行时验证。Windows 测试排除一项仅限指定参考机器的硬件断言；macOS 运行可移植核心子集。这不等于真实 QQ/163 邮箱、个人票据金标或完整 GUI 端到端验收。
+
+          当前安装包未签名，macOS 未公证；系统可能显示来源验证提示。
+
+          ## English
+
+          Core desktop fixes from PR #184 cover original-file retention, persistent invoice deduplication, final archive paths, literal Excel text, IMAP certificate verification, bounded network waits and cancellation. DSH is excluded.
+
+          Includes an Apple Silicon ARM64 DMG, a Windows x64 installer and portable ZIP, SHA-256 checksums and build provenance. Both platforms passed the release run's core regression and existing package qualification checks. No real mailbox or full GUI end-to-end certification is claimed. Packages are unsigned; macOS is not notarized.
+          ''', encoding='utf-8')
+          PY
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" release-bundle/* --target "$GITHUB_SHA" --draft --title "InvoiceFlowAI $RELEASE_TAG" --notes-file release-notes.md
+          gh release view "$RELEASE_TAG" --json isDraft,assets > uploaded-release.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          c = json.loads(Path(os.environ['CONTRACT_PATH']).read_text(encoding='utf-8'))
+          uploaded = json.loads(Path('uploaded-release.json').read_text(encoding='utf-8'))
+          if not uploaded['isDraft'] or {a['name'] for a in uploaded['assets']} != set(c['assets']) or any(a['size'] <= 0 for a in uploaded['assets']):
+              raise SystemExit('uploaded draft asset set verification failed')
+          PY
+          mkdir verification-download
+          gh release download "$RELEASE_TAG" --pattern "InvoiceFlowAI-$RELEASE_TAG-*" --dir verification-download
+          cmp "release-bundle/InvoiceFlowAI-$RELEASE_TAG-SHA256SUMS.txt" "verification-download/InvoiceFlowAI-$RELEASE_TAG-SHA256SUMS.txt"
+          (cd verification-download && sha256sum --check "InvoiceFlowAI-$RELEASE_TAG-SHA256SUMS.txt")
+          gh release edit "$RELEASE_TAG" --draft=false --latest
