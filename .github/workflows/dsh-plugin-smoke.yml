@@ -44,7 +44,7 @@ jobs:
       - name: Install the tarball into an isolated DSH Web profile
         run: |
           host_dir="$GITHUB_WORKSPACE/.runtime/dsh-host"
-          npm install --prefix "$host_dir" --no-save --no-audit --no-fund @deepseek-ai/dsh@0.2.2-rc.1
+          npm install --prefix "$host_dir" --no-save --no-audit --no-fund @deepseek-ai/dsh@0.2.2-rc.1 pnpm@12.16.1
           export PATH="$host_dir/node_modules/.bin:$PATH"
           echo "$host_dir/node_modules/.bin" >> "$GITHUB_PATH"
           package_tgz="$(find "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact" -maxdepth 1 -name '*.tgz' -print -quit)"
