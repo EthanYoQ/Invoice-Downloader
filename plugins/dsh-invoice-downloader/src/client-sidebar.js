@@ -7,7 +7,7 @@ window.__ModuleLoader__.load({
     const e = React.createElement
 
     const name = 'invoice-downloader-client'
-    const inject = ['slots', 'connection', 'workspaces']
+    const inject = ['slots', 'connection', 'uiWorkspace']
     let panelOpen = false
     const panelSubscribers = new Set()
 
@@ -151,14 +151,10 @@ window.__ModuleLoader__.load({
       return e('div', { style: { ...styles.status, ...color }, role: 'status' }, value.message)
     }
 
-    async function chooseOutputDirectory(workspaces, update, setPathStatus) {
+    async function chooseOutputDirectory(pickDirectory, update, setPathStatus) {
       setPathStatus({ kind: 'idle', message: '' })
-      if (!workspaces || typeof workspaces.pickDirectory !== 'function') {
-        setPathStatus({ kind: 'error', message: '当前 DSH Host 不支持目录选择。' })
-        return
-      }
       try {
-        const selected = await workspaces.pickDirectory()
+        const selected = await pickDirectory()
         if (typeof selected === 'string' && selected) {
           update('savePath', selected)
           setPathStatus({ kind: 'success', message: '已选择保存位置；保存设置后会重新校验。' })
@@ -168,7 +164,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function InvoicePanel({ call, workspaces, onClose }) {
+    function InvoicePanel({ call, pickDirectory, onClose }) {
       const [settings, setSettings] = React.useState({
         email: '',
         authCode: '',
@@ -264,7 +260,7 @@ window.__ModuleLoader__.load({
       }
 
       const chooseDirectory = async () => {
-        await chooseOutputDirectory(workspaces, update, setPathStatus)
+        await chooseOutputDirectory(pickDirectory, update, setPathStatus)
       }
 
       const save = async () => {
@@ -503,22 +499,23 @@ window.__ModuleLoader__.load({
       }, wide ? '发票下载' : '发票')
     }
 
-    function Overlay({ call, workspaces }) {
+    function Overlay({ call, pickDirectory }) {
       const [open, setOpen] = usePanelOpen()
-      return open ? e(InvoicePanel, { call, workspaces, onClose: () => setOpen(false) }) : null
+      return open ? e(InvoicePanel, { call, pickDirectory, onClose: () => setOpen(false) }) : null
     }
 
     function apply(ctx) {
       const connection = ctx.get('connection')
-      const workspaces = ctx.workspaces
-      const call = (endpoint, payload) => connection.rpc.call('/invoice', endpoint, payload ?? {})
+      const desktop = globalThis.__DSH_DIRECTORY_PICKER__
+      const pickDirectory = desktop === undefined ? () => ctx.uiWorkspace.pickDirectory() : () => desktop.pick()
+      const call = (endpoint, payload) => connection.rpc.call('/api', 'invoice/rpc', { endpoint, payload: payload ?? {} })
       ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
         { name: 'sidebar.footer.action', id: 'invoice-downloader', order: 95, label: '发票下载' },
         props => e(FooterAction, { wide: Boolean(props && props.wide) }),
       ))
       ctx.slots.inject('shell.overlay', () => ctx.slots.register(
         { name: 'shell.overlay', id: 'invoice-downloader-panel', order: 95, label: '发票下载' },
-        () => e(Overlay, { call, workspaces }),
+        () => e(Overlay, { call, pickDirectory }),
       ))
     }
 

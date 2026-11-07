@@ -1,4 +1,5 @@
 import * as path from 'node:path'
+import type { ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection'
 import type { CredentialProvider } from '@deepseek-ai/dsh-credentials'
 import type { SubprocessHandle, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { GLM_API_KEY_REF, IMAP_AUTH_CODE_REF, isCredentialConfigured, resolveCredential } from './credentials.js'
@@ -20,15 +21,7 @@ export interface InvoiceRpcContext {
   artifacts: ArtifactRegistry
 }
 
-export interface RpcResult {
-  ok: boolean
-  value?: unknown
-  error?: {
-    code: 'bad-request' | 'internal'
-    message: string
-    details: { issues: [] } | Record<string, never>
-  }
-}
+export type RpcResult = ConnectionRpcResult<unknown>
 
 interface RuntimeHealth {
   ok: boolean

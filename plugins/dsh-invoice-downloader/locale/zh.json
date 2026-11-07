@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "发票下载",
+    "description": "通过 IMAP 下载发票附件，在本地识别并导出 Excel 汇总。"
+  }
+}
