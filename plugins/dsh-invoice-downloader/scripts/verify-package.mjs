@@ -9,6 +9,9 @@ const required = [
   'lib/activate.js',
   'src/client-sidebar.js',
   'cordis.patch.yml',
+  'icon.svg',
+  'locale/en.json',
+  'locale/zh.json',
   'runtime/install.py',
   'runtime/health_check.py',
   'runtime/requirements-headless.txt',
@@ -75,8 +78,15 @@ assert.equal(packageManifest.os, undefined)
 assert.equal(packageManifest.cpu, undefined)
 
 const directDshImports = collectJavaScriptFiles(join(packageRoot, 'lib'))
-  .filter(file => /(?:from|import\()\s*['"]@deepseek-ai\//.test(readFileSync(join(packageRoot, 'lib', file), 'utf8')))
-assert.deepEqual(directDshImports, [])
+  .flatMap(file => Array.from(
+    readFileSync(join(packageRoot, 'lib', file), 'utf8')
+      .matchAll(/(?:from|import\s*\(?)\s*['"](@deepseek-ai\/[^'"]+)['"]/g),
+    match => match[1],
+  ))
+assert.deepEqual(directDshImports.sort(), [
+  '@deepseek-ai/dsh-client-connection',
+  '@deepseek-ai/dsh-host-webserver',
+])
 
 const stagedPaths = [
   'runtime/.venv',

@@ -20,14 +20,10 @@ jobs:
     name: Package, runtime, and DSH load
     runs-on: macos-14
     timeout-minutes: 40
+    env:
+      DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/checkout@v4
-        with:
-          repository: deepseek-ai/deepseek-harness
-          ref: master
-          path: dsh
 
       - uses: actions/setup-node@v4
         with:
@@ -46,22 +42,17 @@ jobs:
           npm pack --pack-destination "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact"
 
       - name: Install the tarball into an isolated DSH Web profile
-        working-directory: dsh
-        env:
-          DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
         run: |
-          corepack enable
-          pnpm install --frozen-lockfile
-          pnpm run build
+          host_dir="$GITHUB_WORKSPACE/.runtime/dsh-host"
+          npm install --prefix "$host_dir" --no-save --no-audit --no-fund @deepseek-ai/dsh@0.2.2-rc.1
+          export PATH="$host_dir/node_modules/.bin:$PATH"
+          echo "$host_dir/node_modules/.bin" >> "$GITHUB_PATH"
           package_tgz="$(find "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact" -maxdepth 1 -name '*.tgz' -print -quit)"
           test -n "$package_tgz"
-          pnpm dsh plugin --profile web add "file:$package_tgz"
-          pnpm dsh --profile web --dump-config | grep --fixed-strings '@ethanyoq/dsh-invoice-downloader'
+          dsh plugin --profile web add "file:$package_tgz"
+          dsh --profile web --dump-config | grep --fixed-strings '@ethanyoq/dsh-invoice-downloader'
 
       - name: Install and check the DSH profile-state runtime
-        working-directory: dsh
-        env:
-          DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
         run: |
           plugin_dir="$(cd "$DSH_HOME/profiles/web" && node -p "require('node:path').dirname(require.resolve('@ethanyoq/dsh-invoice-downloader/package.json'))")"
           runtime_root="$DSH_HOME/invoice-downloader/runtime"
@@ -73,25 +64,24 @@ jobs:
           "$runtime_root/.venv/bin/python" "$plugin_dir/runtime/health_check.py" --engine-root "$plugin_dir/runtime/engine"
           test ! -e "$plugin_dir/runtime/.venv"
 
-      - name: Serve and load the package client bundle
-        working-directory: dsh
-        env:
-          DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
+      - name: Load the client bundle and check authenticated invoice RPC
         run: |
-          pnpm dsh --profile web --port 3192 > "$RUNNER_TEMP/dsh-web.log" 2>&1 &
+          log="$RUNNER_TEMP/dsh-web.log"
+          dsh --profile web --host 127.0.0.1 --port 0 --no-open > "$log" 2>&1 &
           dsh_pid=$!
           cleanup() {
             status=$?
             kill "$dsh_pid" 2>/dev/null || true
             wait "$dsh_pid" 2>/dev/null || true
-            if [ "$status" -ne 0 ]; then cat "$RUNNER_TEMP/dsh-web.log"; fi
+            if [ "$status" -ne 0 ]; then sed -E 's/([?&]token=)[A-Za-z0-9_-]+/\1[redacted]/g' "$log"; fi
             exit "$status"
           }
           trap cleanup EXIT
-          for attempt in {1..30}; do
-            if curl --fail --silent --show-error 'http://127.0.0.1:3192/plugins/@ethanyoq/dsh-invoice-downloader/client.js' > "$RUNNER_TEMP/invoice-client.js"; then
+          for attempt in {1..60}; do
+            if grep -q '^dsh web: http://' "$log"; then
               break
             fi
+            kill -0 "$dsh_pid"
             sleep 1
           done
-          test -s "$RUNNER_TEMP/invoice-client.js"
+          node plugins/dsh-invoice-downloader/scripts/smoke-dsh-web.mjs "$log" --with-runtime

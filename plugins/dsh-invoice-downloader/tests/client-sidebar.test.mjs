@@ -6,9 +6,10 @@ import { runInNewContext } from 'node:vm'
 
 const source = readFileSync(join(import.meta.dirname, '..', 'src', 'client-sidebar.js'), 'utf8')
 
-function loadPluginExports() {
+function loadPluginExports(desktopPicker) {
   let definition
   runInNewContext(source, {
+    __DSH_DIRECTORY_PICKER__: desktopPicker,
     window: {
       __ModuleLoader__: {
         load(value) { definition = value },
@@ -17,18 +18,41 @@ function loadPluginExports() {
   })
   assert.ok(definition)
   return definition.factory(name => {
-    if (name === 'react') return { createElement() {} }
+    if (name === 'react') return { createElement: (type, props) => ({ type, props }) }
     throw new Error(`unexpected client dependency: ${name}`)
   })
 }
 
-test('sidebar is explicitly anchored on the right and uses the DSH directory picker', () => {
+test('sidebar is explicitly anchored on the right', () => {
   assert.match(source, /right: '16px'/)
   assert.match(source, /left: 'auto'/)
   assert.match(source, /width: 'min\(440px, calc\(100vw - 32px\)\)'/)
-  assert.match(source, /workspaces\.pickDirectory\(\)/)
-  assert.match(source, /const workspaces = ctx\.workspaces/)
   assert.match(source, /'选择保存位置'/)
+})
+
+test('the registered panel selects directories through the browser workspace or Desktop bridge', async () => {
+  for (const desktop of [undefined, { pick: async () => 'desktop-directory' }]) {
+    const plugin = loadPluginExports(desktop)
+    const registered = new Map()
+    const calls = []
+    const services = {
+      slots: {
+        inject(_name, register) { register() },
+        register(options, render) { registered.set(options.name, render) },
+      },
+      connection: { rpc: { call: (...args) => calls.push(args) } },
+      uiWorkspace: { pickDirectory: async () => 'browser-directory' },
+    }
+    const context = Object.fromEntries(plugin.inject.map(name => [name, services[name]]))
+    plugin.apply({ ...context, get: name => context[name] })
+
+    const { call, pickDirectory } = registered.get('shell.overlay')().props
+    call('getRuntimeStatus', { fixture: true })
+    assert.deepEqual(calls.map(([channel, method, body]) => [channel, method, { ...body }]), [
+      ['/api', 'invoice/rpc', { endpoint: 'getRuntimeStatus', payload: { fixture: true } }],
+    ])
+    assert.equal(await pickDirectory(), desktop ? 'desktop-directory' : 'browser-directory')
+  }
 })
 
 test('sidebar preserves every pending field update during one render batch', () => {
@@ -49,7 +73,7 @@ test('directory picker applies a selected DSH path and reports success', async (
   const updates = []
   const statuses = []
   await chooseOutputDirectory(
-    { async pickDirectory() { return 'C:\\invoice-output' } },
+    async () => 'C:\\invoice-output',
     (...args) => updates.push(args),
     value => statuses.push([value.kind, value.message]),
   )
@@ -65,7 +89,7 @@ test('directory picker leaves settings unchanged when the native chooser is canc
   const updates = []
   const statuses = []
   await chooseOutputDirectory(
-    { async pickDirectory() { return undefined } },
+    async () => null,
     (...args) => updates.push(args),
     value => statuses.push([value.kind, value.message]),
   )
@@ -78,7 +102,7 @@ test('directory picker reports a Host error without changing settings', async ()
   const updates = []
   const statuses = []
   await chooseOutputDirectory(
-    { async pickDirectory() { throw new Error('native dialog unavailable') } },
+    async () => { throw new Error('native dialog unavailable') },
     (...args) => updates.push(args),
     value => statuses.push([value.kind, value.message]),
   )

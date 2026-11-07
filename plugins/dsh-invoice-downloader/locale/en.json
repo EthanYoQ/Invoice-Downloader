@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Invoice downloader",
+    "description": "Download invoice attachments by IMAP, run local OCR, and export an Excel summary."
+  }
+}

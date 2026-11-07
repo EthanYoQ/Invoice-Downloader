@@ -6,8 +6,12 @@
 
 ## 安装
 
+插件 0.2.0 支持 DeepSeek Harness `0.2.2-rc.1` 和 `0.2.1-rc.5`。在本机启动 DSH Web，使用回环监听地址，并保持远程可信主机列表为空。进入本插件目录，打包并安装。
+
 ```powershell
-dsh plugin --profile web add @ethanyoq/dsh-invoice-downloader
+npm ci
+npm pack
+dsh plugin --profile web add "file:$PWD/ethanyoq-dsh-invoice-downloader-0.2.0.tgz"
 ```
 
 启动 DSH Web，打开右侧的“发票下载”入口，先点击“安装本地引擎”，再选择保存位置并完成 IMAP 配置。运行时安装仅在本机创建 Python 虚拟环境；不会在安装包或插件设置中保存邮箱授权码或 API 密钥。
@@ -44,11 +48,15 @@ npm pack
 
 ## English
 
-Run local IMAP invoice download, OCR, archive, and Excel summary workflows from a right-side DeepSeek Harness panel. Install the bundle with:
+Run local IMAP invoice download, OCR, archive, and Excel summary workflows from a right-side DeepSeek Harness panel. To build and install the bundle, run these commands from this plugin directory.
 
 ```sh
-dsh plugin --profile web add @ethanyoq/dsh-invoice-downloader
+npm ci
+npm pack
+dsh plugin --profile web add "file:$PWD/ethanyoq-dsh-invoice-downloader-0.2.0.tgz"
 ```
+
+Plugin version 0.2.0 supports DeepSeek Harness `0.2.2-rc.1` and `0.2.1-rc.5`. Run DSH Web on a loopback address with no remote trusted hosts.
 
 The package supports Windows x64 and macOS Apple Silicon. Use the panel to install its local Python runtime, choose an output directory, and configure IMAP. Credentials are stored through the DSH credential service rather than plugin settings.
 

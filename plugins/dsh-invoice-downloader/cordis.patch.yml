@@ -1,7 +1,7 @@
 - insert:
     - id: invoice-downloader
       name: '@ethanyoq/dsh-invoice-downloader'
-      inject: ['subprocess', 'connection', 'sessions', 'llm', 'agentDefaultModel', 'credentials']
+      inject: ['subprocess', 'connection', 'webServer', 'sessions', 'llm', 'agentDefaultModel', 'credentials']
       config:
         savePath: ''
         runtimeRoot: ''
