@@ -17,17 +17,22 @@ permissions:
 
 jobs:
   package-and-runtime:
-    name: Package, runtime, and DSH load
+    name: Package, runtime, and DSH load (${{ matrix.dsh }})
     runs-on: macos-15
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: [0.2.2-rc.3, 0.2.2-rc.5, 0.2.3-alpha.2]
     env:
       DSH_HOME: ${{ github.workspace }}/.runtime/dsh-plugin-home
+      DSH_VERSION: ${{ matrix.dsh }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.22.3
 
       - uses: actions/setup-python@v5
         with:
@@ -44,7 +49,7 @@ jobs:
       - name: Install the tarball into an isolated DSH Web profile
         run: |
           host_dir="$GITHUB_WORKSPACE/.runtime/dsh-host"
-          npm install --prefix "$host_dir" --no-save --no-audit --no-fund @deepseek-ai/dsh@0.2.2-rc.1 pnpm@11.28.5
+          npm install --prefix "$host_dir" --no-save --no-audit --no-fund "@deepseek-ai/dsh@$DSH_VERSION" pnpm@11.28.5
           export PATH="$host_dir/node_modules/.bin:$PATH"
           echo "$host_dir/node_modules/.bin" >> "$GITHUB_PATH"
           package_tgz="$(find "$GITHUB_WORKSPACE/.runtime/dsh-plugin-artifact" -maxdepth 1 -name '*.tgz' -print -quit)"
